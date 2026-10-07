@@ -1486,6 +1486,14 @@ class TestRespawnStormBreaker:
 
 
 class TestLaunchdPlistRespawnGovernance:
+    @pytest.fixture(autouse=True)
+    def ordinary_checkout(self, monkeypatch):
+        # Launcher discovery is separate from the plist supervision contract.
+        monkeypatch.setattr(
+            "hermes_cli.gateway_launchd._timestamped_stderr_gateway_command",
+            lambda *a, **kw: [sys.executable, "-m", "hermes_cli.main", "gateway", "run"],
+        )
+
     def test_plist_has_throttle_interval(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from hermes_cli.gateway import generate_launchd_plist
