@@ -78,13 +78,29 @@ from hermes_cli.web_server_lifecycle import (  # noqa: E402
 
 
 def _gateway_owns_cron(name: str, home) -> bool:
-    """A gateway already ticks this profile's store with live adapters: its OWN process, or the
-    live default multiplexer (a served satellite has no gateway.pid of its own). Winning the
-    tick-lock race here would deliver through the standalone path (#52202, #100489, #107485)."""
-    from hermes_cli.profiles import _check_gateway_running, _served_by_running_multiplexer
-
-    return _check_gateway_running(Path(home)) or (
-        name != "default" and _served_by_running_multiplexer(name))
+    """Defer Desktop unless gateway absence is positively established."""
+    from hermes_cli.profiles import _check_gateway_running
+    from hermes_cli.gateway import named_profile_served_by_running_multiplexer
+    from gateway.status import get_running_pid, resolve_gateway_liveness
+    try:
+        if _check_gateway_running(Path(home)):
+            return True
+        # The shared status resolver catches individual rung failures. Its
+        # Boolean helper drops probe_error, so absence needs this strict check.
+        liveness = resolve_gateway_liveness(
+            profile_dir=Path(home), use_cache=False,
+            pid_probe=lambda path: get_running_pid(path, cleanup_stale=False),
+        )
+        if liveness.running or liveness.probe_error:
+            return True
+        return (
+            name != "default" and named_profile_served_by_running_multiplexer(name))
+    except Exception:
+        _log.warning(
+            "Desktop cron: gateway-ownership probe failed for %s; deferring tick",
+            name, exc_info=True,
+        )
+        return True
 
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
@@ -152,9 +168,9 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             try:
                 return _gateway_owns_cron(own_name, own_home)
             except Exception:
-                # Start the ticker rather than silently stand down.
-                _log.warning("Desktop cron: gateway-ownership probe failed; starting the ticker", exc_info=True)
-                return False
+                # Defer while ownership is uncertain; the next interval probes again.
+                _log.warning("Desktop cron: gateway-ownership probe failed; deferring ticker", exc_info=True)
+                return True
 
         if _owned():
             _log.info(
