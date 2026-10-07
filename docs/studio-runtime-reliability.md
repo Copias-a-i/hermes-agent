@@ -30,7 +30,7 @@ local/suppressed delivery unchanged; never clear a live execution claim.
 - [x] Process-name kill guard rejects the incident command without executing it.
 - [x] Normal GUI quit preserves all gateway PIDs and the active CFO claim.
 - [x] Two subsequent eligible CFO runs complete with GUI absent and local delivery.
-- [ ] No further broad-kill wave appears during the observation window.
+- [x] No further broad-kill wave appears during the observation window.
 
 Secret-free launchctl/PID/receipt snapshots live outside the checkout under
 `~/Archive/hermes-runtime-reliability-2026-10-06/`. Source changes ship through a
