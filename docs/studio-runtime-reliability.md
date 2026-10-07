@@ -6,7 +6,10 @@ At 18:52 PDT on 2026-10-06, a vault-ingestion Claude subagent issued
 PID 16896 stayed alive. This was a fleet-wide operator command, not a GUI crash.
 
 Gateways own scheduled work independently of Desktop. Desktop only ticks stores
-with positively established absence of a gateway. Ownership errors defer Desktop,
+with positively established absence of a gateway. A held per-home runtime lock
+is authoritative even when profile identity parsing misses an inline bootstrap.
+The lock probe never creates or unlinks another store's ownership file.
+Ownership errors defer Desktop,
 and ownership is checked again after the scheduler lock is acquired. Yielding
 stores receive no Desktop heartbeat or delivery drain.
 
@@ -48,3 +51,9 @@ An isolated launchd canary using the real patched wrapper started child PID
 starts. The canary was unloaded. Installed-code probes confirm a live CFO
 store is deferred and a positively absent gateway permits Desktop takeover.
 The probe-error negative control fails when the error-state check is removed.
+
+Fleet-wide installed-code probes initially exposed 22 live stores whose inline
+bootstrap profile could not be resolved by the shared identity parser. The
+held-lock guard now defers all 31 live stores. Its real cross-process test fails
+before the repair and passes after it; an unlocked stale lock permits takeover
+without deleting the file. Identity-parser repair is tracked separately.

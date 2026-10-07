@@ -77,12 +77,27 @@ from hermes_cli.web_server_lifecycle import (  # noqa: E402
 )
 
 
+def _desktop_gateway_runtime_lock_owned(home) -> bool:
+    """Observe kernel ownership without creating or unlinking another store's lock."""
+    from gateway.status import _probe_lock_file
+
+    try:
+        handle = (Path(home) / "gateway.lock").open("r+")
+    except FileNotFoundError:
+        return False
+    return _probe_lock_file(handle)
+
+
 def _gateway_owns_cron(name: str, home) -> bool:
     """Defer Desktop unless gateway absence is positively established."""
     from hermes_cli.profiles import _check_gateway_running
     from hermes_cli.gateway import named_profile_served_by_running_multiplexer
     from gateway.status import get_running_pid, resolve_gateway_liveness
     try:
+        # A held per-home runtime lock is ownership even when an older identity
+        # matcher cannot recognize the gateway's bootstrap command line.
+        if _desktop_gateway_runtime_lock_owned(home):
+            return True
         if _check_gateway_running(Path(home)):
             return True
         # The shared status resolver catches individual rung failures. Its
