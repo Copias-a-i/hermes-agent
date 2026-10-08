@@ -39,9 +39,12 @@ def _wait_until(predicate, timeout=10.0, interval=0.005):
     return predicate()
 
 
-def test_ticker_calls_tick_at_least_once_then_stops():
+def test_ticker_calls_tick_at_least_once_then_stops(monkeypatch):
     """The gateway in-process ticker loop calls cron.scheduler.tick repeatedly
     and exits promptly once the stop_event is set."""
+    # CLI imports must not inspect or repair this checkout during a ticker unit test.
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda root: None)
+    monkeypatch.setattr("hermes_cli._early_recovery.restore_interrupted_pull", lambda *a, **kw: False)
     from gateway.run import _start_cron_ticker
 
     calls = []

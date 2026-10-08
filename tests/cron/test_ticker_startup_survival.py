@@ -74,6 +74,9 @@ def test_multiplex_ticker_survives_a_raising_gate_without_ticking_ungated(tmp_pa
 def test_housekeeping_restarts_a_dead_ticker(monkeypatch):
     """The supervisor is the outer layer: a ticker that ended without a stop request is respawned
     on the next housekeeping tick; one that ended BECAUSE of the stop request is not."""
+    # Housekeeping may import the CLI; checkout recovery is outside this test.
+    monkeypatch.setattr("pm.environments.activate_dependencies", lambda root: None)
+    monkeypatch.setattr("hermes_cli._early_recovery.restore_interrupted_pull", lambda *a, **kw: False)
     import gateway.run as gateway_run
     from cron.scheduler_thread import SupervisedTickerThread
 
