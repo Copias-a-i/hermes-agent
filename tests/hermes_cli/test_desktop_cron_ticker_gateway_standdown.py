@@ -13,6 +13,55 @@ import threading
 import pytest
 
 
+@pytest.mark.parametrize("failed_probe", ["profile", "multiplexer", "lock"])
+def test_uncertain_ownership_defers_built_in_gate(tmp_path, monkeypatch, failed_probe):
+    from hermes_cli import gateway as gateway_cli, profiles, web_server
+
+    def unavailable(*args):
+        raise RuntimeError("ownership unavailable")
+
+    monkeypatch.setattr(profiles, "_check_gateway_running", unavailable if failed_probe == "profile" else lambda home: False)
+    monkeypatch.setattr(gateway_cli, "named_profile_served_by_running_multiplexer", unavailable if failed_probe == "multiplexer" else lambda name: False)
+    if failed_probe == "lock":
+        monkeypatch.setattr(web_server, "_desktop_gateway_runtime_lock_owned", unavailable)
+    assert web_server._gateway_owns_cron("worker", tmp_path) is True
+
+
+def test_status_probe_error_is_not_gateway_absence(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from gateway import status
+    from hermes_cli import gateway as gateway_cli, profiles, web_server
+
+    monkeypatch.setattr(profiles, "_check_gateway_running", lambda home: False)
+    monkeypatch.setattr(gateway_cli, "named_profile_served_by_running_multiplexer", lambda name: False)
+    monkeypatch.setattr(status, "resolve_gateway_liveness", lambda **kwargs: SimpleNamespace(running=False, probe_error=True))
+    assert web_server._gateway_owns_cron("worker", tmp_path) is True
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX runtime-lock experiment")
+def test_held_runtime_lock_defers_unrecognized_live_gateway(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+    from gateway import status
+    from hermes_cli import gateway as gateway_cli, profiles, web_server
+
+    monkeypatch.setattr(profiles, "_check_gateway_running", lambda home: False)
+    monkeypatch.setattr(gateway_cli, "named_profile_served_by_running_multiplexer", lambda name: False)
+    monkeypatch.setattr(status, "resolve_gateway_liveness", lambda **kwargs: SimpleNamespace(running=False, probe_error=False))
+    lock = tmp_path / "gateway.lock"
+    source = "import fcntl,sys; f=open(sys.argv[1],'a+'); fcntl.flock(f,fcntl.LOCK_EX); print('ready',flush=True); sys.stdin.readline()"
+    child = subprocess.Popen([sys.executable, "-c", source, str(lock)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        assert web_server._gateway_owns_cron("worker", tmp_path) is True
+        assert lock.exists()
+    finally:
+        child.communicate("stop\n", timeout=10)
+    assert web_server._gateway_owns_cron("worker", tmp_path) is False
+    assert lock.exists()  # A stand-down probe must never unlink ownership files.
+
+
 @pytest.fixture()
 def ticker_env(tmp_path, monkeypatch):
     """Isolated HERMES_HOME plus a seam recording whether the provider started."""
@@ -99,22 +148,19 @@ def test_ticker_starts_when_no_gateway(ticker_env, gateway):
     assert "kwargs" in started  # provider started as before
 
 
-def test_ticker_fails_open_when_ownership_probe_raises(ticker_env, monkeypatch, caplog):
+def test_ticker_defers_when_ownership_probe_raises(ticker_env, monkeypatch, caplog):
     from hermes_cli import web_server
-
-    _home, started = ticker_env
-
     import hermes_cli.profiles as profiles
 
+    _home, started = ticker_env
     def _boom(home):
         raise RuntimeError("probe unavailable")
-
     monkeypatch.setattr(profiles, "_check_gateway_running", _boom)
-
+    stopped = threading.Event()
+    stopped.set()
     with caplog.at_level(logging.WARNING, logger="hermes_cli.web_server"):
-        web_server._start_desktop_cron_ticker(threading.Event(), interval=0)
-
-    assert "kwargs" in started  # not a silent stand-down
+        web_server._start_desktop_cron_ticker(stopped, interval=0)
+    assert started == {}
     assert "gateway-ownership probe failed" in caplog.text
 
 
@@ -180,6 +226,7 @@ def test_fail_open_ticker_yields_to_the_multiplexer_serving_this_profile(tmp_pat
     fail-open gate must still stand down for it, as the multiplex gate does."""
     import cron.scheduler_provider as sp
     import hermes_cli.profiles as profiles
+    import hermes_cli.gateway as gateway_cli
     import hermes_constants
     from hermes_cli import web_server
 
@@ -198,7 +245,7 @@ def test_fail_open_ticker_yields_to_the_multiplexer_serving_this_profile(tmp_pat
     monkeypatch.setattr(profiles, "profiles_to_serve", _enumeration_fails)
     monkeypatch.setattr(profiles, "_check_gateway_running", lambda _home: False)
     monkeypatch.setattr(
-        profiles, "_served_by_running_multiplexer", lambda name: multiplexer["serves"] and name == "worker")
+        gateway_cli, "named_profile_served_by_running_multiplexer", lambda name: multiplexer["serves"] and name == "worker")
 
     web_server._start_desktop_cron_ticker(threading.Event(), interval=0)
 
