@@ -586,18 +586,75 @@ def test_finalized_sessions_keep_most_recent_arrival_order(tmp_path):
     assert finalized == old_ids[1:] + [expected]
 
 
-def test_profile_rename_reuses_the_existing_vault_namespace(tmp_path):
+def test_windows_lease_uses_exclusive_create_and_removes_its_owned_lock(monkeypatch, tmp_path):
     mod = _load_lifecycle()
-    home = tmp_path / ".hermes" / "profiles" / "renamed"
-    home.mkdir(parents=True)
+    controller, _home, _vault = _controller(mod, tmp_path)
+    monkeypatch.setattr(mod, "fcntl", None)
+
+    with controller._lease() as acquired:
+        assert acquired is True
+        assert controller.lock_path.exists()
+
+    assert not controller.lock_path.exists()
+
+
+def test_next_turn_replays_other_durable_pending_events(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    old_event_id = "old-event"
     state_path = home / "state" / "fleet-session-lifecycle.json"
     state_path.parent.mkdir()
-    state_path.write_text(json.dumps({"vault_profile": "previous-name"}), encoding="utf-8")
+    state_path.write_text(json.dumps({"pending_turns": {old_event_id: {
+        "event_id": old_event_id,
+        "session_id": "old-session",
+        "turn_id": "old-turn",
+        "completed": True,
+        "interrupted": False,
+        "user": "old-user",
+        "response": "old-response",
+    }}}), encoding="utf-8")
+
+    controller.after_turn(session_id="new-session", turn_id="new-turn", completed=True, interrupted=False,
+                          user_message="new-user", assistant_response="new-response", conversation_history=[], cwd="")
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "event_id: old-event" in checkpoint
+    assert old_event_id not in state["pending_turns"]
+
+
+def test_renamed_profile_writes_only_to_its_current_namespace(tmp_path):
+    mod = _load_lifecycle()
     vault = tmp_path / "vault"
-    controller = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+    beta_home = tmp_path / ".hermes" / "profiles" / "beta"
+    beta_home.mkdir(parents=True)
+    beta_state = beta_home / "state" / "fleet-session-lifecycle.json"
+    beta_state.parent.mkdir()
+    beta_state.write_text(json.dumps({"vault_profile": "alpha"}), encoding="utf-8")
+    alpha_home = tmp_path / ".hermes" / "profiles" / "alpha"
+    alpha_home.mkdir(parents=True)
+    beta = mod.LifecycleController(beta_home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+    alpha = mod.LifecycleController(alpha_home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
 
-    controller.after_turn(session_id="s", turn_id="rename", completed=True, interrupted=False,
+    beta.after_turn(session_id="s", turn_id="beta", completed=True, interrupted=False,
+                    user_message="beta-message", assistant_response="", conversation_history=[], cwd="")
+    alpha.after_turn(session_id="s", turn_id="alpha", completed=True, interrupted=False,
+                     user_message="alpha-message", assistant_response="", conversation_history=[], cwd="")
+
+    assert "beta-message" in _checkpoint_file(vault, "beta").read_text(encoding="utf-8")
+    assert "alpha-message" in _checkpoint_file(vault, "alpha").read_text(encoding="utf-8")
+    assert "beta-message" not in _checkpoint_file(vault, "alpha").read_text(encoding="utf-8")
+
+
+def test_resumed_session_can_write_a_new_full_wrapup_after_later_turn(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+
+    controller.full_wrapup(session_id="resumed", reason="first-exit")
+    controller.after_turn(session_id="resumed", turn_id="later-turn", completed=True, interrupted=False,
                           user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    controller.full_wrapup(session_id="resumed", reason="second-exit")
 
-    assert list((vault / "previous-name" / "daily").glob("*-hermes-lifecycle.md"))
-    assert not (vault / "renamed").exists()
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 2
+    assert "reason: second-exit" in checkpoint

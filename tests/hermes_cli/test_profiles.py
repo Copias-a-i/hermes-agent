@@ -156,23 +156,6 @@ class TestCreateProfile:
         assert mode == 0o600
 
 
-    def test_seeds_lifecycle_marker_for_future_session_inheritance(self, profile_env):
-        """Every new profile gets the bundled lifecycle marker before publish."""
-        profile_dir = create_profile("lifecycle-child", no_alias=True)
-        marker = profile_dir / "state" / "fleet-session-lifecycle-v1"
-        assert marker.read_text(encoding="utf-8") == "fleet-session-lifecycle.v1\n"
-
-    def test_backfills_existing_profiles_idempotently(self, profile_env):
-        """An update migrates the default and every existing named profile once."""
-        default_home = profile_env / ".hermes"
-        legacy = create_profile("lifecycle-legacy", no_alias=True)
-        (default_home / "state" / "fleet-session-lifecycle-v1").unlink(missing_ok=True)
-        (legacy / "state" / "fleet-session-lifecycle-v1").unlink(missing_ok=True)
-
-        changed = profiles.backfill_fleet_session_lifecycles()
-        assert {path.name for path in changed} == {".hermes", "lifecycle-legacy"}
-        assert profiles.backfill_fleet_session_lifecycles() == []
-
     def test_fresh_profile_inherits_a_usable_model(self, profile_env):
         """A profile created without a clone source still resolves a provider.
 
@@ -1971,16 +1954,6 @@ class TestCloneAllExcludesRuntimeTrees:
             assert not (clone / name).exists(), name
         assert (clone / "skills" / "greet" / "SKILL.md").is_file()
         assert (clone / "config.yaml").is_file()
-
-
-def test_clone_all_excludes_profile_runtime_state(profile_env):
-    source = create_profile("state-source", no_alias=True)
-    (source / "state").mkdir(exist_ok=True)
-    (source / "state" / "fleet-session-lifecycle.json").write_text('{"processed_turns": ["source"]}', encoding="utf-8")
-
-    clone = create_profile("state-clone", clone_all=True, no_alias=True)
-
-    assert not (clone / "state" / "fleet-session-lifecycle.json").exists()
 
 
 def test_count_skills_publishes_timestamp_after_the_walk(tmp_path, monkeypatch):

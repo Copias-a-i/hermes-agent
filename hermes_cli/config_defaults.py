@@ -1479,12 +1479,12 @@ DEFAULT_CONFIG = {
         "ledger_max_bytes": 5 * 1024 * 1024,
     },
 
-    # Fleet lifecycle is opt-in per profile. Integration commands remain opt-in;
-    # their adapters own credentials and may be unavailable.
+    # Fleet lifecycle is opt-in per profile; adapters own credentials and may be unavailable.
     "fleet_session_lifecycle": {
         "enabled": False,
         "vault_root": "~/.agent-vault",
         "debounce_seconds": 30,
+        "gbrain_retry_seconds": 300,
         "gbrain_timeout_seconds": 5,
         "pinecone_timeout_seconds": 5,
         "gbrain_command": ["gbrain", "sync"],

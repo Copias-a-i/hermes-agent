@@ -96,9 +96,6 @@ class LifecycleController:
         self.vault_root = Path(os.path.expanduser(configured_vault_root)).resolve()
         self.state_path = self.home / "state" / "fleet-session-lifecycle.json"
         self.lock_path = self.home / "state" / "fleet-session-lifecycle.lock"
-        prior_namespace = self._state().get("vault_profile")
-        if isinstance(prior_namespace, str) and prior_namespace:
-            self.profile = prior_namespace
         self._uses_default_runner = runner is None
         self.runner = runner or self._run
 
@@ -163,11 +160,13 @@ class LifecycleController:
         """
         with self._process_lock_for(self.home):
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
             token = f"{os.getpid()}:{uuid.uuid4().hex}"
+            fd: int | None = None
+            windows_lease = fcntl is None
             locked = False
             try:
                 if fcntl is not None:
+                    fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
@@ -176,7 +175,6 @@ class LifecycleController:
                     locked = True
                 else:  # pragma: no cover - Windows fallback retains exclusive-create semantics.
                     try:
-                        os.close(fd)
                         fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     except FileExistsError:
                         yield False
@@ -186,9 +184,16 @@ class LifecycleController:
                 os.fsync(fd)
                 yield True
             finally:
-                if locked:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
+                if fd is not None:
+                    if locked and fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                if windows_lease:
+                    try:
+                        if self.lock_path.read_text(encoding="ascii") == token:
+                            self.lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
 
     def _checkpoint_path(self) -> Path:
         return self.vault_root / self.profile / "daily" / f"{time.strftime('%Y-%m-%d')}-hermes-lifecycle.md"
@@ -210,7 +215,7 @@ class LifecycleController:
 
     def _checkpoint_has(self, event_id: str) -> bool:
         try:
-            return f"- event_id: {event_id}" in self._checkpoint_path().read_text(encoding="utf-8")
+            return f"- event_id: {event_id}" in self._checkpoint_path().read_text(encoding="utf-8-sig")
         except OSError:
             return False
 
@@ -243,7 +248,7 @@ class LifecycleController:
                 if not acquired:
                     return
                 state = self._state()
-                state.setdefault("vault_profile", self.profile)
+                state["vault_profile"] = self.profile
                 finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
                 final_id = hashlib.sha256(session_id.encode()).hexdigest()
                 if final_id in finalized:
@@ -349,13 +354,12 @@ class LifecycleController:
                 if not acquired:
                     return
                 state = self._state()
-                state.setdefault("vault_profile", self.profile)
+                state["vault_profile"] = self.profile
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
-                if event_id in processed:
-                    return
+                current_was_processed = event_id in processed
                 pending = state.setdefault("pending_turns", {})
                 event = pending.get(event_id)
-                if not isinstance(event, dict):
+                if not current_was_processed and not isinstance(event, dict):
                     event = {"event_id": event_id, "session_id": redact_for_export(session_id),
                              "turn_id": redact_for_export(turn_id), "completed": bool(completed),
                              "interrupted": bool(interrupted), "user": redact_for_export(user_message),
@@ -363,15 +367,27 @@ class LifecycleController:
                     pending[event_id] = event
                     # Intent is durable before any side effect; a crash can now be recovered.
                     _atomic_json(self.state_path, state)
-                if not self._checkpoint_has(event_id):
-                    self._append_checkpoint(event)
-                processed.append(event_id)
+                for pending_id, pending_event in list(pending.items()):
+                    if not isinstance(pending_event, dict):
+                        pending.pop(pending_id, None)
+                        continue
+                    if pending_id not in processed:
+                        if not self._checkpoint_has(pending_id):
+                            self._append_checkpoint(pending_event)
+                        processed.append(pending_id)
+                    pending.pop(pending_id, None)
+                # New post-finalization activity opens a later final boundary for this session.
+                if not current_was_processed:
+                    final_id = hashlib.sha256(session_id.encode()).hexdigest()
+                    state["finalized_sessions"] = [
+                        item for item in (state.get("finalized_sessions") or ()) if str(item) != final_id
+                    ]
                 # Bound ledger preserves turn arrival order so retry dedup retains the newest ids.
                 state["processed_turns"] = processed[-512:]
-                pending.pop(event_id, None)
                 state["updated_at"] = int(time.time())
-                self._pinecone_index(event, state)
-                self._gbrain_sync(cwd, state)
+                if not current_was_processed:
+                    self._pinecone_index(event, state)
+                    self._gbrain_sync(cwd, state)
                 _atomic_json(self.state_path, state)
         except Exception:
             # Hooks must never block/damage response delivery; the core already persisted the transcript first.
