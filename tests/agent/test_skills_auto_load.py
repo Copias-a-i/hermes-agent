@@ -48,7 +48,7 @@ class TestBuildAutoLoadPrompt:
             "skills:\n  auto_load: ['pinned-skill', ' pinned-skill ', 'no-such-skill', 7]\n", encoding="utf-8")
         prompt, loaded, missing = build_auto_load_prompt(task_id="s1", home_override=home)
         assert loaded == ["pinned-skill"]
-        assert missing == ["no-such-skill"]
+        assert missing == ["no-such-skill", "caveman", "graphify", "pinecone-memory"]
         assert "PINNED CONTENT" in prompt
         assert prompt.count("auto-loaded via config (skills.auto_load)") == 1
 
