@@ -105,6 +105,28 @@ def test_release_tag_consumers_use_complete_tagged_checkouts_and_fail_closed_whe
         assert "exit 1" in command
 
 
+def test_install_e2e_run_workflows_materialize_old_release_tags_from_the_pinned_canonical_source() -> None:
+    """Every checkout that stages an OLD install must carry its selected tag object.
+
+    ``Copias-a-i/hermes-agent`` intentionally has no release tags. The pick job can
+    discover canonical tags, but each independently checked-out leg must fetch the
+    selected tag before it bare-clones the serve repository.
+    """
+    workflows = (
+        ".github/workflows/install-e2e-run.yml",
+        ".github/workflows/install-e2e-macos-run.yml",
+        ".github/workflows/install-e2e-windows-run.yml",
+    )
+    for workflow_path in workflows:
+        rendered = (_REPO / workflow_path).read_text(encoding="utf-8")
+        assert "Materialize selected release tag" in rendered
+        assert "https://github.com/Copias-a-i/hermes-agent" in rendered
+        assert "https://github.com/NousResearch/hermes-agent.git" in rendered
+        assert "git remote get-url origin" in rendered
+        assert "git fetch --no-tags --force" in rendered
+        assert "^{commit}" in rendered
+
+
 def test_windows_only_lane_has_a_budget_above_the_real_powershell_fixture_ceiling() -> None:
     """The runner must not SIGKILL a bounded fixture before its child timeout reports red."""
     workflow = _yaml(".github/workflows/tests-os.yml")
