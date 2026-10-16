@@ -28,6 +28,19 @@ def _load_lifecycle():
     return module
 
 
+def _load_plugin():
+    root = Path(__file__).resolve().parents[2]
+    plugin_dir = root / "plugins" / "fleet-session-lifecycle"
+    package = "hermes_plugins.fleet_session_lifecycle_runtime"
+    spec = importlib.util.spec_from_file_location(
+        package, plugin_dir / "__init__.py", submodule_search_locations=[str(plugin_dir)]
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[package] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _controller(mod, tmp_path, *, profile="jarvis", runner=None):
     home = tmp_path / ".hermes" / "profiles" / profile
     home.mkdir(parents=True)
@@ -146,3 +159,56 @@ def test_write_pending_gbrain_is_not_reentered_or_run_for_non_repo(tmp_path):
     assert calls == [["gbrain", "sync"]]
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
     assert state["gbrain"]["write_pending"] is True
+
+
+def test_interruption_uses_pre_llm_snapshot_and_registers_start_capture(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    registered = {}
+
+    class Context:
+        def register_hook(self, name, callback):
+            registered[name] = callback
+
+    plugin.register(Context())
+    assert "pre_llm_call" in registered
+    captured = {}
+
+    class Controller:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def after_turn(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(plugin, "LifecycleController", Controller)
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
+    registered["pre_llm_call"](session_id="crashed", turn_id="turn", user_message="before crash")
+    registered["on_session_end"](
+        session_id="crashed", turn_id="turn", completed=False, interrupted=True,
+    )
+    assert captured["user_message"] == "before crash"
+    assert captured["interrupted"] is True
+
+
+def test_pinecone_unavailable_stays_pending_without_touching_gbrain(tmp_path):
+    mod = _load_lifecycle()
+
+    def unavailable(argv, **_kwargs):
+        if argv[0] == "pinecone-adapter":
+            raise FileNotFoundError("pinecone-adapter")
+        raise AssertionError("gbrain must not run outside a repository")
+
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    home.mkdir(parents=True)
+    controller = mod.LifecycleController(
+        home,
+        {"vault_root": str(tmp_path / "vault"), "pinecone_command": ["pinecone-adapter"]},
+        runner=unavailable,
+    )
+    controller.after_turn(
+        session_id="s", turn_id="pinecone-down", completed=True, interrupted=False,
+        user_message="safe summary", assistant_response="ok", conversation_history=[], cwd="",
+    )
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
+    assert state["pinecone"] == {"last_status": "unavailable", "write_pending": True}
+    assert "gbrain" not in state
