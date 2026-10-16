@@ -39,5 +39,5 @@ def test_clone_all_excludes_profile_runtime_state(profile_env):
     (source / "state").mkdir(exist_ok=True)
     (source / "state" / "fleet-session-lifecycle.json").write_text('{"processed_turns": ["source"]}', encoding="utf-8")
 
-    clone = create_profile("state-clone", clone_all=True, no_alias=True)
+    clone = create_profile("state-clone", clone_all=True, clone_from="state-source", no_alias=True)
     assert not (clone / "state" / "fleet-session-lifecycle.json").exists()

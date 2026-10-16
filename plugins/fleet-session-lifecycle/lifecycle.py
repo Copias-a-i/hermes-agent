@@ -1,8 +1,9 @@
 """Crash-safe per-turn maintenance for the bundled fleet lifecycle plugin.
 
-The plugin deliberately owns only derived checkpoint metadata.  The canonical
-vault is never passed to gbrain, and optional integration failures are recorded
-for a later turn instead of raising into Hermes' delivery path.
+The plugin deliberately owns only derived checkpoint metadata.  The vault path,
+credentials and raw conversation history are never handed to the optional
+external outbox adapter, and an adapter failure is recorded for a later turn
+instead of raising into Hermes' delivery path.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ _SECRET_PATTERNS = (
     re.compile(r"\b(?:sk|pk)_[A-Za-z0-9_-]{16,}\b"),
 )
 _MAX_TEXT = 600
-_DEFAULT_GBRAIN = ("gbrain", "sync")
+_PARTITION_NAME = re.compile(r"\d{4}-\d{2}-\d{2}-hermes-lifecycle\.md")
 
 logger = logging.getLogger(__name__)
 
@@ -111,22 +112,7 @@ class LifecycleController:
     @staticmethod
     def _run(argv: list[str], **kwargs: Any) -> int:
         return subprocess.run(argv, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=kwargs.get("timeout", 5), cwd=kwargs.get("cwd") or None,
-                              env=kwargs.get("env")).returncode
-
-    @staticmethod
-    def _git_root(cwd: str) -> Path | None:
-        """Locate the nearest worktree root, including a linked-worktree .git file."""
-        if not cwd:
-            return None
-        try:
-            current = Path(cwd).resolve()
-        except OSError:
-            return None
-        for candidate in (current, *current.parents):
-            if (candidate / ".git").exists():
-                return candidate
-        return None
+                              timeout=kwargs.get("timeout", 5), env=kwargs.get("env")).returncode
 
     def _command_env(self) -> dict[str, str]:
         """Build a profile-scoped, secret-scrubbed environment for optional commands."""
@@ -243,15 +229,58 @@ class LifecycleController:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def _checkpoint_has(self, event_id: str) -> bool:
+    def _checkpoint_has(self, event_id: str, partition: str | None = None, *, recovery: bool = False) -> bool:
+        """Check one recorded partition; scan history only to recover legacy pending state.
+
+        New admissions persist the partition with their intent, keeping the hot
+        path to one bounded read. A pre-existing record without that field is a
+        legacy recovery case, so scan the profile's daily partitions once before
+        risking a duplicate checkpoint.
+        """
         daily = self.vault_root / self.profile / "daily"
+        if partition and _PARTITION_NAME.fullmatch(partition):
+            paths = (daily / partition,)
+        elif recovery:
+            try:
+                paths = tuple(path for path in daily.iterdir() if _PARTITION_NAME.fullmatch(path.name))
+            except OSError:
+                paths = ()
+        else:
+            paths = (self._checkpoint_path(),)
+        for path in paths:
+            try:
+                if f"- event_id: {event_id}" in path.read_text(encoding="utf-8-sig"):
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def admit_turn(self, *, session_id: str, turn_id: str, user_message: Any) -> None:
+        """Durably record a turn intent before model execution can be interrupted."""
+        if not session_id or not turn_id:
+            return
+        event_id = hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
         try:
-            return any(
-                f"- event_id: {event_id}" in path.read_text(encoding="utf-8-sig")
-                for path in daily.glob("*-hermes-lifecycle.md")
-            )
-        except OSError:
-            return False
+            with self._lease() as acquired:
+                if not acquired:
+                    return
+                state = self._state()
+                processed = {str(item) for item in (state.get("processed_turns") or ())}
+                pending = state.setdefault("pending_turns", {})
+                if event_id not in processed and not isinstance(pending.get(event_id), dict):
+                    pending[event_id] = {
+                        "event_id": event_id,
+                        "session_id": redact_for_export(session_id),
+                        "turn_id": redact_for_export(turn_id),
+                        "completed": False,
+                        "interrupted": True,
+                        "user": redact_for_export(user_message),
+                        "response": "",
+                        "checkpoint_partition": self._checkpoint_path().name,
+                    }
+                    _atomic_json(self.state_path, state)
+        except Exception:
+            logger.exception("fleet-session-lifecycle: turn admission failed for %s", redact_for_export(session_id))
 
     def _append_full_wrapup(self, session_id: str, reason: str) -> None:
         """Write the session-bound final checkpoint without creating an agent turn."""
@@ -340,50 +369,9 @@ class LifecycleController:
         else:
             outbox.update(last_status="write_pending", write_pending=True)
 
-    def _gbrain_sync(self, cwd: str, state: dict[str, Any]) -> None:
-        root = self._git_root(cwd)
-        if root is None:
-            return
-        gbrain = state.setdefault("gbrain", {})
-        now = time.time()
-        try:
-            retry_seconds = max(0.0, float(self.config.get("gbrain_retry_seconds", 300)))
-        except (TypeError, ValueError):
-            retry_seconds = 300.0
-        if (
-            gbrain.get("write_pending")
-            and str(gbrain.get("last_repo") or "") == str(root)
-            and now - float(gbrain.get("last_attempt_at") or 0) < retry_seconds
-        ):
-            return
-        try:
-            debounce = max(0.0, float(self.config.get("debounce_seconds", 30)))
-        except (TypeError, ValueError):
-            debounce = 30.0
-        if (str(gbrain.get("last_repo") or "") == str(root)
-                and now - float(gbrain.get("last_attempt_at") or 0) < debounce):
-            gbrain["last_status"] = "debounced"
-            return
-        gbrain["last_attempt_at"] = now
-        command: list[str] | Any = list(_DEFAULT_GBRAIN) if "gbrain_command" not in self.config else self.config["gbrain_command"]
-        if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
-            return
-        try:
-            code = self._invoke(command, timeout=float(self.config.get("gbrain_timeout_seconds", 5)), cwd=str(root))
-        except FileNotFoundError:
-            gbrain.update(last_status="unavailable", write_pending=True, last_repo=str(root))
-            return
-        except Exception:
-            logger.exception("fleet-session-lifecycle: gbrain sync failed; queued for a later turn")
-            gbrain.update(last_status="failed", write_pending=True, last_repo=str(root))
-            return
-        if code == 0:
-            gbrain.update(last_status="ok", write_pending=False, last_repo=str(root))
-        else:
-            gbrain.update(last_status="write_pending", write_pending=True, last_repo=str(root))
-
     def after_turn(self, *, session_id: str, turn_id: str, completed: bool, interrupted: bool,
-                   user_message: Any, assistant_response: Any, conversation_history: list[Any], cwd: str) -> None:
+                   user_message: Any, assistant_response: Any, conversation_history: list[Any] | None = None,
+                   cwd: str = "") -> None:
         """Durably checkpoint exactly once per turn; never propagate a lifecycle failure."""
         if not session_id or not turn_id:
             return
@@ -402,16 +390,22 @@ class LifecycleController:
                     event = {"event_id": event_id, "session_id": redact_for_export(session_id),
                              "turn_id": redact_for_export(turn_id), "completed": bool(completed),
                              "interrupted": bool(interrupted), "user": redact_for_export(user_message),
-                             "response": redact_for_export(assistant_response)}
+                             "response": redact_for_export(assistant_response),
+                             "checkpoint_partition": self._checkpoint_path().name}
                     pending[event_id] = event
                     # Intent is durable before any side effect; a crash can now be recovered.
                     _atomic_json(self.state_path, state)
+                elif not current_was_processed:
+                    event.update(completed=bool(completed), interrupted=bool(interrupted),
+                                 user=redact_for_export(user_message) or event.get("user", ""),
+                                 response=redact_for_export(assistant_response))
                 for pending_id, pending_event in list(pending.items()):
                     if not isinstance(pending_event, dict):
                         pending.pop(pending_id, None)
                         continue
                     if pending_id not in processed:
-                        if not self._checkpoint_has(pending_id):
+                        partition = str(pending_event.get("checkpoint_partition") or "") or None
+                        if not self._checkpoint_has(pending_id, partition, recovery=partition is None):
                             self._append_checkpoint(pending_event)
                         processed.append(pending_id)
                         self._outbox_index(pending_event, state)
@@ -425,8 +419,6 @@ class LifecycleController:
                 # Bound ledger preserves turn arrival order so retry dedup retains the newest ids.
                 state["processed_turns"] = processed[-512:]
                 state["updated_at"] = int(time.time())
-                if not current_was_processed:
-                    self._gbrain_sync(cwd, state)
                 _atomic_json(self.state_path, state)
         except Exception:
             # Hooks must never block/damage response delivery; the core already persisted the transcript first.

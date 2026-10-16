@@ -1483,11 +1483,10 @@ DEFAULT_CONFIG = {
     "fleet_session_lifecycle": {
         "enabled": False,
         "vault_root": "~/.agent-vault",
-        "debounce_seconds": 30,
-        "gbrain_retry_seconds": 300,
-        "gbrain_timeout_seconds": 5,
+        # Age after which a lock whose recorded owner is gone may be reclaimed (Windows only:
+        # POSIX releases the advisory flock with the owning process).
+        "lock_stale_seconds": 300,
         "outbox_timeout_seconds": 5,
-        "gbrain_command": ["gbrain", "sync"],
         "outbox_command": [],
     },
 

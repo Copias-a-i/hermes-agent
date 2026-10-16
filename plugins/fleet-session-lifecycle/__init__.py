@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from pathlib import Path
 from typing import Any
 
 from hermes_constants import get_hermes_home
@@ -33,26 +32,47 @@ def _enabled(config: dict[str, Any]) -> bool:
     return config.get("enabled") is True
 
 
+def _drop_pending(session_id: str, turn_id: str) -> None:
+    """Release in-memory turn snapshots a disabled profile will never checkpoint.
+
+    A profile that opts out mid-session would otherwise retain the last inbound
+    message for the lifetime of the process.
+    """
+    with _pending_lock:
+        if turn_id:
+            _pending.pop((session_id, turn_id), None)
+        elif session_id:
+            for key in [key for key in _pending if key[0] == session_id]:
+                _pending.pop(key, None)
+
+
 def _on_pre_llm_call(**kwargs: Any) -> None:
     """Snapshot the raw inbound turn before execution so interrupts retain context."""
-    if not _enabled(_config()):
-        return
-    session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
-    if not session_id or not turn_id:
-        return
-    with _pending_lock:
-        _pending[(session_id, turn_id)] = {
-            "user_message": kwargs.get("user_message", ""),
-            "assistant_response": "",
-            "conversation_history": kwargs.get("conversation_history") or [],
-        }
+    try:
+        config = _config()
+        session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
+        if not _enabled(config):
+            _drop_pending(session_id, turn_id)
+            return
+        controller = LifecycleController(get_hermes_home(), config)
+        # Durable before the model call: an interrupt after this point is recoverable.
+        controller.admit_turn(session_id=session_id, turn_id=turn_id, user_message=kwargs.get("user_message", ""))
+        with _pending_lock:
+            _pending[(session_id, turn_id)] = {
+                "user_message": kwargs.get("user_message", ""),
+                "assistant_response": "",
+            }
+    except Exception:
+        logger.exception("fleet-session-lifecycle: pre-llm admission failed")
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
     """Add final output after it is persisted; keep the pre-turn crash snapshot."""
-    if not _enabled(_config()):
-        return
+    config = _config()
     session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
+    if not _enabled(config):
+        _drop_pending(session_id, turn_id)
+        return
     if not session_id or not turn_id:
         return
     with _pending_lock:
@@ -60,7 +80,6 @@ def _on_post_llm_call(**kwargs: Any) -> None:
         snapshot.update({
             "user_message": kwargs.get("user_message", snapshot.get("user_message", "")),
             "assistant_response": kwargs.get("assistant_response", ""),
-            "conversation_history": kwargs.get("conversation_history") or snapshot.get("conversation_history", []),
         })
 
 
@@ -68,9 +87,12 @@ def _on_session_end(**kwargs: Any) -> None:
     """Checkpoint after core transcript persistence; all errors stay fail-open."""
     try:
         config = _config()
-        if not _enabled(config):
-            return
         session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
+        if not _enabled(config):
+            # Session end is terminal for its cached snapshots; do not retain a
+            # mismatched or omitted turn identifier after an opt-out.
+            _drop_pending(session_id, "")
+            return
         with _pending_lock:
             if not turn_id and session_id:
                 # Shutdown paths that omit turn_id still need the pre-turn identity.
@@ -83,7 +105,6 @@ def _on_session_end(**kwargs: Any) -> None:
             session_id=session_id, turn_id=turn_id,
             completed=bool(kwargs.get("completed")), interrupted=bool(kwargs.get("interrupted")),
             user_message=saved.get("user_message", ""), assistant_response=saved.get("assistant_response", ""),
-            conversation_history=saved.get("conversation_history", []), cwd=str(kwargs.get("cwd") or Path.cwd()),
         )
     except Exception:
         logger.exception("fleet-session-lifecycle: turn checkpoint failed; turn stays deliverable")

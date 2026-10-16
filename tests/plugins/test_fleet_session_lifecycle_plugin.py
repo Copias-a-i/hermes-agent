@@ -10,6 +10,8 @@ import threading
 import types
 from pathlib import Path
 
+import pytest
+
 from hermes_cli.fleet_session_lifecycle import install_profile_lifecycle
 from hermes_cli.plugin_validate import validate_plugin_dir
 
@@ -49,38 +51,27 @@ def _controller(mod, tmp_path, *, profile="jarvis", runner=None):
     home = tmp_path / ".hermes" / "profiles" / profile
     home.mkdir(parents=True)
     vault = tmp_path / "vault"
-    return mod.LifecycleController(home, {"vault_root": str(vault), "debounce_seconds": 0}, runner=runner), home, vault
+    return mod.LifecycleController(home, {"vault_root": str(vault)}, runner=runner), home, vault
 
 
 def _checkpoint_file(vault: Path, profile: str) -> Path:
     return next((vault / profile / "daily").glob("*-hermes-lifecycle.md"))
 
 
-def test_checkpoint_redacts_secrets_and_never_sends_vault_to_gbrain(tmp_path):
+def test_checkpoint_redacts_secrets_and_never_sends_vault_to_external_outbox(tmp_path):
     mod = _load_lifecycle()
-    calls = []
-
-    def runner(argv, **kwargs):
-        calls.append((argv, kwargs))
-        return 0
-
-    controller, home, vault = _controller(mod, tmp_path, runner=runner)
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["outbox_command"] = ["indexer"]
     controller.after_turn(
         session_id="s1", turn_id="t1", completed=True, interrupted=False,
         user_message="token=super-secret and AKIAABCDEFGHIJKLMNOP", assistant_response="done",
-        conversation_history=[], cwd=str(repo),
+        conversation_history=[], cwd="",
     )
-
     checkpoint = _checkpoint_file(vault, "jarvis")
     text = checkpoint.read_text(encoding="utf-8")
     assert "super-secret" not in text and "AKIAABCDEFGHIJKLMNOP" not in text
     assert "[REDACTED]" in text
-    assert calls and calls[0][0] == ["gbrain", "sync"]
-    assert str(vault) not in " ".join(calls[0][0])
-    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
-    assert state["gbrain"]["last_status"] == "ok"
+    assert not (home / "state" / "fleet-session-lifecycle-outbox.jsonl").exists()
 
 
 def test_exact_once_with_concurrent_duplicate_delivery(tmp_path):
@@ -100,36 +91,20 @@ def test_exact_once_with_concurrent_duplicate_delivery(tmp_path):
     assert rows.count("turn_id: same") == 1
 
 
-def test_interrupted_turn_is_checkpointed_and_unavailable_integrations_queue(tmp_path):
+def test_interrupted_turn_is_checkpointed_and_unavailable_outbox_queues(tmp_path):
     mod = _load_lifecycle()
 
     def unavailable(*_args, **_kwargs):
-        raise FileNotFoundError("gbrain")
+        raise FileNotFoundError("indexer")
 
     controller, home, vault = _controller(mod, tmp_path, runner=unavailable)
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
+    controller.config["outbox_command"] = ["indexer"]
     controller.after_turn(session_id="s", turn_id="interrupt", completed=False, interrupted=True,
-                          user_message="u", assistant_response="", conversation_history=[], cwd=str(repo))
+                          user_message="u", assistant_response="", conversation_history=[], cwd="")
     assert "interrupted: true" in _checkpoint_file(vault, "jarvis").read_text()
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
-    assert state["gbrain"]["write_pending"] is True
-    assert state["gbrain"]["last_status"] == "unavailable"
-
-
-def test_gbrain_debounce_coalesces_distinct_turns(tmp_path):
-    mod = _load_lifecycle()
-    calls = []
-    root = tmp_path / "repo"
-    (root / ".git").mkdir(parents=True)
-    home = tmp_path / ".hermes" / "profiles" / "jarvis"
-    home.mkdir(parents=True)
-    controller = mod.LifecycleController(home, {"vault_root": str(tmp_path / "vault"), "debounce_seconds": 3600},
-                                         runner=lambda argv, **_kwargs: calls.append(argv) or 0)
-    for turn_id in ("one", "two"):
-        controller.after_turn(session_id="s", turn_id=turn_id, completed=True, interrupted=False,
-                              user_message="u", assistant_response="a", conversation_history=[], cwd=str(root))
-    assert calls == [["gbrain", "sync"]]
+    assert state["outbox"]["write_pending"] is True
+    assert state["outbox"]["last_status"] == "unavailable"
 
 
 def test_profiles_use_separate_vault_and_state_paths(tmp_path):
@@ -146,7 +121,7 @@ def test_profiles_use_separate_vault_and_state_paths(tmp_path):
     assert (home_b / "state" / "fleet-session-lifecycle.json").exists()
 
 
-def test_write_pending_gbrain_is_not_reentered_or_run_for_non_repo(tmp_path):
+def test_outbox_failure_is_not_reentered_without_new_delivery(tmp_path):
     mod = _load_lifecycle()
     calls = []
 
@@ -155,18 +130,12 @@ def test_write_pending_gbrain_is_not_reentered_or_run_for_non_repo(tmp_path):
         return 75
 
     controller, home, _vault = _controller(mod, tmp_path, runner=runner)
+    controller.config["outbox_command"] = ["indexer"]
     controller.after_turn(session_id="s", turn_id="one", completed=True, interrupted=False,
-                          user_message="u", assistant_response="a", conversation_history=[], cwd=str(tmp_path / "not-a-repo"))
-    assert calls == []
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
-    controller.after_turn(session_id="s", turn_id="two", completed=True, interrupted=False,
-                          user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo))
-    controller.after_turn(session_id="s", turn_id="three", completed=True, interrupted=False,
-                          user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo))
-    assert calls == [["gbrain", "sync"]]
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    assert calls and calls[0][:1] == ["indexer"]
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
-    assert state["gbrain"]["write_pending"] is True
+    assert state["outbox"]["write_pending"] is True
 
 
 def test_enabled_requires_an_explicit_boolean_true():
@@ -194,6 +163,9 @@ def test_interruption_uses_pre_llm_snapshot_and_registers_start_capture(monkeypa
         def __init__(self, *_args, **_kwargs):
             pass
 
+        def admit_turn(self, **_kwargs):
+            return None
+
         def after_turn(self, **kwargs):
             captured.update(kwargs)
 
@@ -208,13 +180,56 @@ def test_interruption_uses_pre_llm_snapshot_and_registers_start_capture(monkeypa
     assert captured["interrupted"] is True
 
 
+def test_pre_llm_admission_survives_process_loss_before_session_end(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    registered = {}
+
+    class Context:
+        def register_hook(self, name, callback):
+            registered[name] = callback
+
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    vault = tmp_path / "vault"
+    home.mkdir(parents=True)
+    plugin.register(Context())
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": True, "vault_root": str(vault)})
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: home)
+
+    registered["pre_llm_call"](session_id="crashed", turn_id="turn", user_message="before crash")
+    plugin._pending.clear()
+    registered["on_session_end"](
+        session_id="crashed", turn_id="turn", completed=False, interrupted=True,
+    )
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert "user: before crash" in checkpoint
+    assert "interrupted: true" in checkpoint
+
+
+def test_disabled_session_end_purges_all_pending_snapshots(monkeypatch):
+    plugin = _load_plugin()
+    plugin._pending.clear()
+    plugin._pending.update({
+        ("disabled", "first"): {"user_message": "one"},
+        ("disabled", "second"): {"user_message": "two"},
+        ("other", "third"): {"user_message": "three"},
+    })
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": False})
+
+    plugin._on_session_end(session_id="disabled", turn_id="mismatched")
+
+    assert not any(key[0] == "disabled" for key in plugin._pending)
+    assert ("other", "third") in plugin._pending
+    plugin._pending.clear()
+
+
 def test_outbox_adapter_unavailable_keeps_a_durable_local_record(tmp_path):
     mod = _load_lifecycle()
 
     def unavailable(argv, **_kwargs):
         if argv[0] == "external-outbox-adapter":
             raise FileNotFoundError("external-outbox-adapter")
-        raise AssertionError("gbrain must not run outside a repository")
+        raise AssertionError("only the configured outbox adapter may run")
 
     home = tmp_path / ".hermes" / "profiles" / "jarvis"
     home.mkdir(parents=True)
@@ -230,7 +245,7 @@ def test_outbox_adapter_unavailable_keeps_a_durable_local_record(tmp_path):
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
     assert state["outbox"] == {"last_status": "unavailable", "write_pending": True}
     assert (home / "state" / "fleet-session-lifecycle-outbox.jsonl").exists()
-    assert "gbrain" not in state
+    assert "outbox" in state
 
 
 def test_final_wrapup_is_idempotent_and_never_runs_a_model_or_returns_a_message(tmp_path):
@@ -416,33 +431,6 @@ def test_processed_turns_retains_arrival_order_at_the_recency_bound(tmp_path):
     assert processed == old_ids[1:] + [expected_newest]
 
 
-def test_explicit_empty_gbrain_command_disables_sync_but_missing_uses_default(tmp_path):
-    mod = _load_lifecycle()
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
-
-    disabled_calls = []
-    disabled, _home, _vault = _controller(
-        mod, tmp_path / "disabled", runner=lambda argv, **kwargs: disabled_calls.append(argv) or 0,
-    )
-    disabled.config["gbrain_command"] = []
-    disabled.after_turn(
-        session_id="s", turn_id="disabled", completed=True, interrupted=False,
-        user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo),
-    )
-    assert disabled_calls == []
-
-    default_calls = []
-    default, _home, _vault = _controller(
-        mod, tmp_path / "default", runner=lambda argv, **kwargs: default_calls.append(argv) or 0,
-    )
-    default.after_turn(
-        session_id="s", turn_id="default", completed=True, interrupted=False,
-        user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo),
-    )
-    assert default_calls == [["gbrain", "sync"]]
-
-
 def test_profile_scoped_process_leases_do_not_serialize_unrelated_profiles(tmp_path):
     mod = _load_lifecycle()
     entered = threading.Event()
@@ -495,6 +483,7 @@ def test_stale_lease_reclamation_retains_the_current_owner_metadata(tmp_path):
     assert controller.lock_path.read_text(encoding="ascii").startswith(f"{os.getpid()}:")
 
 
+@pytest.mark.platforms("windows")
 def test_windows_stale_exclusive_lock_is_reclaimed_when_owner_is_dead(monkeypatch, tmp_path):
     mod = _load_lifecycle()
     controller, _home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
@@ -536,28 +525,8 @@ def test_checkpoint_path_is_date_partitioned(monkeypatch, tmp_path):
     assert controller._checkpoint_path() == vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
 
 
-def test_gbrain_failure_in_one_repo_does_not_back_off_a_different_repo(tmp_path):
+def test_outbox_failure_is_retried_by_a_later_turn(tmp_path):
     mod = _load_lifecycle()
-    repo_a, repo_b = tmp_path / "repo-a", tmp_path / "repo-b"
-    (repo_a / ".git").mkdir(parents=True)
-    (repo_b / ".git").mkdir(parents=True)
-    calls = []
-    controller, _home, _vault = _controller(
-        mod, tmp_path, runner=lambda _argv, **kwargs: calls.append(kwargs["cwd"]) or 1,
-    )
-    controller.config["gbrain_retry_seconds"] = 3600
-
-    for turn_id, repo in (("a", repo_a), ("b", repo_b)):
-        controller.after_turn(session_id="s", turn_id=turn_id, completed=True, interrupted=False,
-                              user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo))
-
-    assert calls == [str(repo_a), str(repo_b)]
-
-
-def test_gbrain_retries_a_pending_failure_when_retry_window_opens(tmp_path):
-    mod = _load_lifecycle()
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
     calls = []
 
     def runner(argv, **_kwargs):
@@ -565,45 +534,18 @@ def test_gbrain_retries_a_pending_failure_when_retry_window_opens(tmp_path):
         return 1 if len(calls) == 1 else 0
 
     controller, home, _vault = _controller(mod, tmp_path, runner=runner)
-    controller.config["gbrain_retry_seconds"] = 0
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
     for turn_id in ("first", "second"):
         controller.after_turn(
             session_id="s", turn_id=turn_id, completed=True, interrupted=False,
-            user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo),
+            user_message="u", assistant_response="a", conversation_history=[], cwd="",
         )
-    assert calls == [["gbrain", "sync"], ["gbrain", "sync"]]
-    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["gbrain"]["last_status"] == "ok"
 
-
-def test_gbrain_resolves_nested_git_worktree_to_top_level(tmp_path):
-    mod = _load_lifecycle()
-    repo = tmp_path / "repo"
-    nested = repo / "packages" / "app"
-    (repo / ".git").mkdir(parents=True)
-    nested.mkdir(parents=True)
-    calls = []
-    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda argv, **kwargs: calls.append((argv, kwargs)) or 0)
-
-    controller.after_turn(session_id="s", turn_id="nested", completed=True, interrupted=False,
-                          user_message="u", assistant_response="a", conversation_history=[], cwd=str(nested))
-
-    assert calls == [(["gbrain", "sync"], {"timeout": 5.0, "cwd": str(repo)})]
-
-
-def test_gbrain_debounce_is_scoped_to_each_repository(tmp_path):
-    mod = _load_lifecycle()
-    repo_a, repo_b = tmp_path / "a", tmp_path / "b"
-    (repo_a / ".git").mkdir(parents=True)
-    (repo_b / ".git").mkdir(parents=True)
-    calls = []
-    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda argv, **kwargs: calls.append(kwargs["cwd"]) or 0)
-    controller.config["debounce_seconds"] = 3600
-
-    for turn_id, repo in (("a", repo_a), ("b", repo_b)):
-        controller.after_turn(session_id="s", turn_id=turn_id, completed=True, interrupted=False,
-                              user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo))
-
-    assert calls == [str(repo_a), str(repo_b)]
+    assert calls == [
+        ["external-outbox-adapter", "--input", str(home / "state" / "fleet-session-lifecycle-outbox.jsonl")],
+        ["external-outbox-adapter", "--input", str(home / "state" / "fleet-session-lifecycle-outbox.jsonl")],
+    ]
+    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["outbox"]["last_status"] == "ok"
 
 
 def test_outbox_adapter_acknowledges_the_durable_queue(tmp_path):
@@ -633,6 +575,7 @@ def test_finalized_sessions_keep_most_recent_arrival_order(tmp_path):
     assert finalized == old_ids[1:] + [expected]
 
 
+@pytest.mark.platforms("windows")
 def test_windows_lease_uses_exclusive_create_and_removes_its_owned_lock(monkeypatch, tmp_path):
     mod = _load_lifecycle()
     controller, _home, _vault = _controller(mod, tmp_path)
@@ -668,6 +611,27 @@ def test_next_turn_replays_other_durable_pending_events(tmp_path):
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert "event_id: old-event" in checkpoint
     assert old_event_id not in state["pending_turns"]
+
+
+def test_admitted_turn_checks_only_its_recorded_partition(monkeypatch, tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    daily = vault / "jarvis" / "daily"
+    daily.mkdir(parents=True)
+    (daily / "2026-10-15-hermes-lifecycle.md").write_text("- event_id: old\n", encoding="utf-8")
+
+    original_iterdir = type(daily).iterdir
+
+    def no_history_scan(path):
+        if path == daily:
+            raise AssertionError("ordinary admitted turns must not enumerate daily history")
+        return original_iterdir(path)
+
+    monkeypatch.setattr(type(daily), "iterdir", no_history_scan)
+    controller.after_turn(session_id="s", turn_id="current", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    assert "turn_id: current" in controller._checkpoint_path().read_text(encoding="utf-8")
 
 
 def test_recovery_checks_prior_daily_partition_before_reappending(monkeypatch, tmp_path):
