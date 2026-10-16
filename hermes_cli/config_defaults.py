@@ -1491,6 +1491,18 @@ DEFAULT_CONFIG = {
         "ledger_max_bytes": 5 * 1024 * 1024,
     },
 
+    # Fleet lifecycle — bundled, profile-local turn checkpoints and first-turn skill policy.
+    # Integration commands are opt-in; their adapters own credentials and may be unavailable.
+    "fleet_session_lifecycle": {
+        "enabled": True,
+        "vault_root": "~/.agent-vault",
+        "debounce_seconds": 30,
+        "gbrain_timeout_seconds": 5,
+        "pinecone_timeout_seconds": 5,
+        "gbrain_command": ["gbrain", "sync"],
+        "pinecone_command": [],
+    },
+
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
     # long-unused skills stale, archives (never deletes) obsolete ones, optionally consolidates
     # overlaps via a forked aux-model agent. Inactivity-triggered from session start, no cron
