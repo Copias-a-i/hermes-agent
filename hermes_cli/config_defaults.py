@@ -1486,9 +1486,9 @@ DEFAULT_CONFIG = {
         "debounce_seconds": 30,
         "gbrain_retry_seconds": 300,
         "gbrain_timeout_seconds": 5,
-        "pinecone_timeout_seconds": 5,
+        "outbox_timeout_seconds": 5,
         "gbrain_command": ["gbrain", "sync"],
-        "pinecone_command": [],
+        "outbox_command": [],
     },
 
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks

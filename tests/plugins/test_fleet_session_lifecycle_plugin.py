@@ -11,6 +11,7 @@ import types
 from pathlib import Path
 
 from hermes_cli.fleet_session_lifecycle import install_profile_lifecycle
+from hermes_cli.plugin_validate import validate_plugin_dir
 
 
 def _load_lifecycle():
@@ -168,6 +169,15 @@ def test_write_pending_gbrain_is_not_reentered_or_run_for_non_repo(tmp_path):
     assert state["gbrain"]["write_pending"] is True
 
 
+def test_enabled_requires_an_explicit_boolean_true():
+    plugin = _load_plugin()
+
+    assert plugin._enabled({"enabled": True}) is True
+    assert plugin._enabled({}) is False
+    assert plugin._enabled({"enabled": "true"}) is False
+    assert plugin._enabled({"enabled": False}) is False
+
+
 def test_interruption_uses_pre_llm_snapshot_and_registers_start_capture(monkeypatch, tmp_path):
     plugin = _load_plugin()
     registered = {}
@@ -198,27 +208,28 @@ def test_interruption_uses_pre_llm_snapshot_and_registers_start_capture(monkeypa
     assert captured["interrupted"] is True
 
 
-def test_pinecone_unavailable_stays_pending_without_touching_gbrain(tmp_path):
+def test_outbox_adapter_unavailable_keeps_a_durable_local_record(tmp_path):
     mod = _load_lifecycle()
 
     def unavailable(argv, **_kwargs):
-        if argv[0] == "pinecone-adapter":
-            raise FileNotFoundError("pinecone-adapter")
+        if argv[0] == "external-outbox-adapter":
+            raise FileNotFoundError("external-outbox-adapter")
         raise AssertionError("gbrain must not run outside a repository")
 
     home = tmp_path / ".hermes" / "profiles" / "jarvis"
     home.mkdir(parents=True)
     controller = mod.LifecycleController(
         home,
-        {"vault_root": str(tmp_path / "vault"), "pinecone_command": ["pinecone-adapter"]},
+        {"vault_root": str(tmp_path / "vault"), "outbox_command": ["external-outbox-adapter"]},
         runner=unavailable,
     )
     controller.after_turn(
-        session_id="s", turn_id="pinecone-down", completed=True, interrupted=False,
+        session_id="s", turn_id="adapter-down", completed=True, interrupted=False,
         user_message="safe summary", assistant_response="ok", conversation_history=[], cwd="",
     )
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
-    assert state["pinecone"] == {"last_status": "unavailable", "write_pending": True}
+    assert state["outbox"] == {"last_status": "unavailable", "write_pending": True}
+    assert (home / "state" / "fleet-session-lifecycle-outbox.jsonl").exists()
     assert "gbrain" not in state
 
 
@@ -266,18 +277,18 @@ def test_finalize_hook_runs_full_wrapup_without_response_delivery(monkeypatch, t
     assert captured == {"session_id": "closing", "reason": "quit"}
 
 
-def test_pinecone_queue_is_two_lf_delimited_json_records(tmp_path):
+def test_outbox_queue_is_two_lf_delimited_json_records(tmp_path):
     mod = _load_lifecycle()
 
     def unavailable(*_args, **_kwargs):
-        raise FileNotFoundError("pinecone-adapter")
+        raise FileNotFoundError("external-outbox-adapter")
 
     controller, home, _vault = _controller(
         mod,
         tmp_path,
         runner=unavailable,
     )
-    controller.config["pinecone_command"] = ["pinecone-adapter"]
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
     for turn_id in ("one", "two"):
         controller.after_turn(
             session_id="s",
@@ -290,7 +301,7 @@ def test_pinecone_queue_is_two_lf_delimited_json_records(tmp_path):
             cwd="",
         )
 
-    raw_queue = (home / "state" / "fleet-session-lifecycle-pinecone.jsonl").read_bytes()
+    raw_queue = (home / "state" / "fleet-session-lifecycle-outbox.jsonl").read_bytes()
     assert raw_queue.count(b"\n") == 2
     rows = [json.loads(line) for line in raw_queue.splitlines()]
     assert [row["turn_id"] for row in rows] == ["one", "two"]
@@ -326,24 +337,24 @@ def test_bom_prefixed_lifecycle_marker_is_already_installed(tmp_path):
     assert marker.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
-def test_empty_pinecone_command_has_no_queue_or_runner_side_effect(tmp_path):
+def test_empty_outbox_command_has_no_queue_or_runner_side_effect(tmp_path):
     mod = _load_lifecycle()
     calls = []
     home = tmp_path / ".hermes" / "profiles" / "jarvis"
     home.mkdir(parents=True)
     controller = mod.LifecycleController(
         home,
-        {"vault_root": str(tmp_path / "vault"), "pinecone_command": []},
+        {"vault_root": str(tmp_path / "vault"), "outbox_command": []},
         runner=lambda argv, **kwargs: calls.append((argv, kwargs)) or 0,
     )
 
     controller.after_turn(
-        session_id="s", turn_id="empty-pinecone", completed=True, interrupted=False,
+        session_id="s", turn_id="empty-outbox", completed=True, interrupted=False,
         user_message="safe summary", assistant_response="ok", conversation_history=[], cwd="",
     )
 
     assert calls == []
-    assert not (home / "state" / "fleet-session-lifecycle-pinecone.jsonl").exists()
+    assert not (home / "state" / "fleet-session-lifecycle-outbox.jsonl").exists()
 
 
 def test_vault_root_expands_home_before_checkpoint_path_use(tmp_path, monkeypatch):
@@ -463,7 +474,7 @@ def test_profile_scoped_process_leases_do_not_serialize_unrelated_profiles(tmp_p
 
     second = threading.Thread(target=checkpoint_beta)
     second.start()
-    assert beta_finished.wait(0.5)
+    assert beta_finished.wait(2.0)
     release.set()
     first.join(2)
     second.join(2)
@@ -484,10 +495,28 @@ def test_stale_lease_reclamation_retains_the_current_owner_metadata(tmp_path):
     assert controller.lock_path.read_text(encoding="ascii").startswith(f"{os.getpid()}:")
 
 
-def test_manifest_declares_every_registered_lifecycle_hook():
+def test_windows_stale_exclusive_lock_is_reclaimed_when_owner_is_dead(monkeypatch, tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["lock_stale_seconds"] = 0
+    controller.lock_path.parent.mkdir(parents=True)
+    controller.lock_path.write_text("999999:abandoned", encoding="ascii")
+    monkeypatch.setattr(mod, "fcntl", None)
+
+    with controller._lease() as acquired:
+        assert acquired is True
+        assert controller.lock_path.read_text(encoding="ascii").startswith(f"{os.getpid()}:")
+
+    assert not controller.lock_path.exists()
+
+
+def test_manifest_validation_probes_the_registered_hooks():
     root = Path(__file__).resolve().parents[2]
-    manifest = (root / "plugins" / "fleet-session-lifecycle" / "plugin.yaml").read_text()
-    assert "  - on_session_finalize" in manifest
+
+    report = validate_plugin_dir(root / "plugins" / "fleet-session-lifecycle")
+
+    assert report.ok, report.failures
+    assert any(name == "capability probe" and ok for name, ok, _detail in report.checks)
 
 
 def test_authorization_schemes_redact_the_following_credential(tmp_path):
@@ -505,6 +534,24 @@ def test_checkpoint_path_is_date_partitioned(monkeypatch, tmp_path):
     controller, _home, vault = _controller(mod, tmp_path)
     monkeypatch.setattr(mod.time, "strftime", lambda _format: "2026-10-16")
     assert controller._checkpoint_path() == vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
+
+
+def test_gbrain_failure_in_one_repo_does_not_back_off_a_different_repo(tmp_path):
+    mod = _load_lifecycle()
+    repo_a, repo_b = tmp_path / "repo-a", tmp_path / "repo-b"
+    (repo_a / ".git").mkdir(parents=True)
+    (repo_b / ".git").mkdir(parents=True)
+    calls = []
+    controller, _home, _vault = _controller(
+        mod, tmp_path, runner=lambda _argv, **kwargs: calls.append(kwargs["cwd"]) or 1,
+    )
+    controller.config["gbrain_retry_seconds"] = 3600
+
+    for turn_id, repo in (("a", repo_a), ("b", repo_b)):
+        controller.after_turn(session_id="s", turn_id=turn_id, completed=True, interrupted=False,
+                              user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo))
+
+    assert calls == [str(repo_a), str(repo_b)]
 
 
 def test_gbrain_retries_a_pending_failure_when_retry_window_opens(tmp_path):
@@ -559,16 +606,16 @@ def test_gbrain_debounce_is_scoped_to_each_repository(tmp_path):
     assert calls == [str(repo_a), str(repo_b)]
 
 
-def test_pinecone_successfully_acknowledges_the_durable_queue(tmp_path):
+def test_outbox_adapter_acknowledges_the_durable_queue(tmp_path):
     mod = _load_lifecycle()
     controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
-    controller.config["pinecone_command"] = ["indexer"]
+    controller.config["outbox_command"] = ["indexer"]
 
     controller.after_turn(session_id="s", turn_id="ack", completed=True, interrupted=False,
                           user_message="u", assistant_response="a", conversation_history=[], cwd="")
 
-    assert not (home / "state" / "fleet-session-lifecycle-pinecone.jsonl").exists()
-    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["pinecone"]["write_pending"] is False
+    assert not (home / "state" / "fleet-session-lifecycle-outbox.jsonl").exists()
+    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["outbox"]["write_pending"] is False
 
 
 def test_finalized_sessions_keep_most_recent_arrival_order(tmp_path):
@@ -621,6 +668,48 @@ def test_next_turn_replays_other_durable_pending_events(tmp_path):
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert "event_id: old-event" in checkpoint
     assert old_event_id not in state["pending_turns"]
+
+
+def test_recovery_checks_prior_daily_partition_before_reappending(monkeypatch, tmp_path):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    old_event_id = "old-event"
+    old_checkpoint = vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
+    old_checkpoint.parent.mkdir(parents=True)
+    old_checkpoint.write_text(f"- event_id: {old_event_id}\n", encoding="utf-8")
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({"pending_turns": {old_event_id: {
+        "event_id": old_event_id, "session_id": "old-session", "turn_id": "old-turn",
+        "completed": True, "interrupted": False, "user": "old-user", "response": "old-response",
+    }}}), encoding="utf-8")
+    monkeypatch.setattr(mod.time, "strftime", lambda _format: "2026-10-17")
+
+    controller.after_turn(session_id="new-session", turn_id="new-turn", completed=True, interrupted=False,
+                          user_message="new-user", assistant_response="new-response", conversation_history=[], cwd="")
+
+    today = vault / "jarvis" / "daily" / "2026-10-17-hermes-lifecycle.md"
+    assert "event_id: old-event" not in today.read_text(encoding="utf-8")
+
+
+def test_recovered_pending_events_reach_the_durable_outbox_before_clear(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 1)
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
+    old_event_id = "old-event"
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({"pending_turns": {old_event_id: {
+        "event_id": old_event_id, "session_id": "old-session", "turn_id": "old-turn",
+        "completed": True, "interrupted": False, "user": "old-user", "response": "old-response",
+    }}}), encoding="utf-8")
+
+    controller.after_turn(session_id="new-session", turn_id="new-turn", completed=True, interrupted=False,
+                          user_message="new-user", assistant_response="new-response", conversation_history=[], cwd="")
+
+    queue = home / "state" / "fleet-session-lifecycle-outbox.jsonl"
+    assert [row["turn_id"] for row in map(json.loads, queue.read_text(encoding="utf-8").splitlines())] == ["old-turn", "new-turn"]
+    assert old_event_id not in json.loads(state_path.read_text(encoding="utf-8"))["pending_turns"]
 
 
 def test_renamed_profile_writes_only_to_its_current_namespace(tmp_path):

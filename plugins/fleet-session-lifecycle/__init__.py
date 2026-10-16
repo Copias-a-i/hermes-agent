@@ -29,8 +29,8 @@ def _config() -> dict[str, Any]:
 
 
 def _enabled(config: dict[str, Any]) -> bool:
-    """Explicit profile disable wins over every lifecycle hook."""
-    return config.get("enabled") is not False
+    """Run hooks only when the profile explicitly opts into lifecycle maintenance."""
+    return config.get("enabled") is True
 
 
 def _on_pre_llm_call(**kwargs: Any) -> None:

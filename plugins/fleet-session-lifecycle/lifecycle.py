@@ -18,6 +18,8 @@ import threading
 import time
 import uuid
 
+import psutil
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows uses the ownership-token fallback.
@@ -149,6 +151,28 @@ class LifecycleController:
             raise FileNotFoundError(command[0])
         return self.runner(resolved, env=self._command_env(), **kwargs)
 
+    @staticmethod
+    def _owner_is_alive(pid: int) -> bool:
+        return psutil.pid_exists(pid)
+
+    def _reclaim_stale_windows_lease(self) -> bool:
+        """Reclaim only an aged lock whose recorded owner is no longer alive."""
+        try:
+            stale_seconds = max(0.0, float(self.config.get("lock_stale_seconds", 300)))
+            stat = self.lock_path.stat()
+            if time.time() - stat.st_mtime < stale_seconds:
+                return False
+            owner = self.lock_path.read_text(encoding="ascii")
+            pid_text, separator, token = owner.partition(":")
+            if not separator or not token or self._owner_is_alive(int(pid_text)):
+                return False
+            if self.lock_path.read_text(encoding="ascii") != owner:
+                return False
+            self.lock_path.unlink()
+            return True
+        except (OSError, ValueError):
+            return False
+
     @contextmanager
     def _lease(self) -> Iterator[bool]:
         """Acquire one profile lease without unlinking another reclaimer's lock.
@@ -177,8 +201,14 @@ class LifecycleController:
                     try:
                         fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     except FileExistsError:
-                        yield False
-                        return
+                        if not self._reclaim_stale_windows_lease():
+                            yield False
+                            return
+                        try:
+                            fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                        except FileExistsError:
+                            yield False
+                            return
                 os.ftruncate(fd, 0)
                 os.write(fd, token.encode("ascii"))
                 os.fsync(fd)
@@ -214,8 +244,12 @@ class LifecycleController:
             os.fsync(handle.fileno())
 
     def _checkpoint_has(self, event_id: str) -> bool:
+        daily = self.vault_root / self.profile / "daily"
         try:
-            return f"- event_id: {event_id}" in self._checkpoint_path().read_text(encoding="utf-8-sig")
+            return any(
+                f"- event_id: {event_id}" in path.read_text(encoding="utf-8-sig")
+                for path in daily.glob("*-hermes-lifecycle.md")
+            )
         except OSError:
             return False
 
@@ -263,47 +297,48 @@ class LifecycleController:
             logger.exception("fleet-session-lifecycle: full wrap-up checkpoint failed for this session")
             return
 
-    def _pinecone_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
-        """Queue only redacted derived text for an explicitly configured indexer.
+    def _outbox_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
+        """Deliver redacted events through an optional vendor-neutral durable outbox.
 
-        The queue lives under the active Hermes profile, never in the Obsidian vault.
-        A deployment can point ``pinecone_command`` at its approved adapter; no
-        credentials, vault path, or raw history are put on argv.
+        Deployments install an adapter outside this repository and configure
+        ``outbox_command``. Missing or failed adapters leave the locally durable
+        record available for a later turn without affecting response delivery.
         """
-        command = self.config.get("pinecone_command")
+        command = self.config.get("outbox_command")
         if (
             not isinstance(command, list)
             or not command
             or not all(isinstance(x, str) and x for x in command)
         ):
             return
-        queue = self.home / "state" / "fleet-session-lifecycle-pinecone.jsonl"
+        queue = self.home / "state" / "fleet-session-lifecycle-outbox.jsonl"
         queue.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"schema": "fleet-lifecycle.v1", "profile": self.profile,
-                   "session_id": event["session_id"], "turn_id": event["turn_id"],
+        payload = {"schema": "fleet-lifecycle-outbox.v1", "event_id": event["event_id"],
+                   "profile": self.profile, "session_id": event["session_id"],
+                   "turn_id": event["turn_id"],
                    "summary": f"user: {event['user']}\\nresponse: {event['response']}"}
         with queue.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        pinecone = state.setdefault("pinecone", {})
+        outbox = state.setdefault("outbox", {})
         try:
-            code = self._invoke(command + ["--input", str(queue)], timeout=float(self.config.get("pinecone_timeout_seconds", 5)))
+            code = self._invoke(command + ["--input", str(queue)], timeout=float(self.config.get("outbox_timeout_seconds", 5)))
         except FileNotFoundError:
-            pinecone.update(last_status="unavailable", write_pending=True)
+            outbox.update(last_status="unavailable", write_pending=True)
             return
         except Exception:
-            logger.exception("fleet-session-lifecycle: pinecone indexer failed; queued for a later turn")
-            pinecone.update(last_status="failed", write_pending=True)
+            logger.exception("fleet-session-lifecycle: external outbox adapter failed; retained locally")
+            outbox.update(last_status="failed", write_pending=True)
             return
         if code == 0:
             try:
                 queue.unlink()
             except FileNotFoundError:
                 pass
-            pinecone.update(last_status="ok", write_pending=False)
+            outbox.update(last_status="ok", write_pending=False)
         else:
-            pinecone.update(last_status="write_pending", write_pending=True)
+            outbox.update(last_status="write_pending", write_pending=True)
 
     def _gbrain_sync(self, cwd: str, state: dict[str, Any]) -> None:
         root = self._git_root(cwd)
@@ -315,7 +350,11 @@ class LifecycleController:
             retry_seconds = max(0.0, float(self.config.get("gbrain_retry_seconds", 300)))
         except (TypeError, ValueError):
             retry_seconds = 300.0
-        if gbrain.get("write_pending") and now - float(gbrain.get("last_attempt_at") or 0) < retry_seconds:
+        if (
+            gbrain.get("write_pending")
+            and str(gbrain.get("last_repo") or "") == str(root)
+            and now - float(gbrain.get("last_attempt_at") or 0) < retry_seconds
+        ):
             return
         try:
             debounce = max(0.0, float(self.config.get("debounce_seconds", 30)))
@@ -332,11 +371,11 @@ class LifecycleController:
         try:
             code = self._invoke(command, timeout=float(self.config.get("gbrain_timeout_seconds", 5)), cwd=str(root))
         except FileNotFoundError:
-            gbrain.update(last_status="unavailable", write_pending=True)
+            gbrain.update(last_status="unavailable", write_pending=True, last_repo=str(root))
             return
         except Exception:
             logger.exception("fleet-session-lifecycle: gbrain sync failed; queued for a later turn")
-            gbrain.update(last_status="failed", write_pending=True)
+            gbrain.update(last_status="failed", write_pending=True, last_repo=str(root))
             return
         if code == 0:
             gbrain.update(last_status="ok", write_pending=False, last_repo=str(root))
@@ -375,6 +414,7 @@ class LifecycleController:
                         if not self._checkpoint_has(pending_id):
                             self._append_checkpoint(pending_event)
                         processed.append(pending_id)
+                        self._outbox_index(pending_event, state)
                     pending.pop(pending_id, None)
                 # New post-finalization activity opens a later final boundary for this session.
                 if not current_was_processed:
@@ -386,7 +426,6 @@ class LifecycleController:
                 state["processed_turns"] = processed[-512:]
                 state["updated_at"] = int(time.time())
                 if not current_was_processed:
-                    self._pinecone_index(event, state)
                     self._gbrain_sync(cwd, state)
                 _atomic_json(self.state_path, state)
         except Exception:
