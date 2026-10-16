@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
 import os
 import sys
 import threading
@@ -55,6 +56,16 @@ def _controller(mod, tmp_path, *, profile="jarvis", runner=None):
 
 def _checkpoint_file(vault: Path, profile: str) -> Path:
     return next((vault / profile / "daily").glob("*-hermes-lifecycle.md"))
+
+
+def _hold_profile_lease(home: str, vault: str, ready, release) -> None:
+    """Hold the real POSIX profile lease from an independent process."""
+    mod = _load_lifecycle()
+    controller = mod.LifecycleController(Path(home), {"vault_root": vault})
+    with controller._lease() as acquired:
+        assert acquired
+        ready.set()
+        assert release.wait(5)
 
 
 def test_checkpoint_redacts_secrets_and_never_sends_vault_to_external_outbox(tmp_path):
@@ -992,3 +1003,64 @@ def test_cancel_session_removes_durable_pending_admissions(tmp_path):
 
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
     assert state["pending_turns"] == {}
+
+
+def test_cancel_session_persists_busy_lease_cancellation_for_next_process(tmp_path):
+    mod = _load_lifecycle()
+    if mod.fcntl is None:
+        pytest.skip("requires POSIX flock")
+    controller, home, vault = _controller(mod, tmp_path)
+    controller.config["finalize_lease_wait_seconds"] = 0
+    controller.admit_turn(session_id="disabled", turn_id="turn", user_message="question")
+    context = multiprocessing.get_context("forkserver")
+    ready, release = context.Event(), context.Event()
+    holder = context.Process(target=_hold_profile_lease, args=(str(home), str(vault), ready, release))
+    holder.start()
+    try:
+        assert ready.wait(2)
+        controller.cancel_session(session_id="disabled")
+        intent = home / "state" / "fleet-session-lifecycle-cancellations" / (
+            __import__("hashlib").sha256(b"disabled").hexdigest() + ".json"
+        )
+        assert intent.exists()
+        release.set()
+        holder.join(3)
+        assert holder.exitcode == 0
+        next_holder = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+        next_holder.after_turn(session_id="other", turn_id="next", completed=True, interrupted=False,
+                               user_message="u", assistant_response="a", conversation_history=[], cwd="")
+        state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+        assert state["pending_turns"] == {}
+        assert not intent.exists()
+    finally:
+        release.set()
+        holder.join(3)
+
+
+def test_full_wrapup_persists_busy_lease_intent_for_next_process(tmp_path):
+    mod = _load_lifecycle()
+    if mod.fcntl is None:
+        pytest.skip("requires POSIX flock")
+    controller, home, vault = _controller(mod, tmp_path)
+    controller.config["finalize_lease_wait_seconds"] = 0
+    context = multiprocessing.get_context("forkserver")
+    ready, release = context.Event(), context.Event()
+    holder = context.Process(target=_hold_profile_lease, args=(str(home), str(vault), ready, release))
+    holder.start()
+    try:
+        assert ready.wait(2)
+        controller.full_wrapup(session_id="closing", reason="quit")
+        final_id = __import__("hashlib").sha256(b"closing").hexdigest()
+        intent = home / "state" / "fleet-session-lifecycle-finalizations" / f"{final_id}.json"
+        assert intent.exists()
+        release.set()
+        holder.join(3)
+        assert holder.exitcode == 0
+        next_holder = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+        next_holder.after_turn(session_id="other", turn_id="next", completed=True, interrupted=False,
+                               user_message="u", assistant_response="a", conversation_history=[], cwd="")
+        assert "session_id: closing" in _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+        assert not intent.exists()
+    finally:
+        release.set()
+        holder.join(3)

@@ -169,6 +169,111 @@ class LifecycleController:
             except FileNotFoundError:
                 pass
 
+    def _cancellation_intent_path(self, session_id: str) -> Path:
+        token = hashlib.sha256(session_id.encode()).hexdigest()
+        return self.home / "state" / "fleet-session-lifecycle-cancellations" / f"{token}.json"
+
+    def _persist_cancellation_intent(self, session_id: str) -> None:
+        """Durably defer disabled-session cleanup while another process owns state."""
+        _atomic_json(self._cancellation_intent_path(session_id), {"session_id": redact_for_export(session_id)})
+
+    def _merge_cancellation_intents(self, state: dict[str, Any]) -> tuple[list[Path], list[str]]:
+        """Apply deferred cancellation only while holding the lifecycle lease."""
+        directory = self.home / "state" / "fleet-session-lifecycle-cancellations"
+        try:
+            paths = tuple(directory.glob("*.json"))
+        except OSError:
+            return [], []
+        pending = state.setdefault("pending_turns", {})
+        adopted: list[Path] = []
+        removed: list[str] = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            session_id = str(payload.get("session_id") or "") if isinstance(payload, dict) else ""
+            if not session_id or path.name != f"{hashlib.sha256(session_id.encode()).hexdigest()}.json":
+                continue
+            for event_id, event in list(pending.items()):
+                if isinstance(event, dict) and str(event.get("session_id") or "") == session_id:
+                    pending.pop(event_id, None)
+                    removed.append(str(event_id))
+            adopted.append(path)
+        return adopted, removed
+
+    def _clear_cancellation_intents(self, paths: list[Path], removed: list[str]) -> None:
+        self._clear_completion_intents([self._completion_intent_path(event_id) for event_id in removed])
+        self._clear_completion_intents(paths)
+
+    def _finalization_intent_path(self, final_id: str) -> Path:
+        return self.home / "state" / "fleet-session-lifecycle-finalizations" / f"{final_id}.json"
+
+    def _persist_finalization_intent(self, session_id: str, reason: str) -> None:
+        final_id = hashlib.sha256(session_id.encode()).hexdigest()
+        _atomic_json(self._finalization_intent_path(final_id), {
+            "final_id": final_id,
+            "session_id": redact_for_export(session_id),
+            "reason": redact_for_export(reason),
+            "partition": self._checkpoint_path().name,
+        })
+
+    def _merge_finalization_intents(self, state: dict[str, Any]) -> list[Path]:
+        """Adopt lease-starved finalization boundaries before any further side effect."""
+        directory = self.home / "state" / "fleet-session-lifecycle-finalizations"
+        try:
+            paths = tuple(directory.glob("*.json"))
+        except OSError:
+            return []
+        intents = state.setdefault("finalization_intents", {})
+        adopted: list[Path] = []
+        for path in paths:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            session_id = str(payload.get("session_id") or "")
+            final_id = str(payload.get("final_id") or "")
+            partition = str(payload.get("partition") or "")
+            if (
+                not session_id
+                or final_id != hashlib.sha256(session_id.encode()).hexdigest()
+                or path.name != f"{final_id}.json"
+                or not _PARTITION_NAME.fullmatch(partition)
+            ):
+                continue
+            intents[final_id] = {
+                "session_id": session_id,
+                "reason": redact_for_export(payload.get("reason")),
+                "partition": partition,
+                "replay_only": True,
+            }
+            adopted.append(path)
+        return adopted
+
+    def _replay_finalization_intents(self, state: dict[str, Any], processed: list[str]) -> None:
+        """Commit every fully-described deferred finalization while the holder owns the lease."""
+        intents = state.setdefault("finalization_intents", {})
+        finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
+        for final_id, payload in list(intents.items()):
+            if not isinstance(payload, dict):
+                continue  # Legacy in-state intent is resumed by its original full_wrapup caller.
+            session_id = str(payload.get("session_id") or "")
+            partition = str(payload.get("partition") or "")
+            if not session_id or not _PARTITION_NAME.fullmatch(partition):
+                continue
+            replayed = self._drain_pending(state, processed, active_session_id=session_id)
+            if session_id in replayed:
+                finalized = [item for item in finalized if item != final_id]
+            if final_id not in finalized:
+                if not bool(payload.get("replay_only")) or not self._full_wrapup_has(final_id, partition):
+                    self._append_full_wrapup(session_id, str(payload.get("reason") or ""), final_id, partition)
+                finalized.append(final_id)
+            intents.pop(final_id, None)
+        state["finalized_sessions"] = finalized[-512:]
+
     @staticmethod
     def _run(argv: list[str], **kwargs: Any) -> int:
         return subprocess.run(argv, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -457,33 +562,31 @@ class LifecycleController:
         try:
             with self._lease_with_retry() as acquired:
                 if not acquired:
-                    logger.warning("fleet-session-lifecycle: final wrap-up lease remained busy")
+                    self._persist_finalization_intent(session_id, reason)
+                    logger.warning("fleet-session-lifecycle: final wrap-up lease remained busy; intent retained")
                     return
                 state = self._state()
+                cancellation_intents, cancelled_events = self._merge_cancellation_intents(state)
                 completion_intents = self._merge_completion_intents(state)
-                if completion_intents:
+                finalization_intents = self._merge_finalization_intents(state)
+                if cancellation_intents or completion_intents or finalization_intents:
                     _atomic_json(self.state_path, state)
+                    self._clear_cancellation_intents(cancellation_intents, cancelled_events)
                     self._clear_completion_intents(completion_intents)
+                    self._clear_completion_intents(finalization_intents)
                 state["vault_profile"] = self.profile
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
-                replayed_sessions = self._drain_pending(state, processed, active_session_id=session_id)
-                finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
-                cleared = {hashlib.sha256(item.encode()).hexdigest() for item in replayed_sessions if item}
-                finalized = [item for item in finalized if item not in cleared]
-                final_id = hashlib.sha256(session_id.encode()).hexdigest()
                 intents = state.setdefault("finalization_intents", {})
+                final_id = hashlib.sha256(session_id.encode()).hexdigest()
                 resuming_finalization = final_id in intents
-                partition = str(intents.get(final_id) or self._checkpoint_path().name)
-                if not _PARTITION_NAME.fullmatch(partition):
-                    partition = self._checkpoint_path().name
-                intents[final_id] = partition
+                intents[final_id] = {
+                    "session_id": redact_for_export(session_id),
+                    "reason": redact_for_export(reason),
+                    "partition": self._checkpoint_path().name,
+                    "replay_only": resuming_finalization,
+                }
                 _atomic_json(self.state_path, state)
-                if final_id not in finalized:
-                    if not resuming_finalization or not self._full_wrapup_has(final_id, partition):
-                        self._append_full_wrapup(session_id, reason, final_id, partition)
-                    finalized.append(final_id)
-                intents.pop(final_id, None)
-                state["finalized_sessions"] = finalized[-512:]
+                self._replay_finalization_intents(state, processed)
                 state["processed_turns"] = processed[-512:]
                 state["updated_at"] = int(time.time())
                 _atomic_json(self.state_path, state)
@@ -498,9 +601,11 @@ class LifecycleController:
         try:
             with self._lease_with_retry() as acquired:
                 if not acquired:
-                    logger.warning("fleet-session-lifecycle: disabled session cancellation lease remained busy")
+                    self._persist_cancellation_intent(session_id)
+                    logger.warning("fleet-session-lifecycle: disabled session cancellation lease remained busy; intent retained")
                     return
                 state = self._state()
+                cancellation_intents, cancelled_events = self._merge_cancellation_intents(state)
                 pending = state.setdefault("pending_turns", {})
                 removed = [
                     event_id for event_id, event in pending.items()
@@ -508,13 +613,11 @@ class LifecycleController:
                 ]
                 for event_id in removed:
                     pending.pop(event_id, None)
-                if removed:
+                if cancellation_intents or removed:
                     _atomic_json(self.state_path, state)
-                for event_id in removed:
-                    try:
-                        self._completion_intent_path(event_id).unlink()
-                    except FileNotFoundError:
-                        pass
+                    self._clear_cancellation_intents(cancellation_intents, [*cancelled_events, *removed])
+                else:
+                    self._clear_cancellation_intents(cancellation_intents, cancelled_events)
         except Exception:
             logger.exception("fleet-session-lifecycle: disabled session cancellation failed")
 
@@ -592,12 +695,17 @@ class LifecycleController:
                     logger.warning("fleet-session-lifecycle: after-turn lease remained busy; completion intent retained")
                     return
                 state = self._state()
+                cancellation_intents, cancelled_events = self._merge_cancellation_intents(state)
                 completion_intents = self._merge_completion_intents(state)
-                if completion_intents:
+                finalization_intents = self._merge_finalization_intents(state)
+                if cancellation_intents or completion_intents or finalization_intents:
                     _atomic_json(self.state_path, state)
+                    self._clear_cancellation_intents(cancellation_intents, cancelled_events)
                     self._clear_completion_intents(completion_intents)
+                    self._clear_completion_intents(finalization_intents)
                 state["vault_profile"] = self.profile
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
+                self._replay_finalization_intents(state, processed)
                 current_was_processed = event_id in processed
                 pending = state.setdefault("pending_turns", {})
                 event = pending.get(event_id)
