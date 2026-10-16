@@ -38,7 +38,10 @@ jobs:
     # slices agree on the split without a planning job.
     name: Run tests (${{ matrix.slice }}/2)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Hosted 2-way slices exceeded 30 minutes while still making continuous
+    # progress (60% and 85% complete at cancellation). Keep the job budget
+    # above the full observed wall time; per-file limits still fail real hangs.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

@@ -57,6 +57,10 @@ def test_required_ci_lanes_use_stock_hosted_runners() -> None:
     """Required Python and native-Windows lanes must not wait on unprovisioned labels."""
     tests = _yaml(".github/workflows/tests.yml")["jobs"]
     assert {tests[name]["runs-on"] for name in ("test", "e2e", "e2e-upgrade")} == {"ubuntu-latest"}
+    # Two slices each ran continuously until GitHub cancelled them at the prior
+    # 30-minute job ceiling. Keep the job ceiling above the full observed slice
+    # wall time while preserving the per-file failure bounds in the runner.
+    assert tests["test"]["timeout-minutes"] == 60
 
     os_tests = _yaml(".github/workflows/tests-os.yml")["jobs"]
     matrix = os_tests["os-tests"]["strategy"]["matrix"]["include"]
