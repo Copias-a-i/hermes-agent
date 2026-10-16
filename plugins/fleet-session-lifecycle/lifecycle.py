@@ -223,6 +223,7 @@ class LifecycleController:
             f"- session_id: {event['session_id']}", f"- turn_id: {event['turn_id']}",
             f"- completed: {str(event['completed']).lower()}", f"- interrupted: {str(event['interrupted']).lower()}",
             f"- user: {event['user']}", f"- response: {event['response']}",
+            f"<!-- hermes-lifecycle checkpoint committed: {event['event_id']} -->",
         )) + "\n"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -249,7 +250,11 @@ class LifecycleController:
             paths = (self._checkpoint_path(),)
         for path in paths:
             try:
-                if f"- event_id: {event_id}" in path.read_text(encoding="utf-8-sig"):
+                contents = path.read_text(encoding="utf-8-sig")
+                if (
+                    f"- event_id: {event_id}" in contents
+                    and f"<!-- hermes-lifecycle checkpoint committed: {event_id} -->" in contents
+                ):
                     return True
             except OSError:
                 continue
@@ -298,30 +303,57 @@ class LifecycleController:
             handle.flush()
             os.fsync(handle.fileno())
 
-    def full_wrapup(self, *, session_id: str, reason: str = "") -> None:
-        """Persist the final `/wrapup`-equivalent boundary exactly once, fail isolated.
+    def _drain_pending(self, state: dict[str, Any], processed: list[str]) -> set[str]:
+        """Replay durable events before removing their intent or closing a session."""
+        replayed_sessions: set[str] = set()
+        pending = state.setdefault("pending_turns", {})
+        for pending_id, pending_event in list(pending.items()):
+            if not isinstance(pending_event, dict):
+                pending.pop(pending_id, None)
+                continue
+            if pending_id not in processed:
+                # Make completion and planned delivery recoverable before any filesystem or adapter effect.
+                pending_event["outbox_intent"] = True
+                _atomic_json(self.state_path, state)
+                partition = str(pending_event.get("checkpoint_partition") or "") or None
+                if not self._checkpoint_has(pending_id, partition, recovery=partition is None):
+                    self._append_checkpoint(pending_event)
+                processed.append(pending_id)
+                _atomic_json(self.state_path, state)
+                self._outbox_index(pending_event, state)
+                replayed_sessions.add(str(pending_event.get("session_id") or ""))
+            pending.pop(pending_id, None)
+        return replayed_sessions
 
-        Finalization is intentionally filesystem-only: invoking a slash command or
-        model turn here could recursively fire lifecycle hooks or race response delivery.
-        """
+    def full_wrapup(self, *, session_id: str, reason: str = "") -> None:
+        """Persist the final `/wrapup` boundary, retrying transient lease contention."""
         if not session_id:
             return
         try:
-            with self._lease() as acquired:
-                if not acquired:
+            deadline = time.monotonic() + max(0.0, float(self.config.get("finalize_lease_wait_seconds", 2)))
+            while True:
+                with self._lease() as acquired:
+                    if acquired:
+                        state = self._state()
+                        state["vault_profile"] = self.profile
+                        processed = [str(item) for item in (state.get("processed_turns") or ())]
+                        replayed_sessions = self._drain_pending(state, processed)
+                        finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
+                        cleared = {hashlib.sha256(item.encode()).hexdigest() for item in replayed_sessions if item}
+                        finalized = [item for item in finalized if item not in cleared]
+                        final_id = hashlib.sha256(session_id.encode()).hexdigest()
+                        if final_id not in finalized:
+                            self._append_full_wrapup(session_id, reason)
+                            finalized.append(final_id)
+                        state["finalized_sessions"] = finalized[-512:]
+                        state["processed_turns"] = processed[-512:]
+                        state["updated_at"] = int(time.time())
+                        _atomic_json(self.state_path, state)
+                        return
+                if time.monotonic() >= deadline:
+                    logger.warning("fleet-session-lifecycle: final wrap-up lease remained busy")
                     return
-                state = self._state()
-                state["vault_profile"] = self.profile
-                finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
-                final_id = hashlib.sha256(session_id.encode()).hexdigest()
-                if final_id in finalized:
-                    return
-                self._append_full_wrapup(session_id, reason)
-                finalized.append(final_id)
-                # Preserve arrival order, not lexical hash order, when pruning recency.
-                state["finalized_sessions"] = finalized[-512:]
-                state["updated_at"] = int(time.time())
-                _atomic_json(self.state_path, state)
+                time.sleep(0.05)
         except Exception:
             logger.exception("fleet-session-lifecycle: full wrap-up checkpoint failed for this session")
             return
@@ -399,23 +431,14 @@ class LifecycleController:
                     event.update(completed=bool(completed), interrupted=bool(interrupted),
                                  user=redact_for_export(user_message) or event.get("user", ""),
                                  response=redact_for_export(assistant_response))
-                for pending_id, pending_event in list(pending.items()):
-                    if not isinstance(pending_event, dict):
-                        pending.pop(pending_id, None)
-                        continue
-                    if pending_id not in processed:
-                        partition = str(pending_event.get("checkpoint_partition") or "") or None
-                        if not self._checkpoint_has(pending_id, partition, recovery=partition is None):
-                            self._append_checkpoint(pending_event)
-                        processed.append(pending_id)
-                        self._outbox_index(pending_event, state)
-                    pending.pop(pending_id, None)
-                # New post-finalization activity opens a later final boundary for this session.
-                if not current_was_processed:
-                    final_id = hashlib.sha256(session_id.encode()).hexdigest()
-                    state["finalized_sessions"] = [
-                        item for item in (state.get("finalized_sessions") or ()) if str(item) != final_id
-                    ]
+                    # An admitted event becomes complete before any checkpoint/outbox side effect.
+                    _atomic_json(self.state_path, state)
+                replayed_sessions = self._drain_pending(state, processed)
+                # Any recovered event is new activity for its own session, not just this callback.
+                cleared = {hashlib.sha256(item.encode()).hexdigest() for item in replayed_sessions if item}
+                state["finalized_sessions"] = [
+                    item for item in (state.get("finalized_sessions") or ()) if str(item) not in cleared
+                ]
                 # Bound ledger preserves turn arrival order so retry dedup retains the newest ids.
                 state["processed_turns"] = processed[-512:]
                 state["updated_at"] = int(time.time())

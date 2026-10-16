@@ -640,7 +640,10 @@ def test_recovery_checks_prior_daily_partition_before_reappending(monkeypatch, t
     old_event_id = "old-event"
     old_checkpoint = vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
     old_checkpoint.parent.mkdir(parents=True)
-    old_checkpoint.write_text(f"- event_id: {old_event_id}\n", encoding="utf-8")
+    old_checkpoint.write_text(
+        f"- event_id: {old_event_id}\n<!-- hermes-lifecycle checkpoint committed: {old_event_id} -->\n",
+        encoding="utf-8",
+    )
     state_path = home / "state" / "fleet-session-lifecycle.json"
     state_path.parent.mkdir()
     state_path.write_text(json.dumps({"pending_turns": {old_event_id: {
@@ -711,3 +714,98 @@ def test_resumed_session_can_write_a_new_full_wrapup_after_later_turn(tmp_path):
     checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
     assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 2
     assert "reason: second-exit" in checkpoint
+
+
+def test_partial_checkpoint_record_is_not_accepted_for_recovery(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path)
+    event_id = "partial-event"
+    path = vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
+    path.parent.mkdir(parents=True)
+    path.write_text(f"<!-- hermes-lifecycle incremental checkpoint -->\\n- event_id: {event_id}\\n", encoding="utf-8")
+
+    assert controller._checkpoint_has(event_id, path.name) is False
+
+
+def test_full_wrapup_drains_durable_pending_before_boundary(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    event_id = "admitted-before-exit"
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({"pending_turns": {event_id: {
+        "event_id": event_id, "session_id": "closing", "turn_id": "interrupted",
+        "completed": False, "interrupted": True, "user": "u", "response": "",
+    }}}), encoding="utf-8")
+
+    controller.full_wrapup(session_id="closing", reason="quit")
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert checkpoint.index(f"event_id: {event_id}") < checkpoint.index("full-wrapup checkpoint")
+    assert event_id not in state["pending_turns"]
+
+
+def test_completed_turn_is_durable_before_checkpoint_side_effect(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.admit_turn(session_id="s", turn_id="t", user_message="question")
+    monkeypatch.setattr(controller, "_append_checkpoint", lambda _event: (_ for _ in ()).throw(OSError("disk")))
+
+    controller.after_turn(session_id="s", turn_id="t", completed=True, interrupted=False,
+                          user_message="question", assistant_response="answer", conversation_history=[], cwd="")
+
+    event_id = __import__("hashlib").sha256("s\0t".encode()).hexdigest()
+    event = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["pending_turns"][event_id]
+    assert event["completed"] is True
+    assert event["interrupted"] is False
+    assert event["response"] == "answer"
+    assert event["outbox_intent"] is True
+
+
+def test_full_wrapup_retries_busy_lease_without_dropping_boundary(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path)
+    original_lease = controller._lease
+    attempts = 0
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def busy_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            yield False
+        else:
+            with original_lease() as acquired:
+                yield acquired
+
+    monkeypatch.setattr(controller, "_lease", busy_once)
+    controller.full_wrapup(session_id="closing", reason="quit")
+
+    assert attempts == 2
+    assert "full-wrapup checkpoint" in _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+
+
+def test_replay_clears_finalization_marker_for_recovered_event_session(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    session_a = "recovered-a"
+    final_a = __import__("hashlib").sha256(session_a.encode()).hexdigest()
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({
+        "finalized_sessions": [final_a],
+        "pending_turns": {"recovered-event": {
+            "event_id": "recovered-event", "session_id": session_a, "turn_id": "old-turn",
+            "completed": True, "interrupted": False, "user": "u", "response": "a",
+        }},
+    }), encoding="utf-8")
+
+    controller.after_turn(session_id="callback-b", turn_id="new-turn", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    controller.full_wrapup(session_id=session_a, reason="resumed-exit")
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert "reason: resumed-exit" in checkpoint
