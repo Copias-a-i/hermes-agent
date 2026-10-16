@@ -123,6 +123,47 @@ class LifecycleController:
             handle.flush()
             os.fsync(handle.fileno())
 
+    def _append_full_wrapup(self, session_id: str, reason: str) -> None:
+        """Write the session-bound final checkpoint without creating an agent turn."""
+        path = self._checkpoint_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = "\n".join((
+            "\n<!-- hermes-lifecycle full-wrapup checkpoint -->",
+            f"- session_id: {redact_for_export(session_id)}",
+            f"- reason: {redact_for_export(reason)}",
+            "- transcript_checkpointed: true",
+            "- delivery_message: none",
+        )) + "\n"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def full_wrapup(self, *, session_id: str, reason: str = "") -> None:
+        """Persist the final `/wrapup`-equivalent boundary exactly once, fail isolated.
+
+        Finalization is intentionally filesystem-only: invoking a slash command or
+        model turn here could recursively fire lifecycle hooks or race response delivery.
+        """
+        if not session_id:
+            return
+        try:
+            with self._lease() as acquired:
+                if not acquired:
+                    return
+                state = self._state()
+                finalized = {str(item) for item in (state.get("finalized_sessions") or ())}
+                final_id = hashlib.sha256(session_id.encode()).hexdigest()
+                if final_id in finalized:
+                    return
+                self._append_full_wrapup(session_id, reason)
+                finalized.add(final_id)
+                state["finalized_sessions"] = sorted(finalized)[-512:]
+                state["updated_at"] = int(time.time())
+                _atomic_json(self.state_path, state)
+        except Exception:
+            return
+
     def _pinecone_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
         """Queue only redacted derived text for an explicitly configured indexer.
 

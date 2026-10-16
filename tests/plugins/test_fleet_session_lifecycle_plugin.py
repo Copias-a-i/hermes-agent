@@ -212,3 +212,46 @@ def test_pinecone_unavailable_stays_pending_without_touching_gbrain(tmp_path):
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
     assert state["pinecone"] == {"last_status": "unavailable", "write_pending": True}
     assert "gbrain" not in state
+
+
+def test_final_wrapup_is_idempotent_and_never_runs_a_model_or_returns_a_message(tmp_path):
+    mod = _load_lifecycle()
+    calls = []
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *args, **kwargs: calls.append((args, kwargs)) or 0)
+
+    assert controller.full_wrapup(session_id="closing", reason="reset") is None
+    assert controller.full_wrapup(session_id="closing", reason="reset") is None
+
+    checkpoint = (vault / "jarvis" / "daily" / "hermes-lifecycle.md").read_text(encoding="utf-8")
+    assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 1
+    assert "session_id: closing" in checkpoint
+    assert "reason: reset" in checkpoint
+    assert calls == []
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
+    assert state["finalized_sessions"]
+
+
+def test_finalize_hook_runs_full_wrapup_without_response_delivery(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    registered = {}
+
+    class Context:
+        def register_hook(self, name, callback):
+            registered[name] = callback
+
+    plugin.register(Context())
+    assert "on_session_finalize" in registered
+    captured = {}
+
+    class Controller:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def full_wrapup(self, **kwargs):
+            captured.update(kwargs)
+            return "must not deliver"
+
+    monkeypatch.setattr(plugin, "LifecycleController", Controller)
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
+    assert registered["on_session_finalize"](session_id="closing", reason="quit") is None
+    assert captured == {"session_id": "closing", "reason": "quit"}

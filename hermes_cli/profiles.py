@@ -1481,6 +1481,11 @@ def _finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: boo
     # read by users as "the new profile reads the root .env". Skipped when a clone copied one.
     _seed_file_if_missing(profile_dir / ".env", _PLACEHOLDER_ENV, 0o600)
 
+    # Backend plugins auto-load from the installation; this profile-local marker
+    # gives future profiles the same lifecycle migration state before publication.
+    from hermes_cli.fleet_session_lifecycle import install_profile_lifecycle
+    install_profile_lifecycle(profile_dir)
+
     # Default SOUL.md to customize immediately (skipped when a clone already provided one).
     with contextlib.suppress(Exception):  # best-effort — don't fail profile creation over this
         from hermes_cli.default_soul import DEFAULT_SOUL_MD
@@ -1560,6 +1565,17 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
         if not quiet:
             print(f"⚠ Skill seeding failed: {e}")
         return None
+
+
+def backfill_fleet_session_lifecycles() -> List[Path]:
+    """Install the bundled lifecycle marker for the default and every named profile.
+
+    This migration is deliberately independent per profile: a permission or
+    filesystem failure in one profile cannot prevent the others from inheriting
+    the bundled backend plugin on their next session.
+    """
+    from hermes_cli.fleet_session_lifecycle import install_profile_lifecycles
+    return install_profile_lifecycles([_get_default_hermes_home(), *_iter_named_profile_dirs()])
 
 
 def backfill_profile_envs(quiet: bool = False) -> List[str]:

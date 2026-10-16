@@ -156,6 +156,23 @@ class TestCreateProfile:
         assert mode == 0o600
 
 
+    def test_seeds_lifecycle_marker_for_future_session_inheritance(self, profile_env):
+        """Every new profile gets the bundled lifecycle marker before publish."""
+        profile_dir = create_profile("lifecycle-child", no_alias=True)
+        marker = profile_dir / "state" / "fleet-session-lifecycle-v1"
+        assert marker.read_text(encoding="utf-8") == "fleet-session-lifecycle.v1\n"
+
+    def test_backfills_existing_profiles_idempotently(self, profile_env):
+        """An update migrates the default and every existing named profile once."""
+        default_home = profile_env / ".hermes"
+        legacy = create_profile("lifecycle-legacy", no_alias=True)
+        (default_home / "state" / "fleet-session-lifecycle-v1").unlink(missing_ok=True)
+        (legacy / "state" / "fleet-session-lifecycle-v1").unlink(missing_ok=True)
+
+        changed = profiles.backfill_fleet_session_lifecycles()
+        assert {path.name for path in changed} == {".hermes", "lifecycle-legacy"}
+        assert profiles.backfill_fleet_session_lifecycles() == []
+
     def test_fresh_profile_inherits_a_usable_model(self, profile_env):
         """A profile created without a clone source still resolves a provider.
 

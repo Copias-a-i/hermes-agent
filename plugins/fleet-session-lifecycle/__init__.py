@@ -68,7 +68,19 @@ def _on_session_end(**kwargs: Any) -> None:
         return
 
 
+def _on_session_finalize(**kwargs: Any) -> None:
+    """Flush a durable full wrap-up checkpoint without producing a user response."""
+    try:
+        LifecycleController(get_hermes_home(), _config()).full_wrapup(
+            session_id=str(kwargs.get("session_id") or ""),
+            reason=str(kwargs.get("reason") or ""),
+        )
+    except Exception:
+        return
+
+
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
