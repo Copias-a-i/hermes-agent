@@ -62,6 +62,8 @@ def test_required_ci_lanes_use_stock_hosted_runners() -> None:
     matrix = os_tests["os-tests"]["strategy"]["matrix"]["include"]
     windows = [cell for cell in matrix if cell.get("marker") == "windows"]
     assert [cell["runner"] for cell in windows] == ["windows-latest"]
+    run_step = next(step for step in os_tests["os-tests"]["steps"] if step["name"] == "Run ${{ matrix.marker }} tests")
+    assert run_step["env"]["HERMES_TEST_WORKERS"] == "${{ matrix.marker == 'windows' && '4' || '' }}"
     assert os_tests["e2e-windows"]["runs-on"] == "windows-latest"
     assert _yaml(".github/workflows/windows-install-update-e2e.yml")["jobs"]["install-update"]["runs-on"] == "windows-latest"
 
