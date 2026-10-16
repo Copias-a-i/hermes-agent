@@ -51,6 +51,31 @@ _spec.loader.exec_module(cc)
 # marker so a green Windows job has run them on that layout (review F81-R). Not "any": macOS
 # bash 3.2 is not a host the replay has been run on.
 _NATIVE_WINDOWS_PLATFORMS = pytest.mark.platforms("linux", "windows")
+
+
+def test_required_ci_lanes_use_stock_hosted_runners() -> None:
+    """Required Python and native-Windows lanes must not wait on unprovisioned labels."""
+    tests = _yaml(".github/workflows/tests.yml")["jobs"]
+    assert {tests[name]["runs-on"] for name in ("test", "e2e", "e2e-upgrade")} == {"ubuntu-latest"}
+
+    os_tests = _yaml(".github/workflows/tests-os.yml")["jobs"]
+    matrix = os_tests["os-tests"]["strategy"]["matrix"]["include"]
+    windows = [cell for cell in matrix if cell.get("marker") == "windows"]
+    assert [cell["runner"] for cell in windows] == ["windows-latest"]
+    assert os_tests["e2e-windows"]["runs-on"] == "windows-latest"
+    assert _yaml(".github/workflows/windows-install-update-e2e.yml")["jobs"]["install-update"]["runs-on"] == "windows-latest"
+
+    unavailable = {"ubuntu-latest-32-core", "windows-latest-32-core", "windows-latest-32-arm-core"}
+    for workflow in (
+        ".github/workflows/tests.yml",
+        ".github/workflows/tests-os.yml",
+        ".github/workflows/windows-install-update-e2e.yml",
+    ):
+        parsed = _yaml(workflow)
+        rendered = json.dumps(parsed)
+        assert all(label not in rendered for label in unavailable)
+
+
 # Not Windows on arm64: Git for Windows ships an x86-64 MSYS bash.exe there, run under emulation,
 # and with the os-tests lane's 16 workers it dies with 0xC000026F (STATUS_WX86_INTERNAL_ERROR) or
 # 0xC0000005 before running a line, on replays of unchanged workflows: one copy of this file red
