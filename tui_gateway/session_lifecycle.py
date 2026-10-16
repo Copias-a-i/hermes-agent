@@ -351,6 +351,30 @@ def _lock_vault_managers(session: dict) -> None:
 
 
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
+    """Finalize only after an automatic Desktop reaper proves it still owns the lifecycle."""
+    if not session or session.get("_finalized"):
+        return
+    agent = session.get("agent")
+    session_id = getattr(agent, "session_id", None) or session.get("session_key")
+    automatic_desktop_cleanup = (
+        end_reason in _AUTOMATIC_SESSION_END_REASONS
+        and _session_source(session).strip().lower() == "desktop"
+    )
+    lifecycle_guard = (
+        _other_runtime_lease_guard(session_id, session)
+        if automatic_desktop_cleanup and session_id
+        else contextlib.nullcontext(False)
+    )
+    with lifecycle_guard as other_runtime_owns_lifecycle:
+        if other_runtime_owns_lifecycle:
+            logger.info("Preserving session %s during %s: another backend owns an active lease", session_id, end_reason)
+            return
+        _finalize_session_owned(session, end_reason=end_reason, lifecycle_guard_held=automatic_desktop_cleanup)
+
+
+def _finalize_session_owned(
+    session: dict | None, end_reason: str = "tui_close", *, lifecycle_guard_held: bool = False,
+) -> None:
     """Best-effort finalize hook + memory commit; mirrors the CLI exit path so a force-quit mid-turn (double
     Ctrl-C, terminal close, SIGHUP) loses nothing."""
     if not session or session.get("_finalized"):
@@ -392,11 +416,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         if agent is not None and history and hasattr(agent, "commit_memory_session"):
             with contextlib.suppress(Exception):
                 agent.commit_memory_session(history)
-        _notify_session_boundary(
-            "on_session_finalize",
-            getattr(agent, "session_id", None) or session.get("session_key"),
-            _session_source(session),
-        )
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
@@ -406,13 +425,19 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     if _desktop_automatic_cleanup and not session_id:
         _release_active_session_slot(session)
     # ``_lease_taken_over``: a new runtime for the same chat owns the row and its delegations now.
-    _lifecycle_guard = (_other_runtime_lease_guard(session_id, session)
-                        if _desktop_automatic_cleanup and session_id
-                        else contextlib.nullcontext(bool(session.get("_lease_taken_over"))))
+    _lifecycle_guard = (contextlib.nullcontext(False) if lifecycle_guard_held
+                        else (_other_runtime_lease_guard(session_id, session)
+                              if _desktop_automatic_cleanup and session_id
+                              else contextlib.nullcontext(bool(session.get("_lease_taken_over")))))
     with _lifecycle_guard as _other_runtime_owns_lifecycle:
         _tui_owns_lifecycle = not _other_runtime_owns_lifecycle
         if _other_runtime_owns_lifecycle:
             logger.info("Preserving session %s during %s: another backend owns an active lease", session_id, end_reason)
+        elif session_id:
+            # Finalize side effects must be lease-owner gated, while retaining the
+            # session's profile runtime scope for the lifecycle hook.
+            with _session_profile_runtime_scope(session):
+                _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
         if session_id:
             # The *session's* profile state.db (app-global remote mode), not the launch profile's.
             with contextlib.suppress(Exception), _session_db(session) as db:

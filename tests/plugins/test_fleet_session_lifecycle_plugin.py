@@ -332,6 +332,33 @@ def test_outbox_queue_is_two_lf_delimited_json_records(tmp_path):
     assert [row["turn_id"] for row in rows] == ["one", "two"]
 
 
+def test_crash_after_outbox_append_leaves_event_unprocessed_for_recovery(tmp_path, monkeypatch):
+    """Queue durability precedes the processed marker across the crash window."""
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 1)
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
+    original_index = controller._outbox_index
+
+    def queue_then_crash(event, state):
+        assert event["event_id"] not in state.get("processed_turns", [])
+        original_index(event, state)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller, "_outbox_index", queue_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        controller.after_turn(
+            session_id="s", turn_id="crash-after-queue", completed=True, interrupted=False,
+            user_message="u", assistant_response="a", conversation_history=[], cwd="",
+        )
+
+    event_id = __import__("hashlib").sha256(b"s\x00crash-after-queue").hexdigest()
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    queue = home / "state" / "fleet-session-lifecycle-outbox.jsonl"
+    assert event_id not in state.get("processed_turns", [])
+    assert event_id in state["pending_turns"]
+    assert event_id in queue.read_text(encoding="utf-8")
+
+
 def test_bom_prefixed_lifecycle_state_is_preserved(tmp_path):
     mod = _load_lifecycle()
     controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
@@ -374,6 +401,18 @@ def test_empty_outbox_command_has_no_queue_or_runner_side_effect(tmp_path):
     assert not (home / "state" / "fleet-session-lifecycle-outbox.jsonl").exists()
 
 
+def test_windows_platform_default_home_uses_default_vault_namespace(tmp_path, monkeypatch):
+    """The Windows default root is canonical, not a custom hashed profile."""
+    import hermes_constants
+
+    mod = _load_lifecycle()
+    local_appdata = tmp_path / "AppData" / "Local"
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+
+    assert mod.profile_name_for_home(local_appdata / "hermes") == "default"
+
+
 def test_vault_root_expands_home_before_checkpoint_path_use(tmp_path, monkeypatch):
     mod = _load_lifecycle()
     home = tmp_path / ".hermes" / "profiles" / "jarvis"
@@ -391,6 +430,7 @@ def test_vault_root_expands_home_before_checkpoint_path_use(tmp_path, monkeypatc
     assert not (Path.cwd() / "~" / ".agent-vault").exists()
 
 
+@pytest.mark.platforms("posix")
 def test_stale_dead_lock_is_reclaimed_but_live_lock_is_preserved(tmp_path, monkeypatch):
     mod = _load_lifecycle()
     home = tmp_path / ".hermes" / "profiles" / "jarvis"
@@ -471,6 +511,7 @@ def test_profile_scoped_process_leases_do_not_serialize_unrelated_profiles(tmp_p
     assert not second.is_alive()
 
 
+@pytest.mark.platforms("posix")
 def test_stale_lease_reclamation_retains_the_current_owner_metadata(tmp_path):
     mod = _load_lifecycle()
     controller, _home, _vault = _controller(
@@ -906,6 +947,19 @@ def test_full_wrapup_recovers_after_append_before_finalized_ledger(tmp_path, mon
     assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 1
 
 
+def test_checkpoint_and_full_wrapup_fsync_daily_directory(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path)
+    synced = []
+    monkeypatch.setattr(mod, "_fsync_directory", lambda path: synced.append(path))
+
+    controller.after_turn(session_id="s", turn_id="checkpoint", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    controller.full_wrapup(session_id="s", reason="quit")
+
+    assert synced.count(vault / "jarvis" / "daily") >= 2
+
+
 def test_atomic_json_fsyncs_parent_directory_after_replace(tmp_path, monkeypatch):
     mod = _load_lifecycle()
     path = tmp_path / "state" / "admission.json"
@@ -1032,6 +1086,43 @@ def test_cancel_session_persists_busy_lease_cancellation_for_next_process(tmp_pa
         state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
         assert state["pending_turns"] == {}
         assert not intent.exists()
+    finally:
+        release.set()
+        holder.join(3)
+
+
+def test_busy_cancellation_dominates_a_concurrent_completion_intent(tmp_path):
+    """A cancellation written after a lease-starved completion prevents its replay."""
+    mod = _load_lifecycle()
+    if mod.fcntl is None:
+        pytest.skip("requires POSIX flock")
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["finalize_lease_wait_seconds"] = 0
+    controller.admit_turn(session_id="disabled", turn_id="turn", user_message="question")
+    context = multiprocessing.get_context("forkserver")
+    ready, release = context.Event(), context.Event()
+    holder = context.Process(target=_hold_profile_lease, args=(str(home), str(vault), ready, release))
+    holder.start()
+    try:
+        assert ready.wait(2)
+        controller.after_turn(
+            session_id="disabled", turn_id="turn", completed=True, interrupted=False,
+            user_message="question", assistant_response="answer", conversation_history=[], cwd="",
+        )
+        controller.cancel_session(session_id="disabled")
+        release.set()
+        holder.join(3)
+        assert holder.exitcode == 0
+        next_holder = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+        next_holder.after_turn(
+            session_id="other", turn_id="next", completed=True, interrupted=False,
+            user_message="u", assistant_response="a", conversation_history=[], cwd="",
+        )
+        event_id = __import__("hashlib").sha256(b"disabled\x00turn").hexdigest()
+        state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+        checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+        assert event_id not in state["processed_turns"]
+        assert "turn_id: turn" not in checkpoint
     finally:
         release.set()
         holder.join(3)

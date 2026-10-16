@@ -56,7 +56,8 @@ def profile_name_for_home(home: Path) -> str:
     """Return a stable, profile-local vault namespace without ambient-home fallback."""
     if home.parent.name == "profiles":
         return home.name
-    if home.name == ".hermes":
+    from hermes_constants import _get_platform_default_hermes_home
+    if home.resolve() == _get_platform_default_hermes_home().resolve():
         return "default"
     # Custom homes must not collapse into default: their resolved identity remains stable
     # across processes without exposing the local path in vault filenames.
@@ -139,8 +140,10 @@ class LifecycleController:
         if event_id:
             _atomic_json(self._completion_intent_path(event_id), event)
 
-    def _merge_completion_intents(self, state: dict[str, Any]) -> list[Path]:
-        """Adopt per-event completion intents while holding the lifecycle lease."""
+    def _merge_completion_intents(
+        self, state: dict[str, Any], *, cancelled_sessions: set[str] | None = None,
+    ) -> list[Path]:
+        """Adopt completions unless a durable cancellation already owns their session."""
         directory = self.home / "state" / "fleet-session-lifecycle-completions"
         try:
             intents = tuple(directory.glob("*.json"))
@@ -148,6 +151,7 @@ class LifecycleController:
             return []
         pending = state.setdefault("pending_turns", {})
         adopted: list[Path] = []
+        cancelled_sessions = cancelled_sessions or set()
         for path in intents:
             try:
                 event = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -155,6 +159,11 @@ class LifecycleController:
                 continue
             event_id = str(event.get("event_id") or "")
             if not event_id or path.name != f"{event_id}.json":
+                continue
+            # A cancellation is terminal: never let a lease-starved completion
+            # re-admit its event after cancellation removed the durable pending row.
+            if str(event.get("session_id") or "") in cancelled_sessions:
+                adopted.append(path)
                 continue
             event["active"] = False
             pending[event_id] = event
@@ -177,16 +186,17 @@ class LifecycleController:
         """Durably defer disabled-session cleanup while another process owns state."""
         _atomic_json(self._cancellation_intent_path(session_id), {"session_id": redact_for_export(session_id)})
 
-    def _merge_cancellation_intents(self, state: dict[str, Any]) -> tuple[list[Path], list[str]]:
+    def _merge_cancellation_intents(self, state: dict[str, Any]) -> tuple[list[Path], list[str], set[str]]:
         """Apply deferred cancellation only while holding the lifecycle lease."""
         directory = self.home / "state" / "fleet-session-lifecycle-cancellations"
         try:
             paths = tuple(directory.glob("*.json"))
         except OSError:
-            return [], []
+            return [], [], set()
         pending = state.setdefault("pending_turns", {})
         adopted: list[Path] = []
         removed: list[str] = []
+        cancelled_sessions: set[str] = set()
         for path in paths:
             try:
                 payload = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -195,12 +205,13 @@ class LifecycleController:
             session_id = str(payload.get("session_id") or "") if isinstance(payload, dict) else ""
             if not session_id or path.name != f"{hashlib.sha256(session_id.encode()).hexdigest()}.json":
                 continue
+            cancelled_sessions.add(session_id)
             for event_id, event in list(pending.items()):
                 if isinstance(event, dict) and str(event.get("session_id") or "") == session_id:
                     pending.pop(event_id, None)
                     removed.append(str(event_id))
             adopted.append(path)
-        return adopted, removed
+        return adopted, removed, cancelled_sessions
 
     def _clear_cancellation_intents(self, paths: list[Path], removed: list[str]) -> None:
         self._clear_completion_intents([self._completion_intent_path(event_id) for event_id in removed])
@@ -431,6 +442,7 @@ class LifecycleController:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
 
     def _checkpoint_has(self, event_id: str, partition: str | None = None, *, recovery: bool = False) -> bool:
         """Check one recorded partition; scan history only to recover legacy pending state.
@@ -510,6 +522,7 @@ class LifecycleController:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
 
     def _full_wrapup_has(self, final_id: str, partition: str) -> bool:
         try:
@@ -548,9 +561,11 @@ class LifecycleController:
                 partition = str(pending_event.get("checkpoint_partition") or "") or None
                 if not self._checkpoint_has(pending_id, partition, recovery=partition is None):
                     self._append_checkpoint(pending_event)
+                # Append and fsync the durable adapter queue before recording the
+                # event as processed, so a crash cannot permanently skip delivery.
+                self._outbox_index(pending_event, state)
                 processed.append(pending_id)
                 _atomic_json(self.state_path, state)
-                self._outbox_index(pending_event, state)
                 replayed_sessions.add(str(pending_event.get("session_id") or ""))
             pending.pop(pending_id, None)
         return replayed_sessions
@@ -566,8 +581,8 @@ class LifecycleController:
                     logger.warning("fleet-session-lifecycle: final wrap-up lease remained busy; intent retained")
                     return
                 state = self._state()
-                cancellation_intents, cancelled_events = self._merge_cancellation_intents(state)
-                completion_intents = self._merge_completion_intents(state)
+                cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
+                completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
                 finalization_intents = self._merge_finalization_intents(state)
                 if cancellation_intents or completion_intents or finalization_intents:
                     _atomic_json(self.state_path, state)
@@ -605,7 +620,9 @@ class LifecycleController:
                     logger.warning("fleet-session-lifecycle: disabled session cancellation lease remained busy; intent retained")
                     return
                 state = self._state()
-                cancellation_intents, cancelled_events = self._merge_cancellation_intents(state)
+                cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
+                cancelled_sessions.add(session_id)
+                completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
                 pending = state.setdefault("pending_turns", {})
                 removed = [
                     event_id for event_id, event in pending.items()
@@ -613,9 +630,10 @@ class LifecycleController:
                 ]
                 for event_id in removed:
                     pending.pop(event_id, None)
-                if cancellation_intents or removed:
+                if cancellation_intents or removed or completion_intents:
                     _atomic_json(self.state_path, state)
                     self._clear_cancellation_intents(cancellation_intents, [*cancelled_events, *removed])
+                    self._clear_completion_intents(completion_intents)
                 else:
                     self._clear_cancellation_intents(cancellation_intents, cancelled_events)
         except Exception:
@@ -695,8 +713,8 @@ class LifecycleController:
                     logger.warning("fleet-session-lifecycle: after-turn lease remained busy; completion intent retained")
                     return
                 state = self._state()
-                cancellation_intents, cancelled_events = self._merge_cancellation_intents(state)
-                completion_intents = self._merge_completion_intents(state)
+                cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
+                completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
                 finalization_intents = self._merge_finalization_intents(state)
                 if cancellation_intents or completion_intents or finalization_intents:
                     _atomic_json(self.state_path, state)
