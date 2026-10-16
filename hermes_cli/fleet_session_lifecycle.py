@@ -20,7 +20,7 @@ def install_profile_lifecycle(profile_dir: Path) -> bool:
     marker = Path(profile_dir) / "state" / _MARKER_NAME
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        if marker.is_file() and marker.read_text(encoding="utf-8") == _MARKER_CONTENT:
+        if marker.is_file() and marker.read_text(encoding="utf-8-sig") == _MARKER_CONTENT:
             return False
         marker.write_text(_MARKER_CONTENT, encoding="utf-8")
         return True

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,8 @@ from typing import Any
 from hermes_constants import get_hermes_home
 
 from .lifecycle import LifecycleController
+
+logger = logging.getLogger(__name__)
 
 _pending: dict[tuple[str, str], dict[str, Any]] = {}
 _pending_lock = threading.Lock()
@@ -21,6 +24,7 @@ def _config() -> dict[str, Any]:
         value = root.get("fleet_session_lifecycle")
         return value if isinstance(value, dict) else {}
     except Exception:
+        logger.exception("fleet-session-lifecycle: config unreadable; using built-in defaults")
         return {}
 
 
@@ -65,6 +69,7 @@ def _on_session_end(**kwargs: Any) -> None:
             conversation_history=saved.get("conversation_history", []), cwd=str(Path.cwd()),
         )
     except Exception:
+        logger.exception("fleet-session-lifecycle: turn checkpoint failed; turn stays deliverable")
         return
 
 
@@ -76,6 +81,7 @@ def _on_session_finalize(**kwargs: Any) -> None:
             reason=str(kwargs.get("reason") or ""),
         )
     except Exception:
+        logger.exception("fleet-session-lifecycle: full wrap-up flush failed; session still ends")
         return
 
 

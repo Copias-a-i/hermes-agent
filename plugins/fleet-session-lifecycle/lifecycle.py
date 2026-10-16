@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -26,6 +27,8 @@ _SECRET_PATTERNS = (
 )
 _MAX_TEXT = 600
 _DEFAULT_GBRAIN = ("gbrain", "sync")
+
+logger = logging.getLogger(__name__)
 
 
 def redact_for_export(value: Any) -> str:
@@ -76,7 +79,7 @@ class LifecycleController:
 
     def _state(self) -> dict[str, Any]:
         try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            data = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
@@ -162,6 +165,7 @@ class LifecycleController:
                 state["updated_at"] = int(time.time())
                 _atomic_json(self.state_path, state)
         except Exception:
+            logger.exception("fleet-session-lifecycle: full wrap-up checkpoint failed for this session")
             return
 
     def _pinecone_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
@@ -180,7 +184,7 @@ class LifecycleController:
                    "session_id": event["session_id"], "turn_id": event["turn_id"],
                    "summary": f"user: {event['user']}\\nresponse: {event['response']}"}
         with queue.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\\n")
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
         pinecone = state.setdefault("pinecone", {})
@@ -190,6 +194,7 @@ class LifecycleController:
             pinecone.update(last_status="unavailable", write_pending=True)
             return
         except Exception:
+            logger.exception("fleet-session-lifecycle: pinecone indexer failed; queued for a later turn")
             pinecone.update(last_status="failed", write_pending=True)
             return
         pinecone.update(last_status="ok" if code == 0 else "write_pending", write_pending=code != 0)
@@ -219,6 +224,7 @@ class LifecycleController:
             gbrain.update(last_status="unavailable", write_pending=True)
             return
         except Exception:
+            logger.exception("fleet-session-lifecycle: gbrain sync failed; queued for a later turn")
             gbrain.update(last_status="failed", write_pending=True)
             return
         if code == 0:
@@ -253,4 +259,6 @@ class LifecycleController:
                 _atomic_json(self.state_path, state)
         except Exception:
             # Hooks must never block/damage response delivery; the core already persisted the transcript first.
+            logger.exception("fleet-session-lifecycle: per-turn checkpoint failed for %s",
+                             redact_for_export(session_id))
             return

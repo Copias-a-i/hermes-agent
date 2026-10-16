@@ -9,6 +9,8 @@ import threading
 import types
 from pathlib import Path
 
+from hermes_cli.fleet_session_lifecycle import install_profile_lifecycle
+
 
 def _load_lifecycle():
     root = Path(__file__).resolve().parents[2]
@@ -255,3 +257,63 @@ def test_finalize_hook_runs_full_wrapup_without_response_delivery(monkeypatch, t
     monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
     assert registered["on_session_finalize"](session_id="closing", reason="quit") is None
     assert captured == {"session_id": "closing", "reason": "quit"}
+
+
+def test_pinecone_queue_is_two_lf_delimited_json_records(tmp_path):
+    mod = _load_lifecycle()
+
+    def unavailable(*_args, **_kwargs):
+        raise FileNotFoundError("pinecone-adapter")
+
+    controller, home, _vault = _controller(
+        mod,
+        tmp_path,
+        runner=unavailable,
+    )
+    controller.config["pinecone_command"] = ["pinecone-adapter"]
+    for turn_id in ("one", "two"):
+        controller.after_turn(
+            session_id="s",
+            turn_id=turn_id,
+            completed=True,
+            interrupted=False,
+            user_message="safe summary",
+            assistant_response="ok",
+            conversation_history=[],
+            cwd="",
+        )
+
+    raw_queue = (home / "state" / "fleet-session-lifecycle-pinecone.jsonl").read_bytes()
+    assert raw_queue.count(b"\n") == 2
+    rows = [json.loads(line) for line in raw_queue.splitlines()]
+    assert [row["turn_id"] for row in rows] == ["one", "two"]
+
+
+def test_bom_prefixed_lifecycle_state_is_preserved(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_bytes(b'\xef\xbb\xbf{"retained": true}')
+
+    controller.after_turn(
+        session_id="s",
+        turn_id="one",
+        completed=True,
+        interrupted=False,
+        user_message="u",
+        assistant_response="a",
+        conversation_history=[],
+        cwd="",
+    )
+
+    assert json.loads(state_path.read_text(encoding="utf-8-sig"))["retained"] is True
+
+
+def test_bom_prefixed_lifecycle_marker_is_already_installed(tmp_path):
+    marker = tmp_path / "profile" / "state" / "fleet-session-lifecycle-v1"
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"\xef\xbb\xbffleet-session-lifecycle.v1\n")
+
+    assert install_profile_lifecycle(tmp_path / "profile") is False
+    assert marker.read_bytes().startswith(b"\xef\xbb\xbf")
