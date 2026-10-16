@@ -868,9 +868,6 @@ def resolve_auto_load_skills(user_config: dict | None = None) -> list[str]:
     skills_block = user_config.get("skills") if isinstance(user_config, dict) else None
     auto_load = skills_block.get("auto_load") if isinstance(skills_block, dict) else None
     names = [entry.strip() for entry in auto_load if isinstance(entry, str) and entry.strip()] if isinstance(auto_load, list) else []
-    lifecycle = user_config.get("fleet_session_lifecycle") if isinstance(user_config, dict) else None
-    if isinstance(lifecycle, dict) and lifecycle.get("enabled") is not False:
-        names.extend(("caveman", "graphify", "pinecone-memory"))
     return list(dict.fromkeys(names))
 
 

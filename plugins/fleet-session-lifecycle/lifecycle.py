@@ -16,6 +16,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import psutil
+
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -72,7 +74,8 @@ class LifecycleController:
         self.home = Path(home)
         self.config = config or {}
         self.profile = profile_name_for_home(self.home)
-        self.vault_root = Path(str(self.config.get("vault_root") or Path.home() / ".agent-vault"))
+        configured_vault_root = str(self.config.get("vault_root") or Path.home() / ".agent-vault")
+        self.vault_root = Path(os.path.expanduser(configured_vault_root)).resolve()
         self.state_path = self.home / "state" / "fleet-session-lifecycle.json"
         self.lock_path = self.home / "state" / "fleet-session-lifecycle.lock"
         self.runner = runner or self._run
@@ -91,12 +94,27 @@ class LifecycleController:
 
     @contextmanager
     def _lease(self) -> Iterator[bool]:
-        """Cross-thread/process best-effort exclusion; failures always leave the turn deliverable."""
+        """Cross-process lease that reclaims only stale locks from dead owners."""
         with self._process_lock:
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
+                age = -1.0
+                try:
+                    age = time.time() - self.lock_path.stat().st_mtime
+                    pid = int(self.lock_path.read_text(encoding="ascii").strip())
+                    owner_is_live = psutil.pid_exists(pid)
+                except (OSError, ValueError):
+                    owner_is_live = True
+                if not owner_is_live and age >= float(self.config.get("lock_stale_seconds", 300)):
+                    try:
+                        self.lock_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    with self._lease() as acquired:
+                        yield acquired
+                    return
                 yield False
                 return
             try:
@@ -176,7 +194,11 @@ class LifecycleController:
         credentials, vault path, or raw history are put on argv.
         """
         command = self.config.get("pinecone_command")
-        if not isinstance(command, list) or not all(isinstance(x, str) and x for x in command):
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(x, str) and x for x in command)
+        ):
             return
         queue = self.home / "state" / "fleet-session-lifecycle-pinecone.jsonl"
         queue.parent.mkdir(parents=True, exist_ok=True)
@@ -243,16 +265,16 @@ class LifecycleController:
                 if not acquired:
                     return
                 state = self._state()
-                processed = set(state.get("processed_turns") or ())
+                processed = [str(item) for item in (state.get("processed_turns") or ())]
                 if event_id in processed:
                     return
                 event = {"session_id": redact_for_export(session_id), "turn_id": redact_for_export(turn_id),
                          "completed": bool(completed), "interrupted": bool(interrupted),
                          "user": redact_for_export(user_message), "response": redact_for_export(assistant_response)}
                 self._append_checkpoint(event)
-                processed.add(event_id)
-                # Bound ledger protects profile state from unbounded growth while preserving recent retry dedup.
-                state["processed_turns"] = sorted(processed)[-512:]
+                processed.append(event_id)
+                # Bound ledger preserves turn arrival order so retry dedup retains the newest ids.
+                state["processed_turns"] = processed[-512:]
                 state["updated_at"] = int(time.time())
                 self._pinecone_index(event, state)
                 self._gbrain_sync(cwd, state)

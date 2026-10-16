@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import threading
 import types
@@ -183,6 +184,7 @@ def test_interruption_uses_pre_llm_snapshot_and_registers_start_capture(monkeypa
             captured.update(kwargs)
 
     monkeypatch.setattr(plugin, "LifecycleController", Controller)
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": True})
     monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
     registered["pre_llm_call"](session_id="crashed", turn_id="turn", user_message="before crash")
     registered["on_session_end"](
@@ -254,6 +256,7 @@ def test_finalize_hook_runs_full_wrapup_without_response_delivery(monkeypatch, t
             return "must not deliver"
 
     monkeypatch.setattr(plugin, "LifecycleController", Controller)
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": True})
     monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
     assert registered["on_session_finalize"](session_id="closing", reason="quit") is None
     assert captured == {"session_id": "closing", "reason": "quit"}
@@ -317,3 +320,75 @@ def test_bom_prefixed_lifecycle_marker_is_already_installed(tmp_path):
 
     assert install_profile_lifecycle(tmp_path / "profile") is False
     assert marker.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+def test_empty_pinecone_command_has_no_queue_or_runner_side_effect(tmp_path):
+    mod = _load_lifecycle()
+    calls = []
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    home.mkdir(parents=True)
+    controller = mod.LifecycleController(
+        home,
+        {"vault_root": str(tmp_path / "vault"), "pinecone_command": []},
+        runner=lambda argv, **kwargs: calls.append((argv, kwargs)) or 0,
+    )
+
+    controller.after_turn(
+        session_id="s", turn_id="empty-pinecone", completed=True, interrupted=False,
+        user_message="safe summary", assistant_response="ok", conversation_history=[], cwd="",
+    )
+
+    assert calls == []
+    assert not (home / "state" / "fleet-session-lifecycle-pinecone.jsonl").exists()
+
+
+def test_vault_root_expands_home_before_checkpoint_path_use(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    home.mkdir(parents=True)
+    configured_home = tmp_path / "configured-home"
+    monkeypatch.setenv("HOME", str(configured_home))
+    controller = mod.LifecycleController(home, {"vault_root": "~/.agent-vault"}, runner=lambda *_a, **_k: 0)
+
+    controller.after_turn(
+        session_id="s", turn_id="tilde-root", completed=True, interrupted=False,
+        user_message="u", assistant_response="a", conversation_history=[], cwd="",
+    )
+
+    assert (configured_home / ".agent-vault" / "jarvis" / "daily" / "hermes-lifecycle.md").exists()
+    assert not (Path.cwd() / "~" / ".agent-vault").exists()
+
+
+def test_stale_dead_lock_is_reclaimed_but_live_lock_is_preserved(tmp_path):
+    mod = _load_lifecycle()
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    home.mkdir(parents=True)
+    controller = mod.LifecycleController(
+        home, {"vault_root": str(tmp_path / "vault"), "lock_stale_seconds": 0}, runner=lambda *_a, **_k: 0,
+    )
+    controller.lock_path.parent.mkdir()
+    controller.lock_path.write_text("999999", encoding="ascii")
+    os.utime(controller.lock_path, (0, 0))
+    controller.after_turn(session_id="s", turn_id="reclaimed", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    checkpoint = controller._checkpoint_path()
+    assert "turn_id: reclaimed" in checkpoint.read_text()
+
+    controller.lock_path.write_text(str(os.getpid()), encoding="ascii")
+    controller.after_turn(session_id="s", turn_id="live", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    assert "turn_id: live" not in checkpoint.read_text()
+
+
+def test_processed_turns_retains_arrival_order_at_the_recency_bound(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    old_ids = [f"old-{index}" for index in range(512)]
+    state_path.write_text(json.dumps({"processed_turns": old_ids}), encoding="utf-8")
+    controller.after_turn(session_id="s", turn_id="newest", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+    processed = json.loads(state_path.read_text())["processed_turns"]
+    expected_newest = __import__("hashlib").sha256(b"s\0newest").hexdigest()
+    assert processed == old_ids[1:] + [expected_newest]

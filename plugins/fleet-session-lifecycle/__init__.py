@@ -28,8 +28,15 @@ def _config() -> dict[str, Any]:
         return {}
 
 
+def _enabled(config: dict[str, Any]) -> bool:
+    """Explicit profile disable wins over every lifecycle hook."""
+    return config.get("enabled") is not False
+
+
 def _on_pre_llm_call(**kwargs: Any) -> None:
     """Snapshot the raw inbound turn before execution so interrupts retain context."""
+    if not _enabled(_config()):
+        return
     session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
     if not session_id or not turn_id:
         return
@@ -43,6 +50,8 @@ def _on_pre_llm_call(**kwargs: Any) -> None:
 
 def _on_post_llm_call(**kwargs: Any) -> None:
     """Add final output after it is persisted; keep the pre-turn crash snapshot."""
+    if not _enabled(_config()):
+        return
     session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
     if not session_id or not turn_id:
         return
@@ -58,6 +67,9 @@ def _on_post_llm_call(**kwargs: Any) -> None:
 def _on_session_end(**kwargs: Any) -> None:
     """Checkpoint after core transcript persistence; all errors stay fail-open."""
     try:
+        config = _config()
+        if not _enabled(config):
+            return
         session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
         with _pending_lock:
             saved = _pending.pop((session_id, turn_id), {})
@@ -76,7 +88,10 @@ def _on_session_end(**kwargs: Any) -> None:
 def _on_session_finalize(**kwargs: Any) -> None:
     """Flush a durable full wrap-up checkpoint without producing a user response."""
     try:
-        LifecycleController(get_hermes_home(), _config()).full_wrapup(
+        config = _config()
+        if not _enabled(config):
+            return
+        LifecycleController(get_hermes_home(), config).full_wrapup(
             session_id=str(kwargs.get("session_id") or ""),
             reason=str(kwargs.get("reason") or ""),
         )

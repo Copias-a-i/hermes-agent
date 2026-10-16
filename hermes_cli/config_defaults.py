@@ -1479,10 +1479,10 @@ DEFAULT_CONFIG = {
         "ledger_max_bytes": 5 * 1024 * 1024,
     },
 
-    # Fleet lifecycle — bundled, profile-local turn checkpoints and first-turn skill policy.
-    # Integration commands are opt-in; their adapters own credentials and may be unavailable.
+    # Fleet lifecycle is opt-in per profile. Integration commands remain opt-in;
+    # their adapters own credentials and may be unavailable.
     "fleet_session_lifecycle": {
-        "enabled": True,
+        "enabled": False,
         "vault_root": "~/.agent-vault",
         "debounce_seconds": 30,
         "gbrain_timeout_seconds": 5,
