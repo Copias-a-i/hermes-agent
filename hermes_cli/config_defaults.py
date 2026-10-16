@@ -1486,6 +1486,8 @@ DEFAULT_CONFIG = {
         # Age after which a lock whose recorded owner is gone may be reclaimed (Windows only:
         # POSIX releases the advisory flock with the owning process).
         "lock_stale_seconds": 300,
+        # Bounded wait shared by admission, completion, and finalization lease acquisition.
+        "finalize_lease_wait_seconds": 2,
         "outbox_timeout_seconds": 5,
         "outbox_command": [],
     },

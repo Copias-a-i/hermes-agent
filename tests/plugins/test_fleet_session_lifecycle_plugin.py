@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.fleet_session_lifecycle import install_profile_lifecycle
 from hermes_cli.plugin_validate import validate_plugin_dir
 
 
@@ -342,14 +341,6 @@ def test_bom_prefixed_lifecycle_state_is_preserved(tmp_path):
 
     assert json.loads(state_path.read_text(encoding="utf-8-sig"))["retained"] is True
 
-
-def test_bom_prefixed_lifecycle_marker_is_already_installed(tmp_path):
-    marker = tmp_path / "profile" / "state" / "fleet-session-lifecycle-v1"
-    marker.parent.mkdir(parents=True)
-    marker.write_bytes(b"\xef\xbb\xbffleet-session-lifecycle.v1\n")
-
-    assert install_profile_lifecycle(tmp_path / "profile") is False
-    assert marker.read_bytes().startswith(b"\xef\xbb\xbf")
 
 
 def test_empty_outbox_command_has_no_queue_or_runner_side_effect(tmp_path):
@@ -809,3 +800,96 @@ def test_replay_clears_finalization_marker_for_recovered_event_session(tmp_path)
 
     checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
     assert "reason: resumed-exit" in checkpoint
+
+
+def test_active_admission_is_not_drained_by_another_session(tmp_path):
+    mod = _load_lifecycle()
+    first, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    second = mod.LifecycleController(first.home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+
+    first.admit_turn(session_id="active-a", turn_id="turn-a", user_message="question")
+    second.after_turn(session_id="finished-b", turn_id="turn-b", completed=True, interrupted=False,
+                      user_message="other", assistant_response="answer", conversation_history=[], cwd="")
+
+    active_id = __import__("hashlib").sha256(b"active-a\x00turn-a").hexdigest()
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert active_id in state["pending_turns"]
+    assert "turn_id: turn-a" not in checkpoint
+
+
+def test_dash_style_secret_is_removed_before_checkpoint_and_outbox(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 1)
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
+    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz"
+
+    controller.after_turn(session_id="s", turn_id="secret", completed=True, interrupted=False,
+                          user_message=secret, assistant_response=secret, conversation_history=[], cwd="")
+
+    assert secret not in _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert secret not in (home / "state" / "fleet-session-lifecycle-outbox.jsonl").read_text(encoding="utf-8")
+
+
+def test_recovery_appends_pending_event_to_its_recorded_partition(monkeypatch, tmp_path):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({"pending_turns": {"midnight": {
+        "event_id": "midnight", "session_id": "old", "turn_id": "turn", "completed": True,
+        "interrupted": False, "user": "u", "response": "a", "checkpoint_partition": "2026-10-16-hermes-lifecycle.md",
+    }}}), encoding="utf-8")
+    monkeypatch.setattr(mod.time, "strftime", lambda _format: "2026-10-17")
+
+    controller.after_turn(session_id="new", turn_id="new", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    old_path = vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
+    today_path = vault / "jarvis" / "daily" / "2026-10-17-hermes-lifecycle.md"
+    assert "event_id: midnight" in old_path.read_text(encoding="utf-8")
+    assert "event_id: midnight" not in today_path.read_text(encoding="utf-8")
+
+
+def test_admission_retries_a_transient_busy_lease(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["finalize_lease_wait_seconds"] = 0.1
+    original_lease = controller._lease
+    attempts = 0
+    from contextlib import contextmanager
+
+    @contextmanager
+    def busy_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            yield False
+        else:
+            with original_lease() as acquired:
+                yield acquired
+
+    monkeypatch.setattr(controller, "_lease", busy_once)
+    controller.admit_turn(session_id="retry", turn_id="admit", user_message="u")
+
+    assert attempts == 2
+    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["pending_turns"]
+
+
+def test_full_wrapup_recovers_after_append_before_finalized_ledger(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path)
+    original_append = controller._append_full_wrapup
+
+    def append_then_crash(*args, **kwargs):
+        original_append(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller, "_append_full_wrapup", append_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        controller.full_wrapup(session_id="closing", reason="quit")
+    monkeypatch.setattr(controller, "_append_full_wrapup", original_append)
+
+    controller.full_wrapup(session_id="closing", reason="quit")
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 1

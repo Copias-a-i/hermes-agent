@@ -18,7 +18,6 @@ from typing import Dict, List, Optional, Tuple
 
 from agent.file_safety import HOME_CREDENTIAL_DIRS
 from hermes_cli.archive_safe import archive_root_dirs, make_targz, normalize_archive_parts, safe_extract_targz
-from hermes_cli.fleet_session_lifecycle import install_profile_lifecycle, install_profile_lifecycles
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS
 from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, PROFILE_ID_RE, clear_named_profile_deleted, mark_named_profile_deleted,
@@ -1479,7 +1478,6 @@ def _finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: boo
     # read by users as "the new profile reads the root .env". Skipped when a clone copied one.
     _seed_file_if_missing(profile_dir / ".env", _PLACEHOLDER_ENV, 0o600)
 
-    install_profile_lifecycle(profile_dir)
     # Default SOUL.md to customize immediately (skipped when a clone already provided one).
     with contextlib.suppress(Exception):  # best-effort — don't fail profile creation over this
         from hermes_cli.default_soul import DEFAULT_SOUL_MD
@@ -1561,7 +1559,6 @@ def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict
         return None
 
 
-def backfill_fleet_session_lifecycles() -> List[Path]: return install_profile_lifecycles([_get_default_hermes_home(), *_iter_named_profile_dirs()])
 def backfill_profile_envs(quiet: bool = False) -> List[str]:
     """Give every named profile predating per-profile ``.env`` one (copy of the default's, or
     the placeholder header). Never overwrites an existing profile ``.env``.
