@@ -288,6 +288,31 @@ def test_late_worker_failure_cannot_override_completed_run(kanban_home):
         conn.close()
 
 
+def test_late_budget_failure_cannot_override_review_requested_run(kanban_home):
+    """A completed review handoff owns its run against a late worker timeout."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewed before worker exit", assignee="worker", max_retries=1)
+        kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
+        assert run_id is not None
+        assert kb.request_review(conn, tid, summary="implementation handed off", expected_run_id=run_id)
+
+        assert not kbd._record_task_failure(
+            conn, tid, "late budget exhaustion", outcome="timed_out", release_claim=True,
+            end_run=True, expected_run_id=run_id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "review"
+        assert task.consecutive_failures == 0
+        run = conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert run["outcome"] == "review_requested"
+    finally:
+        conn.close()
+
+
 def test_stale_failure_cannot_override_reclaimed_completed_task(kanban_home):
     """A late failure for a completed run cannot affect its successor run."""
     conn = kbc.connect()
