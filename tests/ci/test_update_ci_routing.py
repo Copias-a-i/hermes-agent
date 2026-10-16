@@ -92,6 +92,7 @@ def test_release_tag_consumers_use_complete_tagged_checkouts_and_fail_closed_whe
         assert checkout["with"]["fetch-tags"] is True
         verify = next(step for step in steps[checkout_index + 1:] if step.get("name") == "Require release tags")
         command = verify["run"]
+        assert "git fetch --force --tags origin" in command
         assert "git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1" in command
         assert "::error::release tags are unavailable" in command
         assert "exit 1" in command
