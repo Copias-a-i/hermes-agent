@@ -288,6 +288,36 @@ def test_late_worker_failure_cannot_override_completed_run(kanban_home):
         conn.close()
 
 
+def test_stale_failure_cannot_override_reclaimed_completed_task(kanban_home):
+    """A late failure for a completed run cannot affect its successor run."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="rerun after completion", assignee="worker")
+        kb.claim_task(conn, tid)
+        completed_run_id = kb._current_run_id(conn, tid)
+        assert completed_run_id is not None
+        assert kb.complete_task(conn, tid, result="delivered", expected_run_id=completed_run_id)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
+        kb.claim_task(conn, tid)
+        successor_run_id = kb._current_run_id(conn, tid)
+        assert successor_run_id is not None and successor_run_id != completed_run_id
+
+        assert not kbd._record_task_failure(
+            conn, tid, "old worker exit", outcome="spawn_failed", release_claim=True,
+            end_run=True, expected_run_id=completed_run_id,
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == successor_run_id
+        assert task.consecutive_failures == 0
+        assert conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (completed_run_id,)).fetchone()["outcome"] == "completed"
+        assert conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (successor_run_id,)).fetchone()["outcome"] is None
+    finally:
+        conn.close()
+
+
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
