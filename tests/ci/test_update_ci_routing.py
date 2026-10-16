@@ -78,6 +78,38 @@ def test_required_ci_lanes_use_stock_hosted_runners() -> None:
         assert all(label not in rendered for label in unavailable)
 
 
+def test_release_tag_consumers_use_complete_tagged_checkouts_and_fail_closed_when_empty() -> None:
+    """Tag-derived E2E inputs must be available before either consumer reads them."""
+    consumers = (
+        (".github/workflows/tests.yml", "e2e-upgrade"),
+        (".github/workflows/install-e2e.yml", "pick-releases"),
+    )
+    for workflow_path, job_name in consumers:
+        steps = _yaml(workflow_path)["jobs"][job_name]["steps"]
+        checkout_index = next(i for i, step in enumerate(steps) if "actions/checkout@" in step.get("uses", ""))
+        checkout = steps[checkout_index]
+        assert checkout["with"]["fetch-depth"] == 0
+        assert checkout["with"]["fetch-tags"] is True
+        verify = next(step for step in steps[checkout_index + 1:] if step.get("name") == "Require release tags")
+        command = verify["run"]
+        assert "git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1" in command
+        assert "::error::release tags are unavailable" in command
+        assert "exit 1" in command
+
+
+def test_windows_only_lane_has_a_budget_above_the_real_powershell_fixture_ceiling() -> None:
+    """The runner must not SIGKILL a bounded fixture before its child timeout reports red."""
+    workflow = _yaml(".github/workflows/tests-os.yml")
+    job = workflow["jobs"]["os-tests"]
+    assert job["timeout-minutes"] == "${{ matrix.timeout || 30 }}"
+    windows = next(cell for cell in job["strategy"]["matrix"]["include"] if cell.get("marker") == "windows")
+    # test_windows_build_deps.py has six sequential 180-second PowerShell calls.
+    assert windows["file_timeout"] >= 1200
+    assert windows["timeout"] > windows["file_timeout"] / 60
+    run_step = next(step for step in job["steps"] if step.get("name") == "Run ${{ matrix.marker }} tests")
+    assert run_step["env"]["HERMES_TEST_FILE_TIMEOUT"] == "${{ matrix.file_timeout || '' }}"
+
+
 # Not Windows on arm64: Git for Windows ships an x86-64 MSYS bash.exe there, run under emulation,
 # and with the os-tests lane's 16 workers it dies with 0xC000026F (STATUS_WX86_INTERNAL_ERROR) or
 # 0xC0000005 before running a line, on replays of unchanged workflows: one copy of this file red

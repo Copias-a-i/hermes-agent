@@ -91,6 +91,10 @@ jobs:
           - name: Windows-only tests (x64)
             runner: windows-latest
             marker: windows
+            # The bounded PowerShell fixture has six sequential 180-second child calls;
+            # let its own timeout diagnostic surface before the file runner kills it.
+            timeout: 45
+            file_timeout: 1200
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -185,6 +189,9 @@ jobs:
           # parallel coverage without starving PowerShell child startup or the
           # real-process fixtures' deadlines.
           HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
+          # The Windows matrix owns this value so its budget can be checked against
+          # the job timeout and the fixture's six sequential 180-second child calls.
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.file_timeout || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
