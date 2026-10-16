@@ -1383,6 +1383,12 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
+        # Completion is the terminal winner for its run. Dispatcher reapers may
+        # observe a process exit after the worker committed kanban_complete;
+        # that stale observation must not manufacture a retry, circuit-breaker
+        # update, or second terminal event.
+        if row["status"] == "done":
+            return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim

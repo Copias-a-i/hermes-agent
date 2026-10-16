@@ -256,6 +256,38 @@ def test_read_worker_log_tail(kanban_home):
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
 
+def test_late_worker_failure_cannot_override_completed_run(kanban_home):
+    """Completion is terminal: a late timeout/crash result cannot retry or alert it."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="finished before worker exit", assignee="worker", max_retries=1,
+        )
+        kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
+        assert run_id is not None
+        assert kb.complete_task(conn, tid, result="delivered", expected_run_id=run_id) is True
+
+        # This models a process watchdog receiving the worker's non-zero exit
+        # after the worker has already persisted kanban_complete.
+        assert kbd._record_task_failure(
+            conn, tid, "late worker exit", outcome="timed_out", end_run=True,
+        ) is False
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert task.consecutive_failures == 0
+        assert [event.kind for event in kb.list_events(conn, tid)].count("completed") == 1
+        assert not {"timed_out", "crashed", "gave_up"} & {
+            event.kind for event in kb.list_events(conn, tid)
+        }
+        run = conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+        assert run["outcome"] == "completed"
+    finally:
+        conn.close()
+
+
 def test_max_runtime_terminates_overrun_worker(kanban_home):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
@@ -297,7 +329,9 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             assert killed and killed[0][0] == os.getpid()
 
             task = kb.get_task(conn, tid)
+            assert task is not None
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
+            assert task.consecutive_failures == 1
             assert task.worker_pid is None
             assert task.last_heartbeat_at is None
 
