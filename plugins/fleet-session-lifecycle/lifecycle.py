@@ -16,13 +16,19 @@ import subprocess
 import tempfile
 import threading
 import time
-import psutil
+import uuid
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows uses the ownership-token fallback.
+    fcntl = None
 
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 _SECRET_PATTERNS = (
+    re.compile(r"(?i)\bauthorization\s*[:=]\s*(?:bearer|basic|token)\s+[^\s,;]+"),
     re.compile(r"(?i)\b(?:api[_-]?key|token|password|secret|authorization)\s*[:=]\s*[^\s,;]+"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\b(?:sk|pk)_[A-Za-z0-9_-]{16,}\b"),
@@ -42,10 +48,14 @@ def redact_for_export(value: Any) -> str:
 
 
 def profile_name_for_home(home: Path) -> str:
-    """Profile name from its resolved Hermes home, never the ambient process home."""
+    """Return a stable, profile-local vault namespace without ambient-home fallback."""
     if home.parent.name == "profiles":
         return home.name
-    return "default"
+    if home.name == ".hermes":
+        return "default"
+    # Custom homes must not collapse into default: their resolved identity remains stable
+    # across processes without exposing the local path in vault filenames.
+    return "custom-" + hashlib.sha256(str(home.resolve()).encode()).hexdigest()[:16]
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -67,7 +77,15 @@ def _atomic_json(path: Path, data: dict[str, Any]) -> None:
 class LifecycleController:
     """Profile-local durable side effects for one completed or interrupted turn."""
 
-    _process_lock = threading.RLock()
+    _locks_guard = threading.Lock()
+    _process_locks: dict[Path, threading.RLock] = {}
+
+    @classmethod
+    def _process_lock_for(cls, home: Path) -> threading.RLock:
+        """Return the in-process lock dedicated to one resolved profile home."""
+        key = home.resolve()
+        with cls._locks_guard:
+            return cls._process_locks.setdefault(key, threading.RLock())
 
     def __init__(self, home: Path, config: dict[str, Any] | None = None, *,
                  runner: Callable[..., Any] | None = None) -> None:
@@ -78,6 +96,10 @@ class LifecycleController:
         self.vault_root = Path(os.path.expanduser(configured_vault_root)).resolve()
         self.state_path = self.home / "state" / "fleet-session-lifecycle.json"
         self.lock_path = self.home / "state" / "fleet-session-lifecycle.lock"
+        prior_namespace = self._state().get("vault_profile")
+        if isinstance(prior_namespace, str) and prior_namespace:
+            self.profile = prior_namespace
+        self._uses_default_runner = runner is None
         self.runner = runner or self._run
 
     def _state(self) -> dict[str, Any]:
@@ -90,51 +112,93 @@ class LifecycleController:
     @staticmethod
     def _run(argv: list[str], **kwargs: Any) -> int:
         return subprocess.run(argv, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=kwargs.get("timeout", 5), cwd=kwargs.get("cwd") or None).returncode
+                              timeout=kwargs.get("timeout", 5), cwd=kwargs.get("cwd") or None,
+                              env=kwargs.get("env")).returncode
+
+    @staticmethod
+    def _git_root(cwd: str) -> Path | None:
+        """Locate the nearest worktree root, including a linked-worktree .git file."""
+        if not cwd:
+            return None
+        try:
+            current = Path(cwd).resolve()
+        except OSError:
+            return None
+        for candidate in (current, *current.parents):
+            if (candidate / ".git").exists():
+                return candidate
+        return None
+
+    def _command_env(self) -> dict[str, str]:
+        """Build a profile-scoped, secret-scrubbed environment for optional commands."""
+        from tools.environments.local import build_subprocess_env
+        return build_subprocess_env(
+            scrub_secrets=True, inherit_profile_home=False,
+            extra={"HERMES_HOME": str(self.home)}, strip_launch_profile=True,
+        )
+
+    def _resolved_command(self, command: list[str]) -> list[str] | None:
+        """Resolve the executable using Hermes' platform resolver before execution."""
+        from hermes_platform.resolver import locate_command
+        resolved = locate_command(command[0]).command
+        return [*resolved, *command[1:]] if resolved else None
+
+    def _invoke(self, command: list[str], **kwargs: Any) -> int:
+        """Invoke test-injected adapters unchanged; production uses resolved command and scrubbed env."""
+        if not self._uses_default_runner:
+            return self.runner(command, **kwargs)
+        resolved = self._resolved_command(command)
+        if resolved is None:
+            raise FileNotFoundError(command[0])
+        return self.runner(resolved, env=self._command_env(), **kwargs)
 
     @contextmanager
     def _lease(self) -> Iterator[bool]:
-        """Cross-process lease that reclaims only stale locks from dead owners."""
-        with self._process_lock:
+        """Acquire one profile lease without unlinking another reclaimer's lock.
+
+        On POSIX an advisory flock is released by the kernel when its owner dies,
+        so a leftover metadata file is safely reclaimed by the next holder.  The
+        ownership token makes cleanup conditional: a late finalizer cannot remove
+        a lock it no longer owns.
+        """
+        with self._process_lock_for(self.home):
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            token = f"{os.getpid()}:{uuid.uuid4().hex}"
+            locked = False
             try:
-                fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
-                age = -1.0
-                try:
-                    age = time.time() - self.lock_path.stat().st_mtime
-                    pid = int(self.lock_path.read_text(encoding="ascii").strip())
-                    owner_is_live = psutil.pid_exists(pid)
-                except (OSError, ValueError):
-                    owner_is_live = True
-                if not owner_is_live and age >= float(self.config.get("lock_stale_seconds", 300)):
+                if fcntl is not None:
                     try:
-                        self.lock_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    with self._lease() as acquired:
-                        yield acquired
-                    return
-                yield False
-                return
-            try:
-                os.write(fd, str(os.getpid()).encode())
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        yield False
+                        return
+                    locked = True
+                else:  # pragma: no cover - Windows fallback retains exclusive-create semantics.
+                    try:
+                        os.close(fd)
+                        fd = os.open(self.lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    except FileExistsError:
+                        yield False
+                        return
+                os.ftruncate(fd, 0)
+                os.write(fd, token.encode("ascii"))
+                os.fsync(fd)
                 yield True
             finally:
+                if locked:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
-                try:
-                    self.lock_path.unlink()
-                except FileNotFoundError:
-                    pass
 
     def _checkpoint_path(self) -> Path:
-        return self.vault_root / self.profile / "daily" / "hermes-lifecycle.md"
+        return self.vault_root / self.profile / "daily" / f"{time.strftime('%Y-%m-%d')}-hermes-lifecycle.md"
 
     def _append_checkpoint(self, event: dict[str, Any]) -> None:
         path = self._checkpoint_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         line = "\n".join((
             "\n<!-- hermes-lifecycle incremental checkpoint -->",
+            f"- event_id: {event['event_id']}",
             f"- session_id: {event['session_id']}", f"- turn_id: {event['turn_id']}",
             f"- completed: {str(event['completed']).lower()}", f"- interrupted: {str(event['interrupted']).lower()}",
             f"- user: {event['user']}", f"- response: {event['response']}",
@@ -143,6 +207,12 @@ class LifecycleController:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+
+    def _checkpoint_has(self, event_id: str) -> bool:
+        try:
+            return f"- event_id: {event_id}" in self._checkpoint_path().read_text(encoding="utf-8")
+        except OSError:
+            return False
 
     def _append_full_wrapup(self, session_id: str, reason: str) -> None:
         """Write the session-bound final checkpoint without creating an agent turn."""
@@ -173,13 +243,15 @@ class LifecycleController:
                 if not acquired:
                     return
                 state = self._state()
-                finalized = {str(item) for item in (state.get("finalized_sessions") or ())}
+                state.setdefault("vault_profile", self.profile)
+                finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
                 final_id = hashlib.sha256(session_id.encode()).hexdigest()
                 if final_id in finalized:
                     return
                 self._append_full_wrapup(session_id, reason)
-                finalized.add(final_id)
-                state["finalized_sessions"] = sorted(finalized)[-512:]
+                finalized.append(final_id)
+                # Preserve arrival order, not lexical hash order, when pruning recency.
+                state["finalized_sessions"] = finalized[-512:]
                 state["updated_at"] = int(time.time())
                 _atomic_json(self.state_path, state)
         except Exception:
@@ -211,7 +283,7 @@ class LifecycleController:
             os.fsync(handle.fileno())
         pinecone = state.setdefault("pinecone", {})
         try:
-            code = self.runner(command + ["--input", str(queue)], timeout=float(self.config.get("pinecone_timeout_seconds", 5)))
+            code = self._invoke(command + ["--input", str(queue)], timeout=float(self.config.get("pinecone_timeout_seconds", 5)))
         except FileNotFoundError:
             pinecone.update(last_status="unavailable", write_pending=True)
             return
@@ -219,29 +291,41 @@ class LifecycleController:
             logger.exception("fleet-session-lifecycle: pinecone indexer failed; queued for a later turn")
             pinecone.update(last_status="failed", write_pending=True)
             return
-        pinecone.update(last_status="ok" if code == 0 else "write_pending", write_pending=code != 0)
+        if code == 0:
+            try:
+                queue.unlink()
+            except FileNotFoundError:
+                pass
+            pinecone.update(last_status="ok", write_pending=False)
+        else:
+            pinecone.update(last_status="write_pending", write_pending=True)
 
     def _gbrain_sync(self, cwd: str, state: dict[str, Any]) -> None:
-        root = Path(cwd).resolve() if cwd else None
-        if root is None or not (root / ".git").exists():
+        root = self._git_root(cwd)
+        if root is None:
             return
         gbrain = state.setdefault("gbrain", {})
-        if gbrain.get("write_pending"):
-            return
         now = time.time()
+        try:
+            retry_seconds = max(0.0, float(self.config.get("gbrain_retry_seconds", 300)))
+        except (TypeError, ValueError):
+            retry_seconds = 300.0
+        if gbrain.get("write_pending") and now - float(gbrain.get("last_attempt_at") or 0) < retry_seconds:
+            return
         try:
             debounce = max(0.0, float(self.config.get("debounce_seconds", 30)))
         except (TypeError, ValueError):
             debounce = 30.0
-        if now - float(gbrain.get("last_attempt_at") or 0) < debounce:
+        if (str(gbrain.get("last_repo") or "") == str(root)
+                and now - float(gbrain.get("last_attempt_at") or 0) < debounce):
             gbrain["last_status"] = "debounced"
             return
         gbrain["last_attempt_at"] = now
-        command = self.config.get("gbrain_command") or list(_DEFAULT_GBRAIN)
-        if not isinstance(command, list) or not all(isinstance(x, str) and x for x in command):
+        command: list[str] | Any = list(_DEFAULT_GBRAIN) if "gbrain_command" not in self.config else self.config["gbrain_command"]
+        if not isinstance(command, list) or not command or not all(isinstance(x, str) and x for x in command):
             return
         try:
-            code = self.runner(command, timeout=float(self.config.get("gbrain_timeout_seconds", 5)), cwd=str(root))
+            code = self._invoke(command, timeout=float(self.config.get("gbrain_timeout_seconds", 5)), cwd=str(root))
         except FileNotFoundError:
             gbrain.update(last_status="unavailable", write_pending=True)
             return
@@ -265,16 +349,26 @@ class LifecycleController:
                 if not acquired:
                     return
                 state = self._state()
+                state.setdefault("vault_profile", self.profile)
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
                 if event_id in processed:
                     return
-                event = {"session_id": redact_for_export(session_id), "turn_id": redact_for_export(turn_id),
-                         "completed": bool(completed), "interrupted": bool(interrupted),
-                         "user": redact_for_export(user_message), "response": redact_for_export(assistant_response)}
-                self._append_checkpoint(event)
+                pending = state.setdefault("pending_turns", {})
+                event = pending.get(event_id)
+                if not isinstance(event, dict):
+                    event = {"event_id": event_id, "session_id": redact_for_export(session_id),
+                             "turn_id": redact_for_export(turn_id), "completed": bool(completed),
+                             "interrupted": bool(interrupted), "user": redact_for_export(user_message),
+                             "response": redact_for_export(assistant_response)}
+                    pending[event_id] = event
+                    # Intent is durable before any side effect; a crash can now be recovered.
+                    _atomic_json(self.state_path, state)
+                if not self._checkpoint_has(event_id):
+                    self._append_checkpoint(event)
                 processed.append(event_id)
                 # Bound ledger preserves turn arrival order so retry dedup retains the newest ids.
                 state["processed_turns"] = processed[-512:]
+                pending.pop(event_id, None)
                 state["updated_at"] = int(time.time())
                 self._pinecone_index(event, state)
                 self._gbrain_sync(cwd, state)

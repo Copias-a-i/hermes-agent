@@ -51,6 +51,10 @@ def _controller(mod, tmp_path, *, profile="jarvis", runner=None):
     return mod.LifecycleController(home, {"vault_root": str(vault), "debounce_seconds": 0}, runner=runner), home, vault
 
 
+def _checkpoint_file(vault: Path, profile: str) -> Path:
+    return next((vault / profile / "daily").glob("*-hermes-lifecycle.md"))
+
+
 def test_checkpoint_redacts_secrets_and_never_sends_vault_to_gbrain(tmp_path):
     mod = _load_lifecycle()
     calls = []
@@ -68,7 +72,7 @@ def test_checkpoint_redacts_secrets_and_never_sends_vault_to_gbrain(tmp_path):
         conversation_history=[], cwd=str(repo),
     )
 
-    checkpoint = vault / "jarvis" / "daily" / "hermes-lifecycle.md"
+    checkpoint = _checkpoint_file(vault, "jarvis")
     text = checkpoint.read_text(encoding="utf-8")
     assert "super-secret" not in text and "AKIAABCDEFGHIJKLMNOP" not in text
     assert "[REDACTED]" in text
@@ -91,7 +95,7 @@ def test_exact_once_with_concurrent_duplicate_delivery(tmp_path):
         thread.start()
     for thread in threads:
         thread.join()
-    rows = (vault / "jarvis" / "daily" / "hermes-lifecycle.md").read_text(encoding="utf-8")
+    rows = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
     assert rows.count("turn_id: same") == 1
 
 
@@ -106,7 +110,7 @@ def test_interrupted_turn_is_checkpointed_and_unavailable_integrations_queue(tmp
     (repo / ".git").mkdir(parents=True)
     controller.after_turn(session_id="s", turn_id="interrupt", completed=False, interrupted=True,
                           user_message="u", assistant_response="", conversation_history=[], cwd=str(repo))
-    assert "interrupted: true" in (vault / "jarvis" / "daily" / "hermes-lifecycle.md").read_text()
+    assert "interrupted: true" in _checkpoint_file(vault, "jarvis").read_text()
     state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())
     assert state["gbrain"]["write_pending"] is True
     assert state["gbrain"]["last_status"] == "unavailable"
@@ -135,8 +139,8 @@ def test_profiles_use_separate_vault_and_state_paths(tmp_path):
                      user_message="alpha", assistant_response="", conversation_history=[], cwd="")
     second.after_turn(session_id="s", turn_id="b", completed=True, interrupted=False,
                       user_message="beta", assistant_response="", conversation_history=[], cwd="")
-    assert "alpha" in (vault / "alpha" / "daily" / "hermes-lifecycle.md").read_text()
-    assert "beta" not in (vault / "alpha" / "daily" / "hermes-lifecycle.md").read_text()
+    assert "alpha" in _checkpoint_file(vault, "alpha").read_text()
+    assert "beta" not in _checkpoint_file(vault, "alpha").read_text()
     assert (home_a / "state" / "fleet-session-lifecycle.json").exists()
     assert (home_b / "state" / "fleet-session-lifecycle.json").exists()
 
@@ -226,7 +230,7 @@ def test_final_wrapup_is_idempotent_and_never_runs_a_model_or_returns_a_message(
     assert controller.full_wrapup(session_id="closing", reason="reset") is None
     assert controller.full_wrapup(session_id="closing", reason="reset") is None
 
-    checkpoint = (vault / "jarvis" / "daily" / "hermes-lifecycle.md").read_text(encoding="utf-8")
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
     assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 1
     assert "session_id: closing" in checkpoint
     assert "reason: reset" in checkpoint
@@ -355,11 +359,11 @@ def test_vault_root_expands_home_before_checkpoint_path_use(tmp_path, monkeypatc
         user_message="u", assistant_response="a", conversation_history=[], cwd="",
     )
 
-    assert (configured_home / ".agent-vault" / "jarvis" / "daily" / "hermes-lifecycle.md").exists()
+    assert list((configured_home / ".agent-vault" / "jarvis" / "daily").glob("*-hermes-lifecycle.md"))
     assert not (Path.cwd() / "~" / ".agent-vault").exists()
 
 
-def test_stale_dead_lock_is_reclaimed_but_live_lock_is_preserved(tmp_path):
+def test_stale_dead_lock_is_reclaimed_but_live_lock_is_preserved(tmp_path, monkeypatch):
     mod = _load_lifecycle()
     home = tmp_path / ".hermes" / "profiles" / "jarvis"
     home.mkdir(parents=True)
@@ -374,7 +378,14 @@ def test_stale_dead_lock_is_reclaimed_but_live_lock_is_preserved(tmp_path):
     checkpoint = controller._checkpoint_path()
     assert "turn_id: reclaimed" in checkpoint.read_text()
 
-    controller.lock_path.write_text(str(os.getpid()), encoding="ascii")
+    original_flock = mod.fcntl.flock
+
+    def busy_flock(_fd, flags):
+        if flags & mod.fcntl.LOCK_NB:
+            raise BlockingIOError
+        return original_flock(_fd, flags)
+
+    monkeypatch.setattr(mod.fcntl, "flock", busy_flock)
     controller.after_turn(session_id="s", turn_id="live", completed=True, interrupted=False,
                           user_message="u", assistant_response="a", conversation_history=[], cwd="")
     assert "turn_id: live" not in checkpoint.read_text()
@@ -392,3 +403,201 @@ def test_processed_turns_retains_arrival_order_at_the_recency_bound(tmp_path):
     processed = json.loads(state_path.read_text())["processed_turns"]
     expected_newest = __import__("hashlib").sha256(b"s\0newest").hexdigest()
     assert processed == old_ids[1:] + [expected_newest]
+
+
+def test_explicit_empty_gbrain_command_disables_sync_but_missing_uses_default(tmp_path):
+    mod = _load_lifecycle()
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+
+    disabled_calls = []
+    disabled, _home, _vault = _controller(
+        mod, tmp_path / "disabled", runner=lambda argv, **kwargs: disabled_calls.append(argv) or 0,
+    )
+    disabled.config["gbrain_command"] = []
+    disabled.after_turn(
+        session_id="s", turn_id="disabled", completed=True, interrupted=False,
+        user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo),
+    )
+    assert disabled_calls == []
+
+    default_calls = []
+    default, _home, _vault = _controller(
+        mod, tmp_path / "default", runner=lambda argv, **kwargs: default_calls.append(argv) or 0,
+    )
+    default.after_turn(
+        session_id="s", turn_id="default", completed=True, interrupted=False,
+        user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo),
+    )
+    assert default_calls == [["gbrain", "sync"]]
+
+
+def test_profile_scoped_process_leases_do_not_serialize_unrelated_profiles(tmp_path):
+    mod = _load_lifecycle()
+    entered = threading.Event()
+    release = threading.Event()
+    alpha, _home_a, _vault = _controller(mod, tmp_path / "alpha", profile="alpha", runner=lambda *_a, **_k: 0)
+    beta, _home_b, _vault = _controller(mod, tmp_path / "beta", profile="beta", runner=lambda *_a, **_k: 0)
+    original_append = alpha._append_checkpoint
+
+    def blocked_append(event):
+        entered.set()
+        assert release.wait(2)
+        original_append(event)
+
+    alpha._append_checkpoint = blocked_append
+    first = threading.Thread(target=lambda: alpha.after_turn(
+        session_id="s", turn_id="alpha", completed=True, interrupted=False,
+        user_message="u", assistant_response="a", conversation_history=[], cwd="",
+    ))
+    first.start()
+    assert entered.wait(2)
+    beta_finished = threading.Event()
+
+    def checkpoint_beta():
+        beta.after_turn(
+            session_id="s", turn_id="beta", completed=True, interrupted=False,
+            user_message="u", assistant_response="a", conversation_history=[], cwd="",
+        )
+        beta_finished.set()
+
+    second = threading.Thread(target=checkpoint_beta)
+    second.start()
+    assert beta_finished.wait(0.5)
+    release.set()
+    first.join(2)
+    second.join(2)
+    assert not second.is_alive()
+
+
+def test_stale_lease_reclamation_retains_the_current_owner_metadata(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(
+        mod, tmp_path, runner=lambda *_a, **_k: 0,
+    )
+    controller.lock_path.parent.mkdir(parents=True)
+    controller.lock_path.write_text("999999", encoding="ascii")
+    os.utime(controller.lock_path, (0, 0))
+
+    with controller._lease() as acquired:
+        assert acquired is True
+    assert controller.lock_path.read_text(encoding="ascii").startswith(f"{os.getpid()}:")
+
+
+def test_manifest_declares_every_registered_lifecycle_hook():
+    root = Path(__file__).resolve().parents[2]
+    manifest = (root / "plugins" / "fleet-session-lifecycle" / "plugin.yaml").read_text()
+    assert "  - on_session_finalize" in manifest
+
+
+def test_authorization_schemes_redact_the_following_credential(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path)
+    exported = controller._append_checkpoint  # keep controller construction at public config seam
+    assert exported
+    text = mod.redact_for_export("Authorization: Bearer jwt-secret-value")
+    assert "jwt-secret-value" not in text
+    assert "[REDACTED]" in text
+
+
+def test_checkpoint_path_is_date_partitioned(monkeypatch, tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path)
+    monkeypatch.setattr(mod.time, "strftime", lambda _format: "2026-10-16")
+    assert controller._checkpoint_path() == vault / "jarvis" / "daily" / "2026-10-16-hermes-lifecycle.md"
+
+
+def test_gbrain_retries_a_pending_failure_when_retry_window_opens(tmp_path):
+    mod = _load_lifecycle()
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(argv)
+        return 1 if len(calls) == 1 else 0
+
+    controller, home, _vault = _controller(mod, tmp_path, runner=runner)
+    controller.config["gbrain_retry_seconds"] = 0
+    for turn_id in ("first", "second"):
+        controller.after_turn(
+            session_id="s", turn_id=turn_id, completed=True, interrupted=False,
+            user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo),
+        )
+    assert calls == [["gbrain", "sync"], ["gbrain", "sync"]]
+    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["gbrain"]["last_status"] == "ok"
+
+
+def test_gbrain_resolves_nested_git_worktree_to_top_level(tmp_path):
+    mod = _load_lifecycle()
+    repo = tmp_path / "repo"
+    nested = repo / "packages" / "app"
+    (repo / ".git").mkdir(parents=True)
+    nested.mkdir(parents=True)
+    calls = []
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda argv, **kwargs: calls.append((argv, kwargs)) or 0)
+
+    controller.after_turn(session_id="s", turn_id="nested", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd=str(nested))
+
+    assert calls == [(["gbrain", "sync"], {"timeout": 5.0, "cwd": str(repo)})]
+
+
+def test_gbrain_debounce_is_scoped_to_each_repository(tmp_path):
+    mod = _load_lifecycle()
+    repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+    (repo_a / ".git").mkdir(parents=True)
+    (repo_b / ".git").mkdir(parents=True)
+    calls = []
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda argv, **kwargs: calls.append(kwargs["cwd"]) or 0)
+    controller.config["debounce_seconds"] = 3600
+
+    for turn_id, repo in (("a", repo_a), ("b", repo_b)):
+        controller.after_turn(session_id="s", turn_id=turn_id, completed=True, interrupted=False,
+                              user_message="u", assistant_response="a", conversation_history=[], cwd=str(repo))
+
+    assert calls == [str(repo_a), str(repo_b)]
+
+
+def test_pinecone_successfully_acknowledges_the_durable_queue(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["pinecone_command"] = ["indexer"]
+
+    controller.after_turn(session_id="s", turn_id="ack", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    assert not (home / "state" / "fleet-session-lifecycle-pinecone.jsonl").exists()
+    assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["pinecone"]["write_pending"] is False
+
+
+def test_finalized_sessions_keep_most_recent_arrival_order(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path)
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    old_ids = [f"old-{n}" for n in range(512)]
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(json.dumps({"finalized_sessions": old_ids}), encoding="utf-8")
+
+    controller.full_wrapup(session_id="newest")
+
+    finalized = json.loads(state_path.read_text())["finalized_sessions"]
+    expected = __import__("hashlib").sha256(b"newest").hexdigest()
+    assert finalized == old_ids[1:] + [expected]
+
+
+def test_profile_rename_reuses_the_existing_vault_namespace(tmp_path):
+    mod = _load_lifecycle()
+    home = tmp_path / ".hermes" / "profiles" / "renamed"
+    home.mkdir(parents=True)
+    state_path = home / "state" / "fleet-session-lifecycle.json"
+    state_path.parent.mkdir()
+    state_path.write_text(json.dumps({"vault_profile": "previous-name"}), encoding="utf-8")
+    vault = tmp_path / "vault"
+    controller = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+
+    controller.after_turn(session_id="s", turn_id="rename", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    assert list((vault / "previous-name" / "daily").glob("*-hermes-lifecycle.md"))
+    assert not (vault / "renamed").exists()

@@ -1973,6 +1973,16 @@ class TestCloneAllExcludesRuntimeTrees:
         assert (clone / "config.yaml").is_file()
 
 
+def test_clone_all_excludes_profile_runtime_state(profile_env):
+    source = create_profile("state-source", no_alias=True)
+    (source / "state").mkdir(exist_ok=True)
+    (source / "state" / "fleet-session-lifecycle.json").write_text('{"processed_turns": ["source"]}', encoding="utf-8")
+
+    clone = create_profile("state-clone", clone_all=True, no_alias=True)
+
+    assert not (clone / "state" / "fleet-session-lifecycle.json").exists()
+
+
 def test_count_skills_publishes_timestamp_after_the_walk(tmp_path, monkeypatch):
     """A scan longer than the TTL must not publish an already-expired cache entry (#107151):
     the cached timestamp is taken after _walk_skill_count returns, not before it starts."""

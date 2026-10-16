@@ -72,13 +72,18 @@ def _on_session_end(**kwargs: Any) -> None:
             return
         session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
         with _pending_lock:
+            if not turn_id and session_id:
+                # Shutdown paths that omit turn_id still need the pre-turn identity.
+                matching = [key for key in _pending if key[0] == session_id]
+                if matching:
+                    turn_id = matching[-1][1]
             saved = _pending.pop((session_id, turn_id), {})
-        controller = LifecycleController(get_hermes_home(), _config())
+        controller = LifecycleController(get_hermes_home(), config)
         controller.after_turn(
             session_id=session_id, turn_id=turn_id,
             completed=bool(kwargs.get("completed")), interrupted=bool(kwargs.get("interrupted")),
             user_message=saved.get("user_message", ""), assistant_response=saved.get("assistant_response", ""),
-            conversation_history=saved.get("conversation_history", []), cwd=str(Path.cwd()),
+            conversation_history=saved.get("conversation_history", []), cwd=str(kwargs.get("cwd") or Path.cwd()),
         )
     except Exception:
         logger.exception("fleet-session-lifecycle: turn checkpoint failed; turn stays deliverable")
