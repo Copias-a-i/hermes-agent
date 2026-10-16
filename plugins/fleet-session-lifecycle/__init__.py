@@ -89,9 +89,9 @@ def _on_session_end(**kwargs: Any) -> None:
         config = _config()
         session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
         if not _enabled(config):
-            # Session end is terminal for its cached snapshots; do not retain a
-            # mismatched or omitted turn identifier after an opt-out.
+            # Session end is terminal for its cached snapshots and durable admission.
             _drop_pending(session_id, "")
+            LifecycleController(get_hermes_home(), config).cancel_session(session_id=session_id)
             return
         with _pending_lock:
             if not turn_id and session_id:

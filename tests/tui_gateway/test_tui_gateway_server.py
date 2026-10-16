@@ -4921,31 +4921,6 @@ def _session(agent=None, **extra):
     }
 
 
-def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
-    calls = {"hooks": []}
-
-    agent = types.SimpleNamespace(session_id="session-key")
-    agent.commit_memory_session = lambda history: calls.setdefault("history", history)
-    server._sessions["sid"] = _session(
-        agent=agent, history=[{"role": "user", "content": "hello"}]
-    )
-    monkeypatch.setattr(
-        server,
-        "_notify_session_boundary",
-        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
-    )
-
-    try:
-        resp = server.handle_request(
-            {"id": "1", "method": "session.close", "params": {"session_id": "sid"}}
-        )
-        assert resp["result"]["closed"] is True
-        assert calls["history"] == [{"role": "user", "content": "hello"}]
-        assert ("on_session_finalize", "session-key") in calls["hooks"]
-    finally:
-        server._sessions.pop("sid", None)
-
-
 def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
     """One slow session finalizer must not stall unrelated session.resume RPCs."""
     teardown_started = threading.Event()

@@ -72,11 +72,30 @@ def _atomic_json(path: Path, data: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(raw, path)
+        _fsync_directory(path.parent)
     finally:
         try:
             os.unlink(raw)
         except FileNotFoundError:
             pass
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make a replace durable by syncing its parent directory when supported."""
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    try:
+        fd = os.open(path, os.O_RDONLY | directory_flag)
+    except OSError:
+        logger.warning("fleet-session-lifecycle: unable to open state directory for fsync: %s", path)
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        # Windows has no directory fd/fsync equivalent through Python's os module.
+        if os.name != "nt":
+            raise
+    finally:
+        os.close(fd)
 
 
 class LifecycleController:
@@ -111,6 +130,45 @@ class LifecycleController:
         except (OSError, ValueError):
             return {}
 
+    def _completion_intent_path(self, event_id: str) -> Path:
+        return self.home / "state" / "fleet-session-lifecycle-completions" / f"{event_id}.json"
+
+    def _persist_completion_intent(self, event: dict[str, Any]) -> None:
+        """Make a lease-starved completion replayable without mutating another owner's state file."""
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            _atomic_json(self._completion_intent_path(event_id), event)
+
+    def _merge_completion_intents(self, state: dict[str, Any]) -> list[Path]:
+        """Adopt per-event completion intents while holding the lifecycle lease."""
+        directory = self.home / "state" / "fleet-session-lifecycle-completions"
+        try:
+            intents = tuple(directory.glob("*.json"))
+        except OSError:
+            return []
+        pending = state.setdefault("pending_turns", {})
+        adopted: list[Path] = []
+        for path in intents:
+            try:
+                event = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            event_id = str(event.get("event_id") or "")
+            if not event_id or path.name != f"{event_id}.json":
+                continue
+            event["active"] = False
+            pending[event_id] = event
+            adopted.append(path)
+        return adopted
+
+    @staticmethod
+    def _clear_completion_intents(paths: list[Path]) -> None:
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
     @staticmethod
     def _run(argv: list[str], **kwargs: Any) -> int:
         return subprocess.run(argv, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -140,8 +198,23 @@ class LifecycleController:
         return self.runner(resolved, env=self._command_env(), **kwargs)
 
     @staticmethod
-    def _owner_is_alive(pid: int) -> bool:
-        return psutil.pid_exists(pid)
+    def _owner_is_alive(pid: int, birth: float | None = None) -> bool:
+        """Identify an owner by PID plus process birth time to reject PID reuse."""
+        if not psutil.pid_exists(pid):
+            return False
+        if birth is None:
+            return True  # Legacy records predate the birth-time ownership token.
+        try:
+            return abs(psutil.Process(pid).create_time() - birth) < 0.001
+        except (psutil.Error, OSError):
+            return False
+
+    @staticmethod
+    def _owner_birth() -> float | None:
+        try:
+            return psutil.Process(os.getpid()).create_time()
+        except (psutil.Error, OSError):
+            return None
 
     def _reclaim_stale_windows_lease(self) -> bool:
         """Reclaim only an aged lock whose recorded owner is no longer alive."""
@@ -151,8 +224,14 @@ class LifecycleController:
             if time.time() - stat.st_mtime < stale_seconds:
                 return False
             owner = self.lock_path.read_text(encoding="ascii")
-            pid_text, separator, token = owner.partition(":")
-            if not separator or not token or self._owner_is_alive(int(pid_text)):
+            pid_text, separator, remainder = owner.partition(":")
+            birth_text, has_birth, token = remainder.partition(":")
+            try:
+                birth = float(birth_text) if has_birth and birth_text else None
+            except ValueError:
+                return False
+            token = token if has_birth else remainder
+            if not separator or not token or self._owner_is_alive(int(pid_text), birth):
                 return False
             if self.lock_path.read_text(encoding="ascii") != owner:
                 return False
@@ -172,7 +251,8 @@ class LifecycleController:
         """
         with self._process_lock_for(self.home):
             self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-            token = f"{os.getpid()}:{uuid.uuid4().hex}"
+            birth = self._owner_birth()
+            token = f"{os.getpid()}:{birth if birth is not None else ''}:{uuid.uuid4().hex}"
             fd: int | None = None
             windows_lease = fcntl is None
             locked = False
@@ -299,6 +379,7 @@ class LifecycleController:
                         "interrupted": True,
                         "active": True,
                         "owner_pid": os.getpid(),
+                        "owner_birth": self._owner_birth(),
                         "user": redact_for_export(user_message),
                         "response": "",
                         "checkpoint_partition": self._checkpoint_path().name,
@@ -338,7 +419,10 @@ class LifecycleController:
         if str(event.get("session_id") or "") == str(active_session_id or ""):
             return True
         try:
-            return not self._owner_is_alive(int(event.get("owner_pid")))
+            return not self._owner_is_alive(
+                int(event.get("owner_pid")),
+                float(event["owner_birth"]) if event.get("owner_birth") is not None else None,
+            )
         except (TypeError, ValueError):
             return True  # legacy pending record: no liveness claim to honor.
 
@@ -376,6 +460,10 @@ class LifecycleController:
                     logger.warning("fleet-session-lifecycle: final wrap-up lease remained busy")
                     return
                 state = self._state()
+                completion_intents = self._merge_completion_intents(state)
+                if completion_intents:
+                    _atomic_json(self.state_path, state)
+                    self._clear_completion_intents(completion_intents)
                 state["vault_profile"] = self.profile
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
                 replayed_sessions = self._drain_pending(state, processed, active_session_id=session_id)
@@ -402,6 +490,33 @@ class LifecycleController:
         except Exception:
             logger.exception("fleet-session-lifecycle: full wrap-up checkpoint failed for this session")
             return
+
+    def cancel_session(self, *, session_id: str) -> None:
+        """Remove durable admissions when a profile is disabled at session end."""
+        if not session_id:
+            return
+        try:
+            with self._lease_with_retry() as acquired:
+                if not acquired:
+                    logger.warning("fleet-session-lifecycle: disabled session cancellation lease remained busy")
+                    return
+                state = self._state()
+                pending = state.setdefault("pending_turns", {})
+                removed = [
+                    event_id for event_id, event in pending.items()
+                    if isinstance(event, dict) and str(event.get("session_id") or "") == session_id
+                ]
+                for event_id in removed:
+                    pending.pop(event_id, None)
+                if removed:
+                    _atomic_json(self.state_path, state)
+                for event_id in removed:
+                    try:
+                        self._completion_intent_path(event_id).unlink()
+                    except FileNotFoundError:
+                        pass
+        except Exception:
+            logger.exception("fleet-session-lifecycle: disabled session cancellation failed")
 
     def _outbox_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
         """Deliver redacted events through an optional vendor-neutral durable outbox.
@@ -456,9 +571,31 @@ class LifecycleController:
         try:
             with self._lease_with_retry() as acquired:
                 if not acquired:
-                    logger.warning("fleet-session-lifecycle: after-turn lease remained busy")
+                    # The admission is already durable. Publish an independent per-event completion
+                    # intent so a later holder can safely make it replayable instead of waiting for
+                    # this still-live PID to die.
+                    state = self._state()
+                    pending = state.get("pending_turns") if isinstance(state.get("pending_turns"), dict) else {}
+                    event = dict(pending.get(event_id) or {})
+                    event.update({
+                        "event_id": event_id,
+                        "session_id": redact_for_export(session_id),
+                        "turn_id": redact_for_export(turn_id),
+                        "completed": bool(completed),
+                        "interrupted": bool(interrupted),
+                        "active": False,
+                        "user": redact_for_export(user_message) or event.get("user", ""),
+                        "response": redact_for_export(assistant_response),
+                        "checkpoint_partition": event.get("checkpoint_partition") or self._checkpoint_path().name,
+                    })
+                    self._persist_completion_intent(event)
+                    logger.warning("fleet-session-lifecycle: after-turn lease remained busy; completion intent retained")
                     return
                 state = self._state()
+                completion_intents = self._merge_completion_intents(state)
+                if completion_intents:
+                    _atomic_json(self.state_path, state)
+                    self._clear_completion_intents(completion_intents)
                 state["vault_profile"] = self.profile
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
                 current_was_processed = event_id in processed

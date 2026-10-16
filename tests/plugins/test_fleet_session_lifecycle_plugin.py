@@ -893,3 +893,102 @@ def test_full_wrapup_recovers_after_append_before_finalized_ledger(tmp_path, mon
     controller.full_wrapup(session_id="closing", reason="quit")
     checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
     assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 1
+
+
+def test_atomic_json_fsyncs_parent_directory_after_replace(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    path = tmp_path / "state" / "admission.json"
+    syncs = []
+    original_open = mod.os.open
+    original_fsync = mod.os.fsync
+
+    def tracking_open(target, flags, *args):
+        fd = original_open(target, flags, *args)
+        if Path(target) == path.parent:
+            syncs.append(("opened-parent", fd))
+        return fd
+
+    def tracking_fsync(fd):
+        syncs.append(("fsync", fd))
+        return original_fsync(fd)
+
+    monkeypatch.setattr(mod.os, "open", tracking_open)
+    monkeypatch.setattr(mod.os, "fsync", tracking_fsync)
+
+    mod._atomic_json(path, {"admitted": True})
+
+    parent_fds = {fd for kind, fd in syncs if kind == "opened-parent"}
+    assert parent_fds
+    assert any(kind == "fsync" and fd in parent_fds for kind, fd in syncs)
+
+
+def test_after_turn_busy_lease_persists_completion_intent_for_other_session_replay(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    first, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    second = mod.LifecycleController(first.home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+    first.admit_turn(session_id="active", turn_id="turn", user_message="question")
+    first.config["finalize_lease_wait_seconds"] = 0
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def busy_lease():
+        yield False
+
+    monkeypatch.setattr(first, "_lease", busy_lease)
+    first.after_turn(session_id="active", turn_id="turn", completed=True, interrupted=False,
+                     user_message="question", assistant_response="answer", conversation_history=[], cwd="")
+
+    event_id = __import__("hashlib").sha256(b"active\x00turn").hexdigest()
+    assert (home / "state" / "fleet-session-lifecycle-completions" / f"{event_id}.json").exists()
+    second.after_turn(session_id="other", turn_id="next", completed=True, interrupted=False,
+                      user_message="other", assistant_response="ok", conversation_history=[], cwd="")
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert event_id not in state["pending_turns"]
+    assert "turn_id: turn" in _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+
+
+def test_disabled_session_end_cancels_durable_admissions(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    calls = []
+
+    class Controller:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def cancel_session(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(plugin, "LifecycleController", Controller)
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": False})
+
+    plugin._on_session_end(session_id="disabled", turn_id="ignored")
+
+    assert calls == [{"session_id": "disabled"}]
+
+
+def test_owner_liveness_rejects_pid_reuse_with_mismatched_birth_time(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path)
+
+    class Process:
+        def create_time(self):
+            return 200.0
+
+    monkeypatch.setattr(mod.psutil, "pid_exists", lambda _pid: True)
+    monkeypatch.setattr(mod.psutil, "Process", lambda _pid: Process())
+
+    assert controller._owner_is_alive(123, 200.0) is True
+    assert controller._owner_is_alive(123, 100.0) is False
+
+
+def test_cancel_session_removes_durable_pending_admissions(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path)
+    controller.admit_turn(session_id="disabled", turn_id="turn", user_message="question")
+
+    controller.cancel_session(session_id="disabled")
+
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"] == {}
