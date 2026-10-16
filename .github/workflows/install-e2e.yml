@@ -200,7 +200,7 @@ jobs:
             git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1 >/dev/null
           }
           if ! has_reachable_release_tag; then
-            EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent.git'
+            EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent'
             CANONICAL_UPSTREAM='https://github.com/NousResearch/hermes-agent.git'
             actual_origin="$(git remote get-url origin)"
             if [ "$actual_origin" != "$EXPECTED_ORIGIN" ]; then

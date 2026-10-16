@@ -96,7 +96,7 @@ def test_release_tag_consumers_use_complete_tagged_checkouts_and_fail_closed_whe
         # Copias-a-i/hermes-agent is a tagless fork. The fallback must be pinned to
         # the canonical upstream after proving the checkout's origin is precisely
         # the expected fork, rather than trusting a mutable remote alias.
-        assert "EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent.git'" in command
+        assert "EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent'" in command
         assert "CANONICAL_UPSTREAM='https://github.com/NousResearch/hermes-agent.git'" in command
         assert 'git remote get-url origin' in command
         assert 'git fetch --force --tags "$CANONICAL_UPSTREAM"' in command
