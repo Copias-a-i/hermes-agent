@@ -33,6 +33,13 @@ Machines run in parallel. Updates and gateway lifetimes take a job-wide lock
 everything else stay parallel. One install's update sparing another's gateway (#124659) is
 its own journey (test_update_spares_other_installs.py).
 
+Each finished journey must reclaim its profile and work root. A clean ``install.ps1`` leaves
+a multi-gigabyte toolchain under ``%LOCALAPPDATA%\\hermes`` (pinned Git, managed Python, venv,
+filtered checkout). Leaving those trees on disk after the module fixture ends is what filled
+stock ``windows-latest`` late in the suite (ENOSPC while installing git) even after the
+worker count was already cut to two. Teardown therefore snapshots only bounded transcripts
+and then deletes the profile and machine root before the next wave starts.
+
 The suite mutates HKCU and downloads a toolchain per machine, so it only runs where
 ``HERMES_E2E_WINDOWS_INSTALL=1`` (the CI job sets it).
 """
@@ -71,6 +78,12 @@ INSTALL_TIMEOUT = 1500.0
 UPDATE_TIMEOUT = 1200.0
 CMD_TIMEOUT = 300.0
 GATEWAY_READY_TIMEOUT = 240.0
+# One clean install.ps1 journey on stock windows-latest: pinned Git + managed Python + uv
+# venv + filtered checkout + tool caches. Measured by late-suite ENOSPC after ~8-10
+# unreclaimed installs; keep the budget above one live install and below a stock free disk.
+CLEAN_INSTALL_DISK_BYTES = 3 * 1024 ** 3
+# Headroom for runner diagnostics, the next install's temp extract, and concurrent peers.
+FREE_SPACE_CUSHION_BYTES = 2 * 1024 ** 3
 CANONICAL_URLS = (
     "https://github.com/NousResearch/hermes-agent.git",
     "https://github.com/NousResearch/hermes-agent",
@@ -79,6 +92,119 @@ CANONICAL_URLS = (
 NEXT_MARKER = ".hermes-e2e-next"
 # Captured before any machine strips PATH: harness plumbing (serve.git, rev-parse) only.
 REAL_GIT = shutil.which("git")
+# Cap concurrent clean install.ps1 journeys across journey *files* (each file is its own
+# pytest subprocess under run_tests_parallel). A process-local threading.Semaphore cannot
+# do that: workers=2 would otherwise pair test_update_spares_other_installs (two installs)
+# with another file's install = three simultaneous multi-GB toolchains on a stock disk.
+INSTALL_SLOT_LIMIT = max(1, int(os.environ.get("HERMES_E2E_INSTALL_SLOTS", "2")))
+# In-process fallback used only when the host is not Windows (unit tests on macOS/Linux).
+_INSTALL_SLOTS_THREAD = threading.BoundedSemaphore(INSTALL_SLOT_LIMIT)
+
+
+@contextlib.contextmanager
+def _install_slot():
+    """Hold one of ``INSTALL_SLOT_LIMIT`` cross-process install slots until the install ends."""
+    if os.name != "nt":
+        with _INSTALL_SLOTS_THREAD:
+            yield
+        return
+    import msvcrt
+
+    root = Path(os.environ.get("HERMES_E2E_MACHINE_ROOT") or tempfile.gettempdir()) / "hermes-e2e-install-slots"
+    root.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + INSTALL_TIMEOUT + 120.0
+    held = None
+    last_err: BaseException | None = None
+    while held is None and time.monotonic() < deadline:
+        for i in range(INSTALL_SLOT_LIMIT):
+            path = root / f"slot-{i}.lock"
+            fh = None
+            try:
+                fh = open(path, "a+b")
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                fh.seek(0)
+                fh.truncate()
+                fh.write(f"{os.getpid()}\n".encode("ascii"))
+                fh.flush()
+                held = fh
+                break
+            except OSError as exc:
+                last_err = exc
+                if fh is not None:
+                    with contextlib.suppress(OSError):
+                        fh.close()
+        if held is None:
+            time.sleep(0.5)
+    if held is None:
+        raise AssertionError(
+            f"could not acquire one of {INSTALL_SLOT_LIMIT} cross-process install slots "
+            f"under {root} within the install budget"
+            + (f": {last_err}" if last_err else "")
+        )
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            held.seek(0)
+            msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
+        with contextlib.suppress(OSError):
+            held.close()
+
+
+def free_bytes_for(path: Path) -> int:
+    """Free bytes on the volume that holds ``path`` (creating parents is the caller's job)."""
+    probe = path if path.exists() else path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return int(shutil.disk_usage(probe).free)
+
+
+def install_space_required(live_machines: int = 1) -> int:
+    """Bytes that must be free before starting ``live_machines`` concurrent clean installs."""
+    if live_machines < 1:
+        raise ValueError("live_machines must be >= 1")
+    return CLEAN_INSTALL_DISK_BYTES * live_machines + FREE_SPACE_CUSHION_BYTES
+
+
+def require_install_space(path: Path, *, live_machines: int = 1) -> None:
+    """Fail closed before ``install.ps1`` when the volume cannot host another clean journey."""
+    need = install_space_required(live_machines)
+    free = free_bytes_for(path)
+    if free < need:
+        raise AssertionError(
+            f"not enough free disk for {live_machines} clean install journey(s): "
+            f"need {need // (1024 ** 2)} MiB, have {free // (1024 ** 2)} MiB on {path}"
+        )
+
+
+def reclaim_tree(path: Path) -> None:
+    """Delete a machine profile or work root, including read-only git objects on Windows.
+
+    Fail closed if the tree is still present after retries: a silent leftover is how the
+    suite filled stock windows-latest mid-run.
+    """
+    if not path.exists():
+        return
+
+    def _wipe(target: Path) -> None:
+        try:
+            from utils import rmtree_readonly
+
+            rmtree_readonly(target, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(target, ignore_errors=True)
+
+    _wipe(path)
+    # AV / handle races: brief waits beat leaving multi-GB trees for the next journey.
+    for delay in (0.5, 1.0, 2.0):
+        if not path.exists():
+            return
+        time.sleep(delay)
+        _wipe(path)
+    if path.exists():
+        raise RuntimeError(f"failed to reclaim machine tree after retries: {path}")
+
 
 # Every module here also carries platforms("windows") + integration + live_system_guard_bypass
 # literally in its own ``pytestmark`` (scripts/ci/list_os_marked_tests.py reads the file text).
@@ -363,13 +489,19 @@ class Machine:
 
     def install(self) -> Run:
         """``powershell -File install.ps1 -NonInteractive`` from a directory that is no project."""
-        script = self.root / "install.ps1"
-        shutil.copyfile(REPO_ROOT / "scripts" / "install.ps1", script)
-        cwd = self.root / "install-cwd"
-        cwd.mkdir(parents=True, exist_ok=True)
-        return self._run_logged(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-NonInteractive"],
-            "install", timeout=INSTALL_TIMEOUT, cwd=cwd)
+        # Cross-process install slots so workers=2 cannot stack the dual-install spares
+        # journey on top of another clean install (each journey file is its own subprocess).
+        with _install_slot():
+            # Refuse to start another toolchain when the volume is already tight: the
+            # previous residual ENOSPC was "installing git" with a full disk, not a product gate.
+            require_install_space(self.profile if self.profile.exists() else self.root)
+            script = self.root / "install.ps1"
+            shutil.copyfile(REPO_ROOT / "scripts" / "install.ps1", script)
+            cwd = self.root / "install-cwd"
+            cwd.mkdir(parents=True, exist_ok=True)
+            return self._run_logged(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-NonInteractive"],
+                "install", timeout=INSTALL_TIMEOUT, cwd=cwd)
 
     def hermes(self, *args: str, label: str | None = None, timeout: float = CMD_TIMEOUT,
                env_extra: dict[str, str] | None = None) -> Run:
@@ -517,22 +649,50 @@ class Machine:
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=60)
 
     def teardown(self) -> None:
-        self.kill_owned()
+        """Stop processes, snapshot bounded diagnostics, then always reclaim multi-GB trees."""
         try:
-            _restore_hkcu_path(self._hkcu)
-        except OSError:
-            pass
-        artifacts = os.environ.get("HERMES_E2E_ARTIFACTS")
-        if artifacts:
-            dest = Path(artifacts) / self.root.name
-            shutil.copytree(self.logs, dest / "transcripts", dirs_exist_ok=True)
-            for sub in ("logs",):
-                src = self.hermes_home / sub
-                if src.is_dir():
-                    shutil.copytree(src, dest / sub, dirs_exist_ok=True,
-                                    ignore=shutil.ignore_patterns("*.db", "*.db-*"))
-            (dest / "evidence.txt").write_text(self.evidence(), encoding="utf-8", errors="replace")
-            (dest / "timings.json").write_text(json.dumps(self.timings, indent=1), encoding="utf-8")
+            self.kill_owned()
+            try:
+                _restore_hkcu_path(self._hkcu)
+            except OSError:
+                pass
+            artifacts = os.environ.get("HERMES_E2E_ARTIFACTS")
+            if artifacts:
+                dest = Path(artifacts) / self.root.name
+                # Bounded diagnostics only: never archive the installed toolchain/venv/checkout.
+                try:
+                    if self.logs.is_dir():
+                        shutil.copytree(self.logs, dest / "transcripts", dirs_exist_ok=True)
+                    hermes_logs = self.hermes_home / "logs"
+                    if hermes_logs.is_dir():
+                        shutil.copytree(
+                            hermes_logs, dest / "logs", dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("*.db", "*.db-*", "*.zip", "*.msi", "*.exe"),
+                        )
+                    (dest / "evidence.txt").write_text(self.evidence(), encoding="utf-8", errors="replace")
+                    (dest / "timings.json").write_text(json.dumps(self.timings, indent=1), encoding="utf-8")
+                except Exception as exc:
+                    # A full disk or any diagnostics failure must not skip reclaim: the next
+                    # journey needs the space more than CI needs a perfect transcript tree.
+                    with contextlib.suppress(OSError):
+                        dest.mkdir(parents=True, exist_ok=True)
+                        (dest / "artifact-copy-failed.txt").write_text(
+                            f"{type(exc).__name__}: {exc}", encoding="utf-8")
+        finally:
+            # Causal disk fix: drop the multi-GB profile and work root so later journey files
+            # (and a concurrent peer after this module ends) do not inherit residual installs.
+            self.reclaim_disk()
+
+    def reclaim_disk(self) -> None:
+        """Delete this machine's user profile and work root after diagnostics are snapshotted."""
+        errors: list[BaseException] = []
+        for path in (self.profile, self.root):
+            try:
+                reclaim_tree(path)
+            except BaseException as exc:  # keep going so both trees are attempted
+                errors.append(exc)
+        if errors:
+            raise errors[-1]
 
 
 def new_machine(tmp_root: Path, base_url: str, *, label: str, person: str = "",

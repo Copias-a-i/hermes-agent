@@ -87,9 +87,11 @@ jobs:
           # 4-vCPU runner: every one of the first six independent installs hit INSTALL_TIMEOUT
           # (1500 s) in the same run, and the runner then ran out of disk writing their
           # diagnostics — six concurrent toolchains and venvs, not six product defects. Two
-          # leaves each install ~2 vCPUs and a survivable peak footprint; the update and gateway
-          # phases serialize on the harness's job-wide lock anyway (_machine.gateway_phase), so
-          # extra workers never bought proportional throughput.
+          # leaves each install ~2 vCPUs and a survivable peak footprint; the harness reclaims
+          # each machine's multi-GB profile and work root on teardown so later waves do not
+          # inherit residual installs (the late-suite ENOSPC after workers=2). The update and
+          # gateway phases serialize on the harness's job-wide lock anyway (_machine.gateway_phase),
+          # so extra workers never bought proportional throughput.
           HERMES_TEST_WORKERS: '2'
           # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
           # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.

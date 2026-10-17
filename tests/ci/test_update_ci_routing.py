@@ -161,6 +161,9 @@ _STOCK_WINDOWS_VCPUS = 4
 _VCPUS_PER_CLEAN_INSTALL = 2
 # Checkout at fetch-depth 0, setup-pm and the artifact upload, outside the pytest waves.
 _WINDOWS_E2E_OVERHEAD_MINUTES = 20
+# Empirically observed free space on a loaded stock windows-latest after setup-pm is only a
+# low double-digit number of GiB. Unreclaimed installs from earlier journey files filled it.
+_STOCK_WINDOWS_FREE_DISK_BYTES = 14 * 1024 ** 3
 
 
 def _windows_journey_files() -> list[str]:
@@ -168,6 +171,10 @@ def _windows_journey_files() -> list[str]:
     found = sorted(p.name for p in (_REPO / _WINDOWS_JOURNEYS).glob("test_*.py"))
     assert len(found) >= 10, f"{_WINDOWS_JOURNEYS} journeys moved or shrank: {found}"
     return found
+
+
+def _windows_machine_module():
+    return importlib.import_module(_WINDOWS_JOURNEYS.replace("/", ".") + "._machine")
 
 
 def test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_the_budget():
@@ -178,7 +185,7 @@ def test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_
     eleventh journey file or raising the worker count without raising ``timeout-minutes``
     fails here rather than as a wave of uniform install timeouts on a Windows runner.
     """
-    machine = importlib.import_module(_WINDOWS_JOURNEYS.replace("/", ".") + "._machine")
+    machine = _windows_machine_module()
     job = _yaml(_WINDOWS_E2E)["jobs"]["install-update"]
     step = next(s for s in job["steps"] if s.get("name") == "Run Windows install + update E2E")
     env = step["env"]
@@ -187,6 +194,15 @@ def test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_
     assert workers >= 1
     assert workers * _VCPUS_PER_CLEAN_INSTALL <= _STOCK_WINDOWS_VCPUS, \
         f"{workers} concurrent clean installs oversubscribe a {_STOCK_WINDOWS_VCPUS}-vCPU runner"
+
+    # Peak concurrent clean installs must fit the stock free disk *with reclaim between files*.
+    # Without reclaim, ten journey files leave ten multi-GB profiles and ENOSPC mid-suite.
+    # Install slots cap concurrent install.ps1 calls so workers=2 cannot stack the dual-install
+    # spares journey on top of another file's install.
+    assert machine.INSTALL_SLOT_LIMIT == 2
+    peak_live = machine.INSTALL_SLOT_LIMIT
+    assert machine.install_space_required(peak_live) <= _STOCK_WINDOWS_FREE_DISK_BYTES, \
+        f"{peak_live} live installs need more disk than stock windows-latest can spare"
 
     # test_crash_cells.py runs its whole journey inside one file and needs the full hour; a
     # retry of a file killed by that bound would double the capacity problem it reports.
@@ -201,7 +217,132 @@ def test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_
     assert budget > file_timeout / 60, "the job would be cancelled before the per-file bound reports red"
 
 
-@pytest.mark.parametrize("mutation", ["more-workers", "more-journeys", "smaller-budget", "file-retries"])
+def test_windows_install_lane_disk_budget_constants_fit_stock_runner():
+    """Peak live installs must fit stock free disk once prior journeys reclaim."""
+    machine = _windows_machine_module()
+    assert machine.CLEAN_INSTALL_DISK_BYTES >= 2 * 1024 ** 3
+    assert machine.FREE_SPACE_CUSHION_BYTES >= 1024 ** 3
+    assert machine.install_space_required(1) == (
+        machine.CLEAN_INSTALL_DISK_BYTES + machine.FREE_SPACE_CUSHION_BYTES
+    )
+    assert machine.INSTALL_SLOT_LIMIT == 2
+    assert machine.install_space_required(machine.INSTALL_SLOT_LIMIT) <= _STOCK_WINDOWS_FREE_DISK_BYTES
+    workers = int(
+        next(s for s in _yaml(_WINDOWS_E2E)["jobs"]["install-update"]["steps"]
+             if s.get("name") == "Run Windows install + update E2E")["env"]["HERMES_TEST_WORKERS"]
+    )
+    assert workers == 2
+
+
+def test_install_slot_uses_cross_process_msvcrt_locks_on_windows():
+    """Install capacity must span pytest subprocesses via shared machine-root lock files."""
+    harness = (_REPO / _WINDOWS_JOURNEYS / "_machine.py").read_text(encoding="utf-8")
+    # Contract against the Windows path (unit hosts are not nt, so the lock body cannot run here).
+    assert "def _install_slot(" in harness
+    assert "import msvcrt" in harness
+    assert "hermes-e2e-install-slots" in harness
+    assert "msvcrt.locking" in harness
+    assert "LK_NBLCK" in harness
+    assert "HERMES_E2E_MACHINE_ROOT" in harness
+    machine = _windows_machine_module()
+    assert machine.INSTALL_SLOT_LIMIT == 2
+
+
+def _staged_machine(machine_mod, tmp_path):
+    root = tmp_path / "wm-root"
+    profile = tmp_path / "Users" / "hermes-e2e-unit"
+    (root / "serve.git").mkdir(parents=True)
+    installs = profile / "AppData" / "Local" / "hermes" / "installs" / "x"
+    installs.mkdir(parents=True)
+    (installs / "big.bin").write_bytes(b"x" * 1024)
+    (profile / "AppData" / "Local" / "hermes" / "logs").mkdir(parents=True)
+    (profile / "AppData" / "Local" / "hermes" / "logs" / "agent.log").write_text("ok\n", encoding="utf-8")
+    m = machine_mod.Machine(
+        root=root, profile_name=profile.name, base_url="http://127.0.0.1:9",
+        profiles_root=profile.parent,
+    )
+    return m, root, profile
+
+
+def test_machine_reclaim_disk_deletes_profile_and_root(tmp_path):
+    """Unit: reclaim_disk removes both trees."""
+    machine_mod = _windows_machine_module()
+    m, root, profile = _staged_machine(machine_mod, tmp_path)
+    m.reclaim_disk()
+    assert not root.exists()
+    assert not profile.exists()
+
+
+def test_reclaim_tree_fails_closed_when_deletion_cannot_finish(tmp_path, monkeypatch):
+    """A stuck tree must surface as an error, not a silent leftover for the next journey."""
+    machine_mod = _windows_machine_module()
+    stuck = tmp_path / "stuck-profile"
+    stuck.mkdir()
+    (stuck / "held.bin").write_bytes(b"x")
+
+    def _noop_rmtree(path, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(machine_mod.shutil, "rmtree", _noop_rmtree)
+    monkeypatch.setattr(machine_mod.time, "sleep", lambda _s: None)
+    # utils.rmtree_readonly import path also collapses to the same no-op via Exception path
+    # when import succeeds; force both deletion attempts to leave the tree.
+    import utils as _utils
+
+    monkeypatch.setattr(_utils, "rmtree_readonly", lambda path, **kwargs: None)
+    with pytest.raises(RuntimeError, match="failed to reclaim"):
+        machine_mod.reclaim_tree(stuck)
+    assert stuck.exists()
+
+
+def test_teardown_reclaims_disk_even_when_artifact_diagnostics_raise(tmp_path, monkeypatch):
+    """Any diagnostics failure must still delete the multi-GB profile and work root."""
+    machine_mod = _windows_machine_module()
+    m, root, profile = _staged_machine(machine_mod, tmp_path)
+    arts = tmp_path / "arts"
+    monkeypatch.setenv("HERMES_E2E_ARTIFACTS", str(arts))
+    monkeypatch.setattr(m, "kill_owned", lambda: None)
+    monkeypatch.setattr(machine_mod, "_restore_hkcu_path", lambda _saved: None)
+
+    def _boom_evidence() -> str:
+        raise RuntimeError("diagnostics boom")
+
+    monkeypatch.setattr(m, "evidence", _boom_evidence)
+    m.teardown()
+    assert not root.exists(), "work root survived a diagnostics failure"
+    assert not profile.exists(), "profile survived a diagnostics failure"
+    # Failure is recorded when possible, but reclaim is the contract.
+    failed = arts / root.name / "artifact-copy-failed.txt"
+    assert failed.is_file() and "RuntimeError" in failed.read_text(encoding="utf-8")
+
+
+def test_install_refuses_when_free_space_is_below_budget(tmp_path, monkeypatch):
+    """install.ps1 must not start when the volume cannot host another clean journey."""
+    machine_mod = _windows_machine_module()
+    m, _root, _profile = _staged_machine(machine_mod, tmp_path)
+
+    class _Usage:
+        free = 100
+
+    monkeypatch.setattr(machine_mod.shutil, "disk_usage", lambda _p: _Usage())
+    with pytest.raises(AssertionError, match="not enough free disk"):
+        m.install()
+
+
+def test_require_install_space_fails_closed_when_disk_is_tight(tmp_path, monkeypatch):
+    machine_mod = _windows_machine_module()
+
+    class _Usage:
+        free = 100
+
+    monkeypatch.setattr(machine_mod.shutil, "disk_usage", lambda _p: _Usage())
+    with pytest.raises(AssertionError, match="not enough free disk"):
+        machine_mod.require_install_space(tmp_path, live_machines=1)
+
+
+@pytest.mark.parametrize("mutation", [
+    "more-workers", "more-journeys", "smaller-budget", "file-retries",
+])
 def test_capacity_guard_rejects_an_oversubscribed_or_underbudgeted_install_lane(monkeypatch, mutation):
     if mutation == "more-journeys":
         monkeypatch.setattr(sys.modules[__name__], "_windows_journey_files",
