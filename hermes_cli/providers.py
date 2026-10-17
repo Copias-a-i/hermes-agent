@@ -553,6 +553,12 @@ def resolve_provider_full(name: str, user_providers: Optional[Dict[str, Any]] = 
         pdef = _lossy_alias_registry_pdef(raw, canonical)
         if pdef is not None:
             return pdef
+    # A named legacy custom provider may share the generic ``custom`` catalog identity;
+    # resolve its configured endpoint before the generic provider fallback collapses it.
+    if raw == "custom" or raw.startswith("custom:"):
+        custom_pdef = resolve_custom_provider(name, custom_providers)
+        if custom_pdef is not None:
+            return custom_pdef
     pdef = get_provider(canonical)
     if pdef is not None:
         if pdef.source == "plugin-profile" and user_providers:
