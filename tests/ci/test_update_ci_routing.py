@@ -61,6 +61,11 @@ def test_required_ci_lanes_use_stock_hosted_runners() -> None:
     # 30-minute job ceiling. Keep the job ceiling above the full observed slice
     # wall time while preserving the per-file failure bounds in the runner.
     assert tests["test"]["timeout-minutes"] == 60
+    # Worker count follows the runner's capacity, not the retired 32-core label: 32
+    # workers on the 4-vCPU standard runner turned unrelated timing, process, deadlock
+    # and circular-import suites red in both slices while the run still progressed.
+    python_run = next(step for step in tests["test"]["steps"] if step.get("name") == "Run tests")
+    assert str(python_run["env"]["HERMES_TEST_WORKERS"]) == "4"
 
     os_tests = _yaml(".github/workflows/tests-os.yml")["jobs"]
     matrix = os_tests["os-tests"]["strategy"]["matrix"]["include"]
