@@ -39,6 +39,8 @@ _EXPORT_SECRET_PATTERNS = (
     re.compile(r"\b(?:sk|pk)[_-][A-Za-z0-9_-]{16,}\b"),
 )
 _PARTITION_NAME = re.compile(r"\d{4}-\d{2}-\d{2}-hermes-lifecycle\.md")
+_SESSION_HASH = re.compile(r"[0-9a-f]{64}")
+_ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
 _MAX_TEXT = 600
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,24 @@ def redact_for_export(value: Any) -> str:
     for pattern in _EXPORT_SECRET_PATTERNS:
         text = pattern.sub("[REDACTED]", text)
     return text[:_MAX_TEXT]
+
+
+def session_identity_hash(session_id: str) -> str:
+    """Stable internal identity for a session, taken before any display redaction.
+
+    Durable records may only carry the redacted display id, which is lossy: a
+    credential-shaped session id redacts to a different (and colliding) string,
+    so dedup, cancellation and finalization all key on this hash instead.
+    """
+    return hashlib.sha256(str(session_id).encode()).hexdigest()
+
+
+def _is_outbox_record(line: bytes) -> bool:
+    """Whether one JSONL line is a readable outbox record an adapter can consume."""
+    try:
+        return isinstance(json.loads(line.decode("utf-8")), dict)
+    except (UnicodeDecodeError, ValueError):
+        return False
 
 
 def profile_name_for_home(home: Path) -> str:
@@ -99,11 +119,46 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+_STATE_ARTIFACTS = (
+    "fleet-session-lifecycle.json",
+    "fleet-session-lifecycle.lock",
+    "fleet-session-lifecycle-outbox.jsonl",
+    "fleet-session-lifecycle-completions",
+    "fleet-session-lifecycle-cancellations",
+    "fleet-session-lifecycle-finalizations",
+)
+
+
 class LifecycleController:
     """Profile-local durable side effects for one completed or interrupted turn."""
 
     _locks_guard = threading.Lock()
     _process_locks: dict[Path, threading.RLock] = {}
+
+    @staticmethod
+    def has_durable_state(home: Path) -> bool:
+        """Whether this profile ever produced lifecycle state worth cleaning up.
+
+        A profile that never enabled the plugin must not have ``state/`` or a
+        lock file materialised for it by a disabled-session cleanup pass.
+        """
+        state = Path(home) / "state"
+        return any((state / name).exists() for name in _STATE_ARTIFACTS)
+
+    @staticmethod
+    def _event_session_hash(event: dict[str, Any]) -> str:
+        """Identity of a durable record; legacy rows carry only the redacted display id."""
+        stored = str(event.get("session_hash") or "")
+        if _SESSION_HASH.fullmatch(stored):
+            return stored
+        return session_identity_hash(str(event.get("session_id") or ""))
+
+    @staticmethod
+    def _session_identity_candidates(session_id: str) -> set[str]:
+        """Every hash a record for ``session_id`` may carry, including the legacy redacted one."""
+        if not session_id:
+            return set()
+        return {session_identity_hash(session_id), session_identity_hash(redact_for_export(session_id))}
 
     @classmethod
     def _process_lock_for(cls, home: Path) -> threading.RLock:
@@ -157,12 +212,14 @@ class LifecycleController:
                 event = json.loads(path.read_text(encoding="utf-8-sig"))
             except (OSError, ValueError):
                 continue
+            if not isinstance(event, dict):
+                continue
             event_id = str(event.get("event_id") or "")
             if not event_id or path.name != f"{event_id}.json":
                 continue
             # A cancellation is terminal: never let a lease-starved completion
             # re-admit its event after cancellation removed the durable pending row.
-            if str(event.get("session_id") or "") in cancelled_sessions:
+            if self._event_session_hash(event) in cancelled_sessions:
                 adopted.append(path)
                 continue
             event["active"] = False
@@ -178,13 +235,16 @@ class LifecycleController:
             except FileNotFoundError:
                 pass
 
-    def _cancellation_intent_path(self, session_id: str) -> Path:
-        token = hashlib.sha256(session_id.encode()).hexdigest()
-        return self.home / "state" / "fleet-session-lifecycle-cancellations" / f"{token}.json"
+    def _cancellation_intent_path(self, session_hash: str) -> Path:
+        return self.home / "state" / "fleet-session-lifecycle-cancellations" / f"{session_hash}.json"
 
     def _persist_cancellation_intent(self, session_id: str) -> None:
         """Durably defer disabled-session cleanup while another process owns state."""
-        _atomic_json(self._cancellation_intent_path(session_id), {"session_id": redact_for_export(session_id)})
+        session_hash = session_identity_hash(session_id)
+        _atomic_json(self._cancellation_intent_path(session_hash), {
+            "session_hash": session_hash,
+            "session_id": redact_for_export(session_id),
+        })
 
     def _merge_cancellation_intents(self, state: dict[str, Any]) -> tuple[list[Path], list[str], set[str]]:
         """Apply deferred cancellation only while holding the lifecycle lease."""
@@ -202,12 +262,16 @@ class LifecycleController:
                 payload = json.loads(path.read_text(encoding="utf-8-sig"))
             except (OSError, ValueError):
                 continue
-            session_id = str(payload.get("session_id") or "") if isinstance(payload, dict) else ""
-            if not session_id or path.name != f"{hashlib.sha256(session_id.encode()).hexdigest()}.json":
+            if not isinstance(payload, dict):
                 continue
-            cancelled_sessions.add(session_id)
+            session_hash = str(payload.get("session_hash") or "")
+            if not _SESSION_HASH.fullmatch(session_hash) or path.name != f"{session_hash}.json":
+                continue
+            # Legacy rows key on the redacted display id, which the raw-id hash cannot reproduce.
+            identities = {session_hash, session_identity_hash(str(payload.get("session_id") or ""))}
+            cancelled_sessions |= identities
             for event_id, event in list(pending.items()):
-                if isinstance(event, dict) and str(event.get("session_id") or "") == session_id:
+                if isinstance(event, dict) and self._event_session_hash(event) in identities:
                     pending.pop(event_id, None)
                     removed.append(str(event_id))
             adopted.append(path)
@@ -217,16 +281,18 @@ class LifecycleController:
         self._clear_completion_intents([self._completion_intent_path(event_id) for event_id in removed])
         self._clear_completion_intents(paths)
 
-    def _finalization_intent_path(self, final_id: str) -> Path:
-        return self.home / "state" / "fleet-session-lifecycle-finalizations" / f"{final_id}.json"
+    def _finalization_intent_path(self, session_hash: str) -> Path:
+        return self.home / "state" / "fleet-session-lifecycle-finalizations" / f"{session_hash}.json"
 
     def _persist_finalization_intent(self, session_id: str, reason: str) -> None:
-        final_id = hashlib.sha256(session_id.encode()).hexdigest()
-        _atomic_json(self._finalization_intent_path(final_id), {
-            "final_id": final_id,
+        """Keep the boundary replayable; repeated busy attempts collapse onto one intent."""
+        session_hash = session_identity_hash(session_id)
+        _atomic_json(self._finalization_intent_path(session_hash), {
+            "session_hash": session_hash,
             "session_id": redact_for_export(session_id),
             "reason": redact_for_export(reason),
             "partition": self._checkpoint_path().name,
+            "attempt_id": uuid.uuid4().hex,
         })
 
     def _merge_finalization_intents(self, state: dict[str, Any]) -> list[Path]:
@@ -245,44 +311,66 @@ class LifecycleController:
                 continue
             if not isinstance(payload, dict):
                 continue
-            session_id = str(payload.get("session_id") or "")
-            final_id = str(payload.get("final_id") or "")
+            session_hash = str(payload.get("session_hash") or "")
+            display_id = str(payload.get("session_id") or "")
             partition = str(payload.get("partition") or "")
+            attempt_id = str(payload.get("attempt_id") or "")
             if (
-                not session_id
-                or final_id != hashlib.sha256(session_id.encode()).hexdigest()
-                or path.name != f"{final_id}.json"
+                not display_id
+                or not _SESSION_HASH.fullmatch(session_hash)
+                or path.name != f"{session_hash}.json"
                 or not _PARTITION_NAME.fullmatch(partition)
+                or not _ATTEMPT_ID.fullmatch(attempt_id)
             ):
                 continue
-            intents[final_id] = {
-                "session_id": session_id,
+            adopted.append(path)
+            if isinstance(intents.get(session_hash), dict):
+                # An in-state intent may already own a committed marker; never re-identify it.
+                continue
+            intents[session_hash] = {
+                "session_hash": session_hash,
+                "session_id": display_id,
                 "reason": redact_for_export(payload.get("reason")),
                 "partition": partition,
-                "replay_only": True,
+                "attempt_id": attempt_id,
             }
-            adopted.append(path)
         return adopted
+
+    def _finalization_attempt(self, intents: dict[str, Any], session_hash: str) -> tuple[str, str]:
+        """Attempt identity and partition for one boundary; a resumed intent keeps both.
+
+        Its append may already be on disk, and the committed marker only answers
+        for the partition that append went to, so the pair travels together.
+        """
+        resumed = intents.get(session_hash)
+        if isinstance(resumed, dict) and _ATTEMPT_ID.fullmatch(str(resumed.get("attempt_id") or "")):
+            partition = str(resumed.get("partition") or "")
+            if _PARTITION_NAME.fullmatch(partition):
+                return str(resumed["attempt_id"]), partition
+        return uuid.uuid4().hex, self._checkpoint_path().name
 
     def _replay_finalization_intents(self, state: dict[str, Any], processed: list[str]) -> None:
         """Commit every fully-described deferred finalization while the holder owns the lease."""
         intents = state.setdefault("finalization_intents", {})
         finalized = [str(item) for item in (state.get("finalized_sessions") or ())]
-        for final_id, payload in list(intents.items()):
+        for session_hash, payload in list(intents.items()):
             if not isinstance(payload, dict):
                 continue  # Legacy in-state intent is resumed by its original full_wrapup caller.
-            session_id = str(payload.get("session_id") or "")
+            display_id = str(payload.get("session_id") or "")
             partition = str(payload.get("partition") or "")
-            if not session_id or not _PARTITION_NAME.fullmatch(partition):
+            if not display_id or not _PARTITION_NAME.fullmatch(partition):
                 continue
-            replayed = self._drain_pending(state, processed, active_session_id=session_id)
-            if session_id in replayed:
-                finalized = [item for item in finalized if item != final_id]
-            if final_id not in finalized:
-                if not bool(payload.get("replay_only")) or not self._full_wrapup_has(final_id, partition):
-                    self._append_full_wrapup(session_id, str(payload.get("reason") or ""), final_id, partition)
-                finalized.append(final_id)
-            intents.pop(final_id, None)
+            replayed = self._drain_pending(state, processed, active_hashes={session_hash})
+            if session_hash in replayed:
+                finalized = [item for item in finalized if item != session_hash]
+            if session_hash not in finalized:
+                # The attempt is identified independently of the session so a resumed session can
+                # finalize again, while an append whose ledger write was lost is never duplicated.
+                attempt_id = str(payload.get("attempt_id") or session_hash)
+                if not self._full_wrapup_has(attempt_id, partition):
+                    self._append_full_wrapup(display_id, str(payload.get("reason") or ""), attempt_id, partition)
+                finalized.append(session_hash)
+            intents.pop(session_hash, None)
         state["finalized_sessions"] = finalized[-512:]
 
     @staticmethod
@@ -491,6 +579,7 @@ class LifecycleController:
                 if event_id not in processed and not isinstance(pending.get(event_id), dict):
                     pending[event_id] = {
                         "event_id": event_id,
+                        "session_hash": session_identity_hash(session_id),
                         "session_id": redact_for_export(session_id),
                         "turn_id": redact_for_export(turn_id),
                         "completed": False,
@@ -506,18 +595,18 @@ class LifecycleController:
         except Exception:
             logger.exception("fleet-session-lifecycle: turn admission failed for %s", redact_for_export(session_id))
 
-    def _append_full_wrapup(self, session_id: str, reason: str, final_id: str, partition: str) -> None:
+    def _append_full_wrapup(self, session_id: str, reason: str, attempt_id: str, partition: str) -> None:
         """Write one identifiable final checkpoint without creating an agent turn."""
         path = self._checkpoint_path(partition)
         path.parent.mkdir(parents=True, exist_ok=True)
         line = "\n".join((
             "\n<!-- hermes-lifecycle full-wrapup checkpoint -->",
-            f"- final_id: {final_id}",
+            f"- attempt_id: {attempt_id}",
             f"- session_id: {redact_for_export(session_id)}",
             f"- reason: {redact_for_export(reason)}",
             "- transcript_checkpointed: true",
             "- delivery_message: none",
-            f"<!-- hermes-lifecycle full-wrapup committed: {final_id} -->",
+            f"<!-- hermes-lifecycle full-wrapup committed: {attempt_id} -->",
         )) + "\n"
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
@@ -525,17 +614,17 @@ class LifecycleController:
             os.fsync(handle.fileno())
         _fsync_directory(path.parent)
 
-    def _full_wrapup_has(self, final_id: str, partition: str) -> bool:
+    def _full_wrapup_has(self, attempt_id: str, partition: str) -> bool:
         try:
-            return f"<!-- hermes-lifecycle full-wrapup committed: {final_id} -->" in self._checkpoint_path(partition).read_text(encoding="utf-8-sig")
+            return f"<!-- hermes-lifecycle full-wrapup committed: {attempt_id} -->" in self._checkpoint_path(partition).read_text(encoding="utf-8-sig")
         except OSError:
             return False
 
-    def _pending_is_replayable(self, event: dict[str, Any], active_session_id: str | None) -> bool:
+    def _pending_is_replayable(self, event: dict[str, Any], active_hashes: set[str]) -> bool:
         """Only replay completed, explicitly-finalizing, or demonstrably orphaned admissions."""
         if bool(event.get("completed")) or not bool(event.get("active")):
             return True
-        if str(event.get("session_id") or "") == str(active_session_id or ""):
+        if self._event_session_hash(event) in active_hashes:
             return True
         try:
             return not self._owner_is_alive(
@@ -545,15 +634,15 @@ class LifecycleController:
         except (TypeError, ValueError):
             return True  # legacy pending record: no liveness claim to honor.
 
-    def _drain_pending(self, state: dict[str, Any], processed: list[str], *, active_session_id: str | None = None) -> set[str]:
-        """Replay eligible durable events before removing their intent or closing a session."""
+    def _drain_pending(self, state: dict[str, Any], processed: list[str], *, active_hashes: set[str] | None = None) -> set[str]:
+        """Replay eligible durable events, returning the session identities they belong to."""
         replayed_sessions: set[str] = set()
         pending = state.setdefault("pending_turns", {})
         for pending_id, pending_event in list(pending.items()):
             if not isinstance(pending_event, dict):
                 pending.pop(pending_id, None)
                 continue
-            if not self._pending_is_replayable(pending_event, active_session_id):
+            if not self._pending_is_replayable(pending_event, active_hashes or set()):
                 continue
             if pending_id not in processed:
                 # Make completion and planned delivery recoverable before any filesystem or adapter effect.
@@ -567,7 +656,7 @@ class LifecycleController:
                 self._outbox_index(pending_event, state)
                 processed.append(pending_id)
                 _atomic_json(self.state_path, state)
-                replayed_sessions.add(str(pending_event.get("session_id") or ""))
+                replayed_sessions.add(self._event_session_hash(pending_event))
             pending.pop(pending_id, None)
         return replayed_sessions
 
@@ -593,13 +682,14 @@ class LifecycleController:
                 state["vault_profile"] = self.profile
                 processed = [str(item) for item in (state.get("processed_turns") or ())]
                 intents = state.setdefault("finalization_intents", {})
-                final_id = hashlib.sha256(session_id.encode()).hexdigest()
-                resuming_finalization = final_id in intents
-                intents[final_id] = {
+                session_hash = session_identity_hash(session_id)
+                attempt_id, partition = self._finalization_attempt(intents, session_hash)
+                intents[session_hash] = {
+                    "session_hash": session_hash,
                     "session_id": redact_for_export(session_id),
                     "reason": redact_for_export(reason),
-                    "partition": self._checkpoint_path().name,
-                    "replay_only": resuming_finalization,
+                    "partition": partition,
+                    "attempt_id": attempt_id,
                 }
                 _atomic_json(self.state_path, state)
                 self._replay_finalization_intents(state, processed)
@@ -622,12 +712,13 @@ class LifecycleController:
                     return
                 state = self._state()
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
-                cancelled_sessions.add(session_id)
+                identities = self._session_identity_candidates(session_id)
+                cancelled_sessions |= identities
                 completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
                 pending = state.setdefault("pending_turns", {})
                 removed = [
                     event_id for event_id, event in pending.items()
-                    if isinstance(event, dict) and str(event.get("session_id") or "") == session_id
+                    if isinstance(event, dict) and self._event_session_hash(event) in identities
                 ]
                 for event_id in removed:
                     pending.pop(event_id, None)
@@ -639,6 +730,37 @@ class LifecycleController:
                     self._clear_cancellation_intents(cancellation_intents, cancelled_events)
         except Exception:
             logger.exception("fleet-session-lifecycle: disabled session cancellation failed")
+
+    def _repair_outbox_tail(self, queue: Path) -> None:
+        """Drop an unreadable trailing record so the next append cannot fuse onto it.
+
+        A crash between the queue write and its fsync can leave the file ending
+        mid-record.  Appending after that produces one unparseable line, which
+        blocks delivery of every record in the file — including the ones that
+        were already durable — so the torn tail is repaired before enqueueing.
+        """
+        try:
+            raw = queue.read_bytes()
+        except OSError:
+            return
+        if not raw:
+            return
+        records = raw.split(b"\n")
+        trailing = records.pop()  # b"" when the queue already ends on a record terminator
+        if trailing and _is_outbox_record(trailing):
+            records.append(trailing)  # complete record whose terminator was lost
+        while records and not _is_outbox_record(records[-1]):
+            records.pop()
+        repaired = b"".join(line + b"\n" for line in records)
+        if repaired == raw:
+            return
+        with queue.open("r+b") as handle:
+            handle.write(repaired)
+            handle.truncate(len(repaired))
+            handle.flush()
+            os.fsync(handle.fileno())
+        logger.warning("fleet-session-lifecycle: repaired a torn outbox tail (%d byte(s) dropped)",
+                       len(raw) - len(repaired))
 
     def _outbox_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
         """Deliver redacted events through an optional vendor-neutral durable outbox.
@@ -656,6 +778,7 @@ class LifecycleController:
             return
         queue = self.home / "state" / "fleet-session-lifecycle-outbox.jsonl"
         queue.parent.mkdir(parents=True, exist_ok=True)
+        self._repair_outbox_tail(queue)
         payload = {"schema": "fleet-lifecycle-outbox.v1", "event_id": event["event_id"],
                    "profile": self.profile, "session_id": event["session_id"],
                    "turn_id": event["turn_id"],
@@ -701,6 +824,7 @@ class LifecycleController:
                     event = dict(pending.get(event_id) or {})
                     event.update({
                         "event_id": event_id,
+                        "session_hash": session_identity_hash(session_id),
                         "session_id": redact_for_export(session_id),
                         "turn_id": redact_for_export(turn_id),
                         "completed": bool(completed),
@@ -729,7 +853,8 @@ class LifecycleController:
                 pending = state.setdefault("pending_turns", {})
                 event = pending.get(event_id)
                 if not current_was_processed and not isinstance(event, dict):
-                    event = {"event_id": event_id, "session_id": redact_for_export(session_id),
+                    event = {"event_id": event_id, "session_hash": session_identity_hash(session_id),
+                             "session_id": redact_for_export(session_id),
                              "turn_id": redact_for_export(turn_id), "completed": bool(completed),
                              "interrupted": bool(interrupted), "active": False,
                              "user": redact_for_export(user_message), "response": redact_for_export(assistant_response),
@@ -745,9 +870,8 @@ class LifecycleController:
                     _atomic_json(self.state_path, state)
                 replayed_sessions = self._drain_pending(state, processed)
                 # Any recovered event is new activity for its own session, not just this callback.
-                cleared = {hashlib.sha256(item.encode()).hexdigest() for item in replayed_sessions if item}
                 state["finalized_sessions"] = [
-                    item for item in (state.get("finalized_sessions") or ()) if str(item) not in cleared
+                    item for item in (state.get("finalized_sessions") or ()) if str(item) not in replayed_sessions
                 ]
                 # Bound ledger preserves turn arrival order so retry dedup retains the newest ids.
                 state["processed_turns"] = processed[-512:]

@@ -20,3 +20,5 @@ fleet_session_lifecycle:
 ```
 
 When the adapter is absent or fails, lifecycle processing remains fail-open: the redacted records stay in `state/fleet-session-lifecycle-outbox.jsonl` for a later turn. The lifecycle plugin never passes the vault path, credentials, or raw conversation history to an adapter.
+
+Every record in that file is one complete LF-terminated JSON object. A record torn by a crash mid-write is repaired before the next enqueue, so an adapter never has to parse past a partial line — its event is replayed from the still-pending durable admission instead.
