@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import multiprocessing
@@ -14,6 +15,16 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.plugin_validate import validate_plugin_dir
+
+# Redacts to a different string, so a record that kept only the display id cannot
+# re-derive the session it belongs to.
+_CREDENTIAL_SHAPED_SESSION_ID = "sk-live-abcdefghijklmnopqrst"
+
+
+@contextlib.contextmanager
+def _busy_lease():
+    """Stand in for a lease another process already owns."""
+    yield False
 
 
 def _load_lifecycle():
@@ -216,21 +227,72 @@ def test_pre_llm_admission_survives_process_loss_before_session_end(monkeypatch,
     assert "interrupted: true" in checkpoint
 
 
-def test_disabled_session_end_purges_all_pending_snapshots(monkeypatch):
+def test_disabled_session_end_purges_only_the_owning_profiles_snapshots(monkeypatch, tmp_path):
     plugin = _load_plugin()
+    alpha = tmp_path / ".hermes" / "profiles" / "alpha"
+    beta = tmp_path / ".hermes" / "profiles" / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir(parents=True)
+    alpha_key, beta_key = plugin._home_key(alpha), plugin._home_key(beta)
     plugin._pending.clear()
     plugin._pending.update({
-        ("disabled", "first"): {"user_message": "one"},
-        ("disabled", "second"): {"user_message": "two"},
-        ("other", "third"): {"user_message": "three"},
+        (alpha_key, "shared", "first"): {"user_message": "one"},
+        (alpha_key, "shared", "second"): {"user_message": "two"},
+        (beta_key, "shared", "first"): {"user_message": "beta-one"},
+        (alpha_key, "other", "third"): {"user_message": "three"},
     })
     monkeypatch.setattr(plugin, "_config", lambda: {"enabled": False})
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: alpha)
 
-    plugin._on_session_end(session_id="disabled", turn_id="mismatched")
+    plugin._on_session_end(session_id="shared", turn_id="mismatched")
 
-    assert not any(key[0] == "disabled" for key in plugin._pending)
-    assert ("other", "third") in plugin._pending
+    assert not [key for key in plugin._pending if key[0] == alpha_key and key[1] == "shared"]
+    assert (beta_key, "shared", "first") in plugin._pending
+    assert (alpha_key, "other", "third") in plugin._pending
     plugin._pending.clear()
+
+
+def test_same_session_id_in_two_profiles_keeps_its_own_snapshot(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    vault = tmp_path / "vault"
+    alpha = tmp_path / ".hermes" / "profiles" / "alpha"
+    beta = tmp_path / ".hermes" / "profiles" / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir(parents=True)
+    plugin._pending.clear()
+    live = {"home": alpha}
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": True, "vault_root": str(vault)})
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: live["home"])
+
+    plugin._on_pre_llm_call(session_id="shared", turn_id="turn", user_message="alpha-message")
+    live["home"] = beta
+    plugin._on_pre_llm_call(session_id="shared", turn_id="turn", user_message="beta-message")
+    plugin._on_post_llm_call(session_id="shared", turn_id="turn", user_message="beta-message",
+                             assistant_response="beta-answer")
+    live["home"] = alpha
+    plugin._on_session_end(session_id="shared", turn_id="turn", completed=True, interrupted=False)
+
+    alpha_checkpoint = _checkpoint_file(vault, "alpha").read_text(encoding="utf-8")
+    assert "user: alpha-message" in alpha_checkpoint
+    assert "beta-message" not in alpha_checkpoint
+    assert plugin._pending[(plugin._home_key(beta), "shared", "turn")]["assistant_response"] == "beta-answer"
+    plugin._pending.clear()
+
+
+def test_disabled_never_enabled_profile_creates_no_state_directory_or_lock(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    home = tmp_path / ".hermes" / "profiles" / "never-enabled"
+    home.mkdir(parents=True)
+    plugin._pending.clear()
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": False})
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: home)
+
+    plugin._on_pre_llm_call(session_id="s", turn_id="t", user_message="u")
+    plugin._on_post_llm_call(session_id="s", turn_id="t", user_message="u", assistant_response="a")
+    plugin._on_session_end(session_id="s", turn_id="t", completed=True, interrupted=False)
+    plugin._on_session_finalize(session_id="s", reason="quit")
+
+    assert list(home.iterdir()) == []
 
 
 def test_outbox_adapter_unavailable_keeps_a_durable_local_record(tmp_path):
@@ -1014,23 +1076,21 @@ def test_after_turn_busy_lease_persists_completion_intent_for_other_session_repl
 
 
 def test_disabled_session_end_cancels_durable_admissions(monkeypatch, tmp_path):
-    plugin = _load_plugin()
-    calls = []
-
-    class Controller:
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def cancel_session(self, **kwargs):
-            calls.append(kwargs)
-
-    monkeypatch.setattr(plugin, "LifecycleController", Controller)
-    monkeypatch.setattr(plugin, "get_hermes_home", lambda: tmp_path / ".hermes")
-    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": False})
+    mod, plugin = _load_lifecycle(), _load_plugin()
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    home.mkdir(parents=True)
+    config = {"vault_root": str(tmp_path / "vault")}
+    mod.LifecycleController(home, config).admit_turn(
+        session_id="disabled", turn_id="turn", user_message="question")
+    plugin._pending.clear()
+    monkeypatch.setattr(plugin, "LifecycleController", mod.LifecycleController)
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(plugin, "_config", lambda: {**config, "enabled": False})
 
     plugin._on_session_end(session_id="disabled", turn_id="ignored")
 
-    assert calls == [{"session_id": "disabled"}]
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"] == {}
 
 
 def test_owner_liveness_rejects_pid_reuse_with_mismatched_birth_time(tmp_path, monkeypatch):
@@ -1126,6 +1186,173 @@ def test_busy_cancellation_dominates_a_concurrent_completion_intent(tmp_path):
     finally:
         release.set()
         holder.join(3)
+
+
+def test_a_later_turn_replay_consults_the_committed_marker_before_appending(tmp_path, monkeypatch):
+    """A wrap-up whose ledger write was lost is already on disk; replay must not repeat it."""
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    original_append = controller._append_full_wrapup
+
+    def append_then_crash(*args, **kwargs):
+        original_append(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller, "_append_full_wrapup", append_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        controller.full_wrapup(session_id="closing", reason="quit")
+    monkeypatch.setattr(controller, "_append_full_wrapup", original_append)
+
+    controller.after_turn(session_id="other", turn_id="next", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 1
+
+
+def test_resumed_finalization_keeps_the_partition_its_append_went_to(tmp_path, monkeypatch):
+    """The committed marker only answers for the partition that holds it."""
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    monkeypatch.setattr(mod.time, "strftime", lambda _format: "2026-10-16")
+    original_append = controller._append_full_wrapup
+
+    def append_then_crash(*args, **kwargs):
+        original_append(*args, **kwargs)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller, "_append_full_wrapup", append_then_crash)
+    with pytest.raises(KeyboardInterrupt):
+        controller.full_wrapup(session_id="closing", reason="quit")
+    monkeypatch.setattr(controller, "_append_full_wrapup", original_append)
+    monkeypatch.setattr(mod.time, "strftime", lambda _format: "2026-10-17")
+
+    controller.full_wrapup(session_id="closing", reason="quit")
+
+    daily = vault / "jarvis" / "daily"
+    assert daily.joinpath("2026-10-16-hermes-lifecycle.md").read_text(
+        encoding="utf-8").count("full-wrapup checkpoint") == 1
+    assert not daily.joinpath("2026-10-17-hermes-lifecycle.md").exists()
+
+
+def test_torn_outbox_tail_is_repaired_before_the_next_enqueue(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 1)
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
+    queue = home / "state" / "fleet-session-lifecycle-outbox.jsonl"
+    queue.parent.mkdir(parents=True)
+    queue.write_text(
+        json.dumps({"schema": "fleet-lifecycle-outbox.v1", "turn_id": "durable"}) + "\n"
+        + '{"schema": "fleet-lifecycle-outbox.v1", "turn_i',
+        encoding="utf-8",
+    )
+
+    controller.after_turn(session_id="s", turn_id="after-crash", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    rows = [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()]
+    assert [row["turn_id"] for row in rows] == ["durable", "after-crash"]
+
+
+def test_outbox_record_that_lost_its_terminator_keeps_its_payload(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 1)
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
+    queue = home / "state" / "fleet-session-lifecycle-outbox.jsonl"
+    queue.parent.mkdir(parents=True)
+    queue.write_text(json.dumps({"schema": "fleet-lifecycle-outbox.v1", "turn_id": "unterminated"}),
+                     encoding="utf-8")
+
+    controller.after_turn(session_id="s", turn_id="next", completed=True, interrupted=False,
+                          user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    rows = [json.loads(line) for line in queue.read_text(encoding="utf-8").splitlines()]
+    assert [row["turn_id"] for row in rows] == ["unterminated", "next"]
+
+
+def test_healthy_outbox_queue_is_not_rewritten_by_the_tail_repair(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 1)
+    queue = home / "state" / "fleet-session-lifecycle-outbox.jsonl"
+    queue.parent.mkdir(parents=True)
+    intact = json.dumps({"schema": "fleet-lifecycle-outbox.v1", "turn_id": "kept"}) + "\n"
+    queue.write_text(intact, encoding="utf-8")
+
+    controller._repair_outbox_tail(queue)
+
+    assert queue.read_text(encoding="utf-8") == intact
+
+
+def test_the_credential_shaped_session_id_really_is_redacted():
+    """Premise of the tests below: its display form cannot re-derive the session."""
+    mod = _load_lifecycle()
+
+    assert mod.redact_for_export(_CREDENTIAL_SHAPED_SESSION_ID) != _CREDENTIAL_SHAPED_SESSION_ID
+
+
+def test_redaction_shaped_session_id_finalization_intent_is_replayed(tmp_path, monkeypatch):
+    """The stable identity hash, not the redacted display id, binds an intent to its session."""
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["finalize_lease_wait_seconds"] = 0
+    monkeypatch.setattr(controller, "_lease", _busy_lease)
+
+    controller.full_wrapup(session_id=_CREDENTIAL_SHAPED_SESSION_ID, reason="quit")
+
+    intents = home / "state" / "fleet-session-lifecycle-finalizations"
+    assert list(intents.glob("*.json"))
+    next_holder = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+    next_holder.after_turn(session_id="other", turn_id="next", completed=True, interrupted=False,
+                           user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert "full-wrapup checkpoint" in checkpoint
+    assert _CREDENTIAL_SHAPED_SESSION_ID not in checkpoint
+    assert not list(intents.glob("*.json"))
+
+
+def test_redaction_shaped_session_id_cancellation_removes_its_admissions(tmp_path):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path)
+    controller.admit_turn(session_id=_CREDENTIAL_SHAPED_SESSION_ID, turn_id="turn", user_message="question")
+
+    controller.cancel_session(session_id=_CREDENTIAL_SHAPED_SESSION_ID)
+
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"] == {}
+
+
+def test_redaction_shaped_deferred_cancellation_is_applied_by_the_next_holder(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.admit_turn(session_id=_CREDENTIAL_SHAPED_SESSION_ID, turn_id="turn", user_message="question")
+    controller.config["finalize_lease_wait_seconds"] = 0
+    monkeypatch.setattr(controller, "_lease", _busy_lease)
+
+    controller.cancel_session(session_id=_CREDENTIAL_SHAPED_SESSION_ID)
+
+    next_holder = mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0)
+    next_holder.after_turn(session_id="other", turn_id="next", completed=True, interrupted=False,
+                           user_message="u", assistant_response="a", conversation_history=[], cwd="")
+
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"] == {}
+    assert "turn_id: turn" not in _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+
+
+def test_redaction_shaped_session_can_finalize_again_after_new_activity(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+
+    controller.full_wrapup(session_id=_CREDENTIAL_SHAPED_SESSION_ID, reason="first-exit")
+    controller.after_turn(session_id=_CREDENTIAL_SHAPED_SESSION_ID, turn_id="later-turn", completed=True,
+                          interrupted=False, user_message="u", assistant_response="a",
+                          conversation_history=[], cwd="")
+    controller.full_wrapup(session_id=_CREDENTIAL_SHAPED_SESSION_ID, reason="second-exit")
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert checkpoint.count("hermes-lifecycle full-wrapup checkpoint") == 2
+    assert "reason: second-exit" in checkpoint
 
 
 def test_full_wrapup_persists_busy_lease_intent_for_next_process(tmp_path):
