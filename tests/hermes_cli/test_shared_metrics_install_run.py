@@ -179,6 +179,12 @@ def test_receipt_is_recorded_only_on_a_day_the_sender_can_ever_send(marks, monke
     t0 = datetime(2026, 10, 6, tzinfo=timezone.utc)
     clock = {"now": t0 + timedelta(hours=9)}
     monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
+    monkeypatch.setattr(install_run.time, "time", lambda: clock["now"].timestamp())
+    monkeypatch.setattr(
+        install_run,
+        "_today_start",
+        lambda: clock["now"].replace(hour=0, minute=0, second=0, microsecond=0).isoformat().replace("+00:00", "Z"),
+    )
     monkeypatch.setattr("hermes_cli.config.read_raw_config_readonly",
                         lambda: {"telemetry": {"shared_metrics": {"enabled": True, "send": True}}})
     store = store_module.SharedMetricsStore()

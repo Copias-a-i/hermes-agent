@@ -195,6 +195,12 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     """Look up a built-in provider by id or alias: models.dev catalog merged with the Hermes overlay;
     Hermes-only overlay (nous, openai-codex, …); plugin provider profiles with a concrete endpoint."""
     canonical = normalize_provider(name)
+    # A bundled provider profile carries Hermes-owned credentials, API dialect, and endpoint
+    # metadata. It must override a coincident models.dev catalog row, whose generic metadata
+    # cannot safely replace the profile's configured integration contract.
+    profile_pdef = _plugin_profile_pdef(canonical)
+    if profile_pdef is not None:
+        return profile_pdef
     mdev_info = _models_dev_info(canonical, allow_network)
     overlay = HERMES_OVERLAYS.get(canonical)
     if mdev_info is not None:

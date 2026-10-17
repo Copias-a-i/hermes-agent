@@ -287,8 +287,9 @@ class LifecycleController:
 
     @staticmethod
     def _run(argv: list[str], **kwargs: Any) -> int:
-        return subprocess.run(argv, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                              timeout=kwargs.get("timeout", 5), env=kwargs.get("env")).returncode
+        return subprocess.run(argv, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=kwargs.get("timeout", 5),
+                              env=kwargs.get("env")).returncode
 
     def _command_env(self) -> dict[str, str]:
         """Build a profile-scoped, secret-scrubbed environment for optional commands."""
