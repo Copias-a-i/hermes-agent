@@ -1826,11 +1826,9 @@ def anthropic_prompt_cache_policy(
     litellm_openai_wire = (
         eff_api_mode == "chat_completions" and is_claude and _is_litellm_route(provider_lower, eff_base_url)
     )
-    if supports_cache_markers and (
-        is_anthropic_wire
-        or litellm_openai_wire
-        or _route_may_be_custom(agent, eff_provider, provider_lower, eff_base_url)
-    ):
+    route_may_be_custom = _route_may_be_custom(agent, eff_provider, provider_lower, eff_base_url)
+    if supports_cache_markers and (is_anthropic_wire or litellm_openai_wire
+                                   or getattr(agent, "_custom_providers", None) is None or route_may_be_custom):
         try:
             from hermes_cli.config import get_custom_provider_model_capability
             custom_prompt_caching = get_custom_provider_model_capability(

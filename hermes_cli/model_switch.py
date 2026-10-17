@@ -1452,13 +1452,17 @@ def _creds_for_switched_provider(st: _Switch) -> Optional[ModelSwitchResult]:
                                  or st.target_provider.strip().lower() in _entry_aliases(entry))), None):
         custom_url = _clean(custom_cfg.get("base_url") or custom_cfg.get("url") or custom_cfg.get("api"))
         if custom_url:
+            from hermes_cli.auth import AuthError
             custom_key = _entry_configured_key(custom_cfg, _scoped_key_env)
             st.validation_headers = _extra_headers_from_config(custom_cfg)
             try:
                 st.resolve_runtime(
                     requested=st.target_provider, explicit_api_key=custom_key or None, explicit_base_url=custom_url)
                 st.api_key, st.base_url = st.api_key or custom_key, st.base_url or custom_url
-            except Exception:
+            # The resolver's own refusals (AuthError: no usable credential; ValueError: provider
+            # disabled, local server down). The entry carries its own endpoint and key, so bind
+            # those rather than fail the switch.
+            except (AuthError, ValueError):
                 st.api_key, st.base_url, st.api_mode = custom_key, custom_url, ""
     elif st.target_provider == "custom" and st.current_base_url:
         # A bare-custom session switching models stays on its endpoint (#45597). Arriving from
