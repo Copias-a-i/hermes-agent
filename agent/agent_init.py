@@ -669,16 +669,8 @@ def _init_prompt_cache_config(agent):
     agent._use_prompt_caching, agent._use_native_cache_layout = (
         agent._anthropic_prompt_cache_policy()
     )
+    # Defaults are required on every enabled path; config below may only override them.
     agent._cache_disabled = False
-    # cache_ttl: "5m" (default), "1h" (2x write cost; pays off with >5-minute pauses) or "auto"
-    # (1h when a person paces the session, 5m when a machine does); unknown values keep "5m". A falsy/off value disables caching entirely (OAuth plans
-    # billing cache writes, proxies adding their own cache_control); the disable survives
-    # /model switches and fallback re-derivation.
-    # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from config.yaml under
-    # prompt_caching.cache_ttl; unknown values keep "5m". 1h tier costs 2x on write vs 1.25x for 5m, but
-    # amortizes across long sessions with >5-minute pauses between turns (#14971). This is useful for OAuth
-    # subscription users where cache writes bill against "extra usage" or for third-party proxies that
-    # inject their own cache_control markers (#13477).
     agent._cache_ttl = "5m"
     with suppress(Exception):
         from hermes_cli.config import load_config_readonly as _load_pc_cfg
@@ -1150,7 +1142,7 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     if agent.ephemeral_system_prompt:
         prompt_preview = agent.ephemeral_system_prompt[:60] + "..." if len(agent.ephemeral_system_prompt) > 60 else agent.ephemeral_system_prompt
         print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
-    if agent._use_prompt_caching:
+    if getattr(agent, "_use_prompt_caching", False):
         if agent._use_native_cache_layout and agent.provider == "anthropic":
             source = "native Anthropic"
         elif agent._use_native_cache_layout:
