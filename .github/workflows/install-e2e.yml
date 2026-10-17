@@ -181,11 +181,40 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           filter: blob:none
+          # Fetch the complete tag graph: a shallow checkout can report no tags
+          # even when fetch-tags is enabled.
+          fetch-depth: 0
           fetch-tags: true
           sparse-checkout: |
             scripts/sandbox/pick-release-tags.sh
             scripts/releases/pick_tags.py
           sparse-checkout-cone-mode: false
+      - name: Require release tags
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          # Copias-a-i/hermes-agent deliberately has no release tags. If its
+          # complete checkout cannot resolve N-1, read tags from the canonical
+          # source only after pinning the checked-out fork's exact remote URL.
+          has_reachable_release_tag() {
+            git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1 >/dev/null
+          }
+          if ! has_reachable_release_tag; then
+            EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent'
+            CANONICAL_UPSTREAM='https://github.com/NousResearch/hermes-agent.git'
+            actual_origin="$(git remote get-url origin)"
+            if [ "$actual_origin" != "$EXPECTED_ORIGIN" ]; then
+              echo "::error::refusing canonical tag fallback: unexpected origin $actual_origin"
+              exit 1
+            fi
+            git fetch --force --tags "$CANONICAL_UPSTREAM"
+          fi
+          # Both tag selectors require a reachable date-shaped release tag; prove
+          # that origin or the pinned canonical upstream supplied it before matrix selection.
+          if ! has_reachable_release_tag; then
+            echo '::error::release tags are unavailable from origin or canonical upstream'
+            exit 1
+          fi
       - id: pick
         env:
           # Inputs never touch shell syntax directly: TAG_COUNT arrives via

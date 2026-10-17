@@ -39,3 +39,25 @@ def test_real_agent_resolves_auto_from_its_platform(tmp_path, monkeypatch):
             close = getattr(a, "close", None)
             if callable(close):
                 close()
+
+
+def test_real_agent_preserves_enabled_defaults_for_unknown_ttl(tmp_path, monkeypatch):
+    """Unknown non-disable TTLs keep caching enabled with the safe 5m default."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "prompt_caching:\n  cache_ttl: 2h\nmodel:\n  default: anthropic/claude-sonnet-4.6\n", encoding="utf-8")
+    from run_agent import AIAgent
+    agent = AIAgent(
+        session_id="p-unknown-ttl", platform="cli", api_key="k",
+        base_url="https://openrouter.ai/api/v1", provider="openrouter",
+        api_mode="chat_completions", model="anthropic/claude-sonnet-4.6", quiet_mode=True,
+        skip_context_files=True, skip_memory=True, save_trajectories=False, enabled_toolsets=["file"],
+    )
+    try:
+        assert agent._use_prompt_caching
+        assert not agent._cache_disabled
+        assert agent._cache_ttl == "5m"
+    finally:
+        close = getattr(agent, "close", None)
+        if callable(close):
+            close()

@@ -33,14 +33,15 @@ concurrency:
 
 jobs:
   test:
-    # Two 32-core slices instead of one box: on one runner the suite is ~10 min of
-    # nearly fully packed work, and a single bigger runner (96-core) scaled ~1.8x for
-    # 3x the price because files contend for the shared machine. Separate machines
-    # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
-    # both slices agree on the split without a planning job.
+    # Two slices let the hosted standard runners execute independent test files in
+    # parallel. run_tests_parallel.py partitions from the checkout alone, so both
+    # slices agree on the split without a planning job.
     name: Run tests (${{ matrix.slice }}/2)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    # Hosted 2-way slices exceeded 30 minutes while still making continuous
+    # progress (60% and 85% complete at cancellation). Keep the job budget
+    # above the full observed wall time; per-file limits still fail real hangs.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -107,7 +108,11 @@ jobs:
           scripts/run_tests.sh
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
+          # One worker per vCPU of the standard runner this lane now uses. 32 was
+          # sized for ubuntu-latest-32-core; at 8:1 oversubscription on
+          # ubuntu-latest both slices went red across unrelated timing, process,
+          # deadlock and circular-import suites while still making progress.
+          HERMES_TEST_WORKERS: "4"
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -129,7 +134,7 @@ jobs:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -250,7 +255,7 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -263,6 +268,33 @@ jobs:
           # N-1 = `git describe --tags --abbrev=0 HEAD~1`.
           fetch-depth: 0
           fetch-tags: true
+
+      - name: Require release tags
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          # Copias-a-i/hermes-agent deliberately has no release tags. If its
+          # complete checkout cannot resolve N-1, read tags from the canonical
+          # source only after pinning the checked-out fork's exact remote URL.
+          has_reachable_release_tag() {
+            git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1 >/dev/null
+          }
+          if ! has_reachable_release_tag; then
+            EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent'
+            CANONICAL_UPSTREAM='https://github.com/NousResearch/hermes-agent.git'
+            actual_origin="$(git remote get-url origin)"
+            if [ "$actual_origin" != "$EXPECTED_ORIGIN" ]; then
+              echo "::error::refusing canonical tag fallback: unexpected origin $actual_origin"
+              exit 1
+            fi
+            git fetch --force --tags "$CANONICAL_UPSTREAM"
+          fi
+          # The upgrade suite resolves N-1 from a date-shaped release tag; prove
+          # that origin or the pinned canonical upstream supplied it before setup work begins.
+          if ! has_reachable_release_tag; then
+            echo '::error::release tags are unavailable from origin or canonical upstream'
+            exit 1
+          fi
 
       - name: Set up Node
         # `hermes update` builds the web UI / TUI workspaces.

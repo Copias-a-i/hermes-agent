@@ -4,6 +4,16 @@ Pure-data leaf module — must not import from hermes_cli.config. Comments are t
 docs of config.yaml.
 """
 
+from hermes_cli.config_defaults_aux import (
+    aux_block as _aux,
+    base_url as _base_url,
+    env as _env,
+    message_entry as _msg,
+    provider_entry as _prov,
+    setting_entry as _setting,
+    skill_entry as _skill,
+    tool_entry as _tool,
+)
 
 #: Image every container terminal backend (docker/modal/daytona/singularity) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
@@ -15,19 +25,6 @@ LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
 # Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
 DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
-
-
-def _aux(timeout, *, reasoning_effort=True, **extra):
-    """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
-
-    reasoning_effort=False omits that key (MoA blocks configure depth per slot);
-    ``extra`` keys are appended after the standard ones.
-    """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
-    if reasoning_effort:
-        d["reasoning_effort"] = ""
-    d.update(extra)
-    return d
 
 
 DEFAULT_CONFIG = {
@@ -1491,6 +1488,19 @@ DEFAULT_CONFIG = {
         "ledger_max_bytes": 5 * 1024 * 1024,
     },
 
+    # Fleet lifecycle is opt-in per profile; adapters own credentials and may be unavailable.
+    "fleet_session_lifecycle": {
+        "enabled": False,
+        "vault_root": "~/.agent-vault",
+        # Age after which a lock whose recorded owner is gone may be reclaimed (Windows only:
+        # POSIX releases the advisory flock with the owning process).
+        "lock_stale_seconds": 300,
+        # Bounded wait shared by admission, completion, and finalization lease acquisition.
+        "finalize_lease_wait_seconds": 2,
+        "outbox_timeout_seconds": 5,
+        "outbox_command": [],
+    },
+
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
     # long-unused skills stale, archives (never deletes) obsolete ones, optionally consolidates
     # overlaps via a forked aux-model agent. Inactivity-triggered from session start, no cron
@@ -2720,46 +2730,6 @@ DEFAULT_CONFIG = {
     },
     "_config_version": 50,  # Config schema version - bump this when adding new required fields
 }
-
-
-def _env(description, prompt, **keys):
-    """One OPTIONAL_ENV_VARS entry; keyword order is preserved as dict key order."""
-    return {"description": description, "prompt": prompt, **keys}
-
-
-_OMIT = object()
-
-
-def _category(category, password, advanced):
-    """Entry factory for one category with its usual password/advanced defaults.
-
-    ``url``/``help``/``tools`` are only written when passed; ``password=None`` omits the key;
-    ``advanced`` is only written when true. Key order matches the plain ``_env`` entries.
-    """
-    def make(description, prompt, url=_OMIT, *, help=_OMIT, tools=_OMIT, password=password,
-             advanced=advanced):
-        d = {"description": description, "prompt": prompt}
-        d.update((k, v) for k, v in (("help", help), ("url", url), ("tools", tools)) if v is not _OMIT)
-        if password is not None:
-            d["password"] = password
-        d["category"] = category
-        if advanced:
-            d["advanced"] = True
-        return d
-    return make
-
-
-_prov = _category("provider", password=True, advanced=True)
-_tool = _category("tool", password=True, advanced=False)
-_msg = _category("messaging", password=False, advanced=False)
-_skill = _category("skill", password=True, advanced=True)
-_setting = _category("setting", password=False, advanced=False)
-
-
-def _base_url(name, prompt_name=None):
-    """Provider ``*_BASE_URL`` override entry (advanced, not a secret)."""
-    prompt = f"{prompt_name or name} base URL (leave empty for default)"
-    return _prov(f"{name} base URL override", prompt, None, password=False)
 
 
 # Optional environment variables that enhance functionality. Feeds the dashboard keys page and setup

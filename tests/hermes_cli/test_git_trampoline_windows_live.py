@@ -61,7 +61,9 @@ class TestGitTrampolineLive:
         # canonical git-core layout the locator searches first.
         assert real is not None, "expected git-core git.exe on windows-latest"
         assert real.exists()
-        assert real.name == "git.exe"
+        # Windows preserves the spelling that PATH returned (for example
+        # ``git.EXE``), while executable identity is case-insensitive.
+        assert real.name.casefold() == "git.exe"
         probe = subprocess.run(
             [str(real), "--version"], capture_output=True, text=True, timeout=30
         )
@@ -78,7 +80,7 @@ class TestGitTrampolineLive:
         assert healed != broken_cmd, "broken trampoline must be swapped"
         assert healed[1:] == broken_cmd[1:], "git config args must survive"
         real = Path(healed[0])
-        assert real.exists() and real.name == "git.exe"
+        assert real.exists() and real.name.casefold() == "git.exe"
         # The healed command must actually work.
         result = subprocess.run(
             healed[:1] + ["--version"], capture_output=True, text=True, timeout=30

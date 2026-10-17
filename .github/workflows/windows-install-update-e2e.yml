@@ -44,9 +44,14 @@ concurrency:
 jobs:
   install-update:
     name: Windows install.ps1 + hermes update E2E
-    runs-on: windows-latest-32-core
-    # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 75
+    runs-on: windows-latest
+    # The suite's ten journey files run `HERMES_TEST_WORKERS` at a time, so the budget has to
+    # cover ceil(files / workers) waves of clean installs — each bounded by the harness's own
+    # INSTALL_TIMEOUT — plus the checkout, setup-pm and the diagnostics upload around them.
+    # At six workers the budget only ever covered two waves, and a run whose waves each took
+    # the full install bound was cancelled with files left unrun.
+    # Pinned to the file and worker counts by tests/ci/test_update_ci_routing.py.
+    timeout-minutes: 150
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -78,8 +83,16 @@ jobs:
           HERMES_E2E_MACHINE_ROOT: ${{ runner.temp }}\wm
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-          # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
+          # One clean install.ps1 journey per worker. Six at once starved all six on the stock
+          # 4-vCPU runner: every one of the first six independent installs hit INSTALL_TIMEOUT
+          # (1500 s) in the same run, and the runner then ran out of disk writing their
+          # diagnostics — six concurrent toolchains and venvs, not six product defects. Two
+          # leaves each install ~2 vCPUs and a survivable peak footprint; the harness reclaims
+          # each machine's multi-GB profile and work root on teardown so later waves do not
+          # inherit residual installs (the late-suite ENOSPC after workers=2). The update and
+          # gateway phases serialize on the harness's job-wide lock anyway (_machine.gateway_phase),
+          # so extra workers never bought proportional throughput.
+          HERMES_TEST_WORKERS: '2'
           # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
           # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.
           HERMES_TEST_FILE_TIMEOUT: '3600'

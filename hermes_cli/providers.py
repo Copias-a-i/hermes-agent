@@ -195,6 +195,12 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     """Look up a built-in provider by id or alias: models.dev catalog merged with the Hermes overlay;
     Hermes-only overlay (nous, openai-codex, …); plugin provider profiles with a concrete endpoint."""
     canonical = normalize_provider(name)
+    # A bundled provider profile carries Hermes-owned credentials, API dialect, and endpoint
+    # metadata. It must override a coincident models.dev catalog row, whose generic metadata
+    # cannot safely replace the profile's configured integration contract.
+    profile_pdef = _plugin_profile_pdef(canonical)
+    if profile_pdef is not None:
+        return profile_pdef
     mdev_info = _models_dev_info(canonical, allow_network)
     overlay = HERMES_OVERLAYS.get(canonical)
     if mdev_info is not None:
@@ -240,10 +246,14 @@ def _plugin_profile_pdef(name: str) -> Optional[ProviderDef]:
     # A mode outside the reverse table is a plugin-registered dialect: keep its name so
     # ``determine_api_mode`` can check the transport registry instead of degrading it.
     mode = (prof.api_mode or "").strip()
+    # Profiles own endpoint/auth details, but a registered profile must not erase Hermes routing
+    # metadata for the same canonical provider (notably OpenRouter's aggregator identity).
+    overlay = HERMES_OVERLAYS.get(normalize_provider(prof.name or name))
     return ProviderDef(id=prof.name, name=prof.display_name or prof.name or name,
                        transport=api_mode_to_transport.get(mode, mode or "openai_chat"),
                        api_key_env_vars=key_vars, base_url=(prof.base_url or "").strip(),
                        base_url_env_var=next(iter(url_vars), ""),
+                       is_aggregator=overlay.is_aggregator if overlay else False,
                        auth_type=prof.auth_type or "api_key", source="plugin-profile")
 
 
@@ -409,13 +419,18 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     the built-in's real transport/base_url/auth_type with an empty ``openai_chat``/``api_key``
     stub, routing e.g. AWS Bedrock through the generic custom-endpoint ``/models`` probe (#110402).
     """
-    entry = user_config.get(name) if isinstance(user_config, dict) and user_config else None
+    if not isinstance(user_config, dict) or not user_config:
+        return None
+    requested = str(name or "").strip()
+    entry_key = next((key for key in user_config if str(key).strip() == requested), None)
+    entry = user_config.get(entry_key) if entry_key is not None else None
     if not isinstance(entry, dict):
         return None
     base_url = entry.get("api", "") or entry.get("url", "") or entry.get("base_url", "") or ""
     if not base_url:
         return None
-    return _user_pdef(name, entry.get("name", "") or name, base_url,
+    provider_id = str(entry_key).strip()
+    return _user_pdef(provider_id, entry.get("name", "") or provider_id, base_url,
                       entry.get("key_env") or entry.get("api_key_env") or "",
                       entry.get("transport", "openai_chat") or "openai_chat")
 
@@ -547,8 +562,18 @@ def resolve_provider_full(name: str, user_providers: Optional[Dict[str, Any]] = 
         pdef = _lossy_alias_registry_pdef(raw, canonical)
         if pdef is not None:
             return pdef
+    # Explicit custom identities never degrade into a generic provider.
+    if raw.partition(":")[0] == "custom":
+        return resolve_custom_provider(name, custom_providers)
+    if raw in LLAMACPP_ALIASES:
+        pdef = _llamacpp_pdef()
+        if pdef is not None:
+            return pdef
     pdef = get_provider(canonical)
     if pdef is not None:
+        # Generic custom and its aliases are placeholders; only configured endpoints resolve them.
+        if pdef.source == "plugin-profile" and pdef.id == "custom":
+            return resolve_custom_provider(name, custom_providers)
         if pdef.source == "plugin-profile" and user_providers:
             user_pdef = resolve_user_provider(pdef.id, user_providers)
             if user_pdef is not None:

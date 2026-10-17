@@ -689,6 +689,12 @@
     "kind": "bare_which"
   },
   {
+    "path": "hermes_cli/update_cmd_git.py",
+    "symbol": "_locate_real_git",
+    "kind": "bare_which",
+    "reason": "Windows-only fallback for stock Git-for-Windows layouts; each PATH candidate is accepted only after the fork-bomb probe verifies it is not a trampoline"
+  },
+  {
     "path": "hermes_cli/update_pause_record.py",
     "symbol": "_git_executable",
     "kind": "bare_which",

@@ -6,6 +6,7 @@ test patches on ``update_cmd`` stay effective).
 """
 
 import logging
+import shutil
 from contextlib import nullcontext, suppress
 import subprocess
 import sys
@@ -589,7 +590,14 @@ def _locate_real_git() -> Optional[Path]:
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
         for base in (r"C:\Program Files", r"C:\Program Files (x86)")
         for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
+    ]
+    # Current stock windows-latest images can expose the healthy Git-for-Windows
+    # command on PATH without retaining the historical git-core layout. It is
+    # safe only after the same fork-bomb probe rejects it.
+    path_git = shutil.which("git")
+    if path_git:
+        candidates.append(Path(path_git))
+    candidates += _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 

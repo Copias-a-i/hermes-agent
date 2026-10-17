@@ -12,7 +12,7 @@ name: OS-specific tests
 # is where those markers actually execute:
 #
 #   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest-32-core and windows-latest-32-arm-core
+#   windows  → ``-m platforms``    on the stock windows-latest x64 runner
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -88,13 +88,13 @@ jobs:
             runner: macos-latest
             marker: macos
             slice: 2/2
-          - name: Windows-only tests
-            runner: windows-latest-32-core
+          - name: Windows-only tests (x64)
+            runner: windows-latest
             marker: windows
-          - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
-            marker: windows
-            timeout: 60
+            # The bounded PowerShell fixture has six sequential 180-second child calls;
+            # let its own timeout diagnostic surface before the file runner kills it.
+            timeout: 45
+            file_timeout: 1200
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -185,9 +185,13 @@ jobs:
             -m "platforms and not integration" \
             -v --tb=short
         env:
-          # These files spawn nested PowerShell trees. CPU-count parallelism
-          # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          # Stock Windows runners have four vCPUs. Four isolated workers preserve
+          # parallel coverage without starving PowerShell child startup or the
+          # real-process fixtures' deadlines.
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
+          # The Windows matrix owns this value so its budget can be checked against
+          # the job timeout and the fixture's six sequential 180-second child calls.
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.file_timeout || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
@@ -221,10 +225,9 @@ jobs:
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
     name: Windows E2E (real processes)
     if: inputs.e2e
-    # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
-    # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
-    # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: windows-latest-32-core
+    # Stock x64 runner: native Windows process coverage without an unprovisioned
+    # larger-runner label.
+    runs-on: windows-latest
     timeout-minutes: 25
     steps:
       - name: Checkout code
