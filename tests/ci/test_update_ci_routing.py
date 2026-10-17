@@ -149,6 +149,76 @@ def test_windows_only_lane_has_a_budget_above_the_real_powershell_fixture_ceilin
     assert run_step["env"]["HERMES_TEST_FILE_TIMEOUT"] == "${{ matrix.file_timeout || '' }}"
 
 
+# -- the clean Windows install lane's capacity and budget ----------------------------------
+
+_WINDOWS_E2E = ".github/workflows/windows-install-update-e2e.yml"
+_WINDOWS_JOURNEYS = "tests/e2e/core/windows_update"
+# windows-latest is the stock hosted runner: 4 vCPUs, and a disk that holds a handful of
+# toolchains. One clean install.ps1 journey needs about half of those vCPUs to finish inside
+# the harness's own INSTALL_TIMEOUT; six concurrent ones starved every install past that bound
+# and then filled the disk with their diagnostics.
+_STOCK_WINDOWS_VCPUS = 4
+_VCPUS_PER_CLEAN_INSTALL = 2
+# Checkout at fetch-depth 0, setup-pm and the artifact upload, outside the pytest waves.
+_WINDOWS_E2E_OVERHEAD_MINUTES = 20
+
+
+def _windows_journey_files() -> list[str]:
+    """Every file the lane's single pytest invocation has to get through."""
+    found = sorted(p.name for p in (_REPO / _WINDOWS_JOURNEYS).glob("test_*.py"))
+    assert len(found) >= 10, f"{_WINDOWS_JOURNEYS} journeys moved or shrank: {found}"
+    return found
+
+
+def test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_the_budget():
+    """Capacity and budget are one contract: starving the installs or cancelling the job
+    mid-suite both read as product failures on a PR.
+
+    Derived from the suite on disk and the harness's own bound, not remembered: adding an
+    eleventh journey file or raising the worker count without raising ``timeout-minutes``
+    fails here rather than as a wave of uniform install timeouts on a Windows runner.
+    """
+    machine = importlib.import_module(_WINDOWS_JOURNEYS.replace("/", ".") + "._machine")
+    job = _yaml(_WINDOWS_E2E)["jobs"]["install-update"]
+    step = next(s for s in job["steps"] if s.get("name") == "Run Windows install + update E2E")
+    env = step["env"]
+
+    workers = int(env["HERMES_TEST_WORKERS"])
+    assert workers >= 1
+    assert workers * _VCPUS_PER_CLEAN_INSTALL <= _STOCK_WINDOWS_VCPUS, \
+        f"{workers} concurrent clean installs oversubscribe a {_STOCK_WINDOWS_VCPUS}-vCPU runner"
+
+    # test_crash_cells.py runs its whole journey inside one file and needs the full hour; a
+    # retry of a file killed by that bound would double the capacity problem it reports.
+    file_timeout = int(env["HERMES_TEST_FILE_TIMEOUT"])
+    assert file_timeout == 3600
+    assert str(env["HERMES_TEST_FILE_RETRIES"]) == "0"
+
+    waves = -(-len(_windows_journey_files()) // workers)
+    budget = job["timeout-minutes"]
+    assert budget >= waves * machine.INSTALL_TIMEOUT / 60 + _WINDOWS_E2E_OVERHEAD_MINUTES, \
+        f"{budget} min cannot cover {waves} install waves at {machine.INSTALL_TIMEOUT}s plus setup"
+    assert budget > file_timeout / 60, "the job would be cancelled before the per-file bound reports red"
+
+
+@pytest.mark.parametrize("mutation", ["more-workers", "more-journeys", "smaller-budget", "file-retries"])
+def test_capacity_guard_rejects_an_oversubscribed_or_underbudgeted_install_lane(monkeypatch, mutation):
+    if mutation == "more-journeys":
+        monkeypatch.setattr(sys.modules[__name__], "_windows_journey_files",
+                            lambda: [f"test_journey_{i}.py" for i in range(20)])
+    else:
+        job = _mutated_yaml(monkeypatch, _WINDOWS_E2E)["jobs"]["install-update"]
+        step = next(s for s in job["steps"] if s.get("name") == "Run Windows install + update E2E")
+        if mutation == "smaller-budget":
+            job["timeout-minutes"] = 75
+        elif mutation == "more-workers":
+            step["env"]["HERMES_TEST_WORKERS"] = "6"
+        else:
+            step["env"]["HERMES_TEST_FILE_RETRIES"] = "1"
+    with pytest.raises(AssertionError):
+        test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_the_budget()
+
+
 # Not Windows on arm64: Git for Windows ships an x86-64 MSYS bash.exe there, run under emulation,
 # and with the os-tests lane's 16 workers it dies with 0xC000026F (STATUS_WX86_INTERNAL_ERROR) or
 # 0xC0000005 before running a line, on replays of unchanged workflows: one copy of this file red
