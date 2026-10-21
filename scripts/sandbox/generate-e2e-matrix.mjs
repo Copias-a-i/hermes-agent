@@ -520,6 +520,27 @@ function readStdin() {
   });
 }
 
+/**
+ * The result chart runs after failed jobs, so its `needs` output may be empty
+ * or absent. Keep that infrastructure failure legible instead of leaking a
+ * JSON parser exception into the report job.
+ * @param {string} raw
+ * @returns {TagAnnotation[]}
+ */
+function resultTagAnnotations(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('Result chart requires a non-empty JSON array of release-tag annotations; Pick release tags did not provide valid output.');
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0
+      || !parsed.every((tag) => tag && typeof tag.ref === 'string' && typeof tag.desktop === 'boolean')) {
+    throw new Error('Result chart requires a non-empty JSON array of release-tag annotations; Pick release tags did not provide valid output.');
+  }
+  return /** @type {TagAnnotation[]} */ (parsed);
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -531,7 +552,7 @@ async function main() {
   });
   if (values.format === 'results') {
     const jobs = (await readStdin()).split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-    const annotations = /** @type {TagAnnotation[]} */ (JSON.parse(values.tags));
+    const annotations = resultTagAnnotations(values.tags);
     /** @type {Map<string, number>} */
     const artifactById = new Map();
     if (values.artifacts) {
