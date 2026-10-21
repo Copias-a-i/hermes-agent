@@ -17,7 +17,7 @@ def _pick(repo: Path, count: int = 1) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["bash", str(PICKER), "--repo", str(repo), "--count", str(count)], capture_output=True, text=True)
 
 
-def test_picker_rejects_a_checkout_without_release_tags(tmp_path):
+def test_picker_reports_typed_no_candidates_for_a_checkout_without_release_tags(tmp_path):
     _git(tmp_path, "init", "-q", "-b", "main")
     _git(tmp_path, "config", "user.name", "fixture")
     _git(tmp_path, "config", "user.email", "fixture@example.invalid")
@@ -25,10 +25,19 @@ def test_picker_rejects_a_checkout_without_release_tags(tmp_path):
 
     picked = _pick(tmp_path)
 
-    assert picked.returncode != 0
+    assert picked.returncode == 3
     assert picked.stdout == ""
     assert "no release tags found" in picked.stderr
     assert "fetch-depth: 0" in picked.stderr
+
+
+def test_picker_errors_do_not_use_the_no_candidates_exit_code(tmp_path):
+    _git(tmp_path, "init", "-q", "-b", "main")
+
+    picked = _pick(tmp_path, count=0)
+
+    assert picked.returncode == 1
+    assert "--count must be at least 1" in picked.stderr
 
 
 def test_picker_selects_latest_valid_release_after_tags_are_fetched_into_shallow_clone(tmp_path):

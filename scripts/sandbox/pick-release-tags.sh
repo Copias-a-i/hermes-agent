@@ -82,7 +82,11 @@ if [ "$total" -eq 0 ]; then
   echo "error: no release tags found in $REPO" >&2
   echo '       A shallow clone has no tags: fetch with tags (actions/checkout' >&2
   echo '       with fetch-depth: 0, or fetch-tags: true).' >&2
-  exit 1
+  # Exit 3 is a typed, recoverable answer for callers that deliberately
+  # support a repository bootstrap state with no eligible release tags.
+  # Keep all other picker failures non-zero-but-not-3 so CI never mistakes a
+  # broken git invocation or invalid input for an honest coverage gap.
+  exit 3
 fi
 
 if [ "$total" -le "$COUNT" ]; then
