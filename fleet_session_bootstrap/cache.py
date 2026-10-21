@@ -269,7 +269,8 @@ class CacheStore(_StateStore):
             valid = (
                 isinstance(data, dict)
                 and set(data) == _CACHE_ENVELOPE_FIELDS
-                and data.get("schema") == 1
+                and type(data.get("schema")) is int
+                and data["schema"] == 1
                 and type(data.get("created_at")) is int and type(data.get("expires_at")) is int
                 and data.get("partition_identity") == partition_identity
                 and data.get("manifest_digest") == manifest_digest

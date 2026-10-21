@@ -168,6 +168,24 @@ def test_cache_never_reads_or_writes_an_unscoped_payload(tmp_path: Path) -> None
         cache.put(key, payload)
 
 
+@pytest.mark.parametrize("invalid_schema", [True, False])
+def test_cache_quarantines_boolean_schema_envelopes(tmp_path: Path, invalid_schema: bool) -> None:
+    from fleet_session_bootstrap.cache import CacheStore
+
+    cache = CacheStore(tmp_path / "state")
+    key = "a" * 64
+    manifest: dict[str, object] = {"schema": 1}
+    payload = {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
+    metadata = {"partition_identity": "c" * 64, "manifest": manifest, "source_version": "v1", "now": 100}
+    entry = cache.put(key, payload, **metadata)
+    envelope = json.loads(entry.read_text(encoding="utf-8"))
+    envelope["schema"] = invalid_schema
+    entry.write_text(json.dumps(envelope), encoding="utf-8")
+
+    assert cache.get(key, **metadata) is None
+    assert not entry.exists()
+
+
 def test_cache_rejects_partial_metadata_and_payload_digest_mismatch(tmp_path: Path) -> None:
     from fleet_session_bootstrap.cache import CacheStore
 
