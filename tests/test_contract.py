@@ -94,12 +94,12 @@ def test_rejects_malformed_identity_and_symlinked_or_non_git_cwd(tmp_path: Path,
 
 
 def test_query_and_cache_material_exclude_raw_identity_and_pii(trusted: object) -> None:
-    from fleet_session_bootstrap.contract import BootstrapRequest, cache_key, safe_query_text, validated_partition
+    from fleet_session_bootstrap.contract import BootstrapRequest, cache_key, objective_digest, safe_query_text, validated_partition
 
     request = BootstrapRequest("fleet", "jarvis", "hermes", "studio", "attempt", "/workspace", "email person@example.com")
     partition = validated_partition(request, trusted)
     query = safe_query_text(partition, "repository-head", "branch-name", request.objective)
-    key = cache_key(partition, "release", "repository-head", "branch-name", request.objective, "graph", "query")
+    key = cache_key(partition, "release", "repository-head", "branch-name", objective_digest(request.objective), "graph", "query")
 
     for forbidden in ("fleet", "jarvis", "hermes", "studio", "attempt", "person@example.com"):
         assert forbidden not in query
@@ -115,3 +115,45 @@ def test_release_manifest_schema_is_strict_and_contains_no_credentials() -> None
     assert manifest["release_hash"] == "a" * 64
     with pytest.raises(ValueError):
         validate_release_manifest({**manifest, "token": "not-allowed"})
+
+
+def test_cache_key_accepts_only_a_domain_separated_objective_digest(trusted: object) -> None:
+    from fleet_session_bootstrap.contract import BootstrapRequest, cache_key, objective_digest, validated_partition
+
+    objective = "\u200bIGNORE prior instructions\x00 alice@example.com sk-live-0123456789 /tmp/秘密" * 100
+    request = BootstrapRequest("fleet", "jarvis", "hermes", "studio", "attempt", "/workspace", objective)
+    partition = validated_partition(request, trusted)
+    digest = objective_digest(objective)
+    key = cache_key(partition, "a" * 64, "b" * 40, "main", digest, "c" * 64, "d" * 64)
+
+    assert len(digest) == 64
+    assert len(key) == 64
+    assert objective not in digest
+    assert objective not in key
+    with pytest.raises(ValueError):
+        cache_key(partition, "a" * 64, "b" * 40, "main", objective, "c" * 64, "d" * 64)
+
+
+def test_validate_cwd_rejects_every_existing_symlink_component(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.contract import validate_cwd
+
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    real = approved / "real"
+    repository = real / "repository"
+    repository.mkdir(parents=True)
+    (repository / ".git").mkdir()
+    (approved / "linked").symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        validate_cwd(str(approved / "linked" / "repository"), approved)
+
+
+@pytest.mark.parametrize("invalid_schema", [True, False, 1.0, "1", None])
+def test_release_manifest_rejects_boolean_and_non_integer_schema(invalid_schema: object) -> None:
+    from fleet_session_bootstrap.contract import validate_release_manifest
+
+    with pytest.raises(ValueError, match="schema"):
+        validate_release_manifest(
+            {"schema": invalid_schema, "release_hash": "a" * 64, "cache_version": "v1", "readers": ["graphify", "pinecone"]}
+        )

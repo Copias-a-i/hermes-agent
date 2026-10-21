@@ -9,10 +9,12 @@ import stat
 import sys
 from hashlib import sha256
 from pathlib import Path
+from time import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from fleet_session_bootstrap.cache import ReceiptStore
 from fleet_session_bootstrap.contract import BootstrapRequest, TrustedIdentity, validate_cwd, validated_partition
 from fleet_session_bootstrap.render import render_pack
 
@@ -35,6 +37,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--trusted-identity", type=Path, required=True)
     parser.add_argument("--approved-root", type=Path, required=True)
+    parser.add_argument("--state-root", type=Path, required=True)
     try:
         options = parser.parse_args()
         raw = json.load(sys.stdin)
@@ -49,6 +52,19 @@ def main() -> int:
         )
         partition = validated_partition(request, _load_identity(options.trusted_identity))
         validate_cwd(request.cwd, options.approved_root)
+        ReceiptStore(options.state_root).write(
+            request.session_id,
+            {
+                "cache_state": "unavailable",
+                "manifest_version": "v1",
+                "availability": "unavailable",
+                "count": 0,
+                "elapsed_ms": 0,
+                "timestamp": int(time()),
+                "error": "none",
+                "namespace_digest": sha256(partition.namespace.encode()).hexdigest(),
+            },
+        )
         pack = render_pack(sha256(partition.namespace.encode()).hexdigest(), "unavailable", ())
         print(json.dumps({"availability": "unavailable", "pack": pack}, separators=(",", ":")))
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
