@@ -181,6 +181,7 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           filter: blob:none
+          fetch-depth: 0
           fetch-tags: true
           sparse-checkout: |
             scripts/sandbox/pick-release-tags.sh
@@ -464,8 +465,25 @@ jobs:
           sparse-checkout-cone-mode: false
       - env:
           GH_TOKEN: ${{ github.token }}
+          PICK_RELEASES_RESULT: ${{ needs.pick-releases.result }}
+          RELEASE_TAGS: ${{ needs.pick-releases.outputs.tags }}
         run: |
           set -euo pipefail
+          unavailable() {
+            echo "::error::$1"
+            {
+              echo "### Install & Update E2E results"
+              echo
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          if [ "$PICK_RELEASES_RESULT" != "success" ]; then
+            unavailable "Result chart unavailable: Pick release tags concluded $PICK_RELEASES_RESULT, so there is no trustworthy matrix to chart. Inspect the Pick release tags job."
+          fi
+          if ! printf '%s' "$RELEASE_TAGS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "object" and (.ref | type == "string") and (.desktop | type == "boolean"))' >/dev/null; then
+            unavailable "Result chart unavailable: Pick release tags succeeded but did not emit a valid non-empty tag annotation array. Inspect that job's output."
+          fi
           # The repo's GITHUB_TOKEN shares one hourly API budget with every
           # other workflow; a busy hour answered "API rate limit exceeded for
           # installation" and turned a green matrix red here. Retry, then
@@ -494,6 +512,6 @@ jobs:
             echo 'Legend: ✅ upgrade passed · known [n] = exact historical failure, see footnote · ❌ unexpected failure · pre-desktop / TODO = why a leg skipped · 📼 opens the leg player (recording + synced logs)'
             echo
             node scripts/sandbox/generate-e2e-matrix.mjs --format results \
-              --tags '${{ needs.pick-releases.outputs.tags }}' \
+              --tags "$RELEASE_TAGS" \
               --artifacts /tmp/e2e-artifacts.ndjson < /tmp/e2e-jobs.ndjson
           } >> "$GITHUB_STEP_SUMMARY"
