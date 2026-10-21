@@ -558,6 +558,7 @@ build-backend = "setuptools.build_meta"
 hermes = "hermes_cli.main:main"
 hermes-agent = "agent.legacy_cli:main"
 hermes-acp = "acp_adapter.entry:main"
+fleet-session-bootstrap = "fleet_session_bootstrap.cli:main"
 
 [tool.hermes]
 # Extras that only an explicit selection installs (setup, sync_venv). Bundles
@@ -810,6 +811,8 @@ include = [
   "pm.*",
   "tools",
   "tools.*",
+  "fleet_session_bootstrap",
+  "fleet_session_bootstrap.*",
 ]
 
 [tool.setuptools.package-data]
