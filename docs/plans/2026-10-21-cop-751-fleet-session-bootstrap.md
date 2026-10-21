@@ -1,200 +1,102 @@
 # COP-751: portable low-token session-start bootstrap — implementation plan
 
-**Status:** plan only; implementation is blocked until exact-head independent security review passes.
+**Status:** plan only. No runtime/config deployment or implementation starts until this exact plan passes independent review. Repair round **1 of 2**.
 
-## Goal
+## Goal and architecture
 
-Deploy one portable session-start bootstrap across the four fleet Macs and every discovered agent runtime. It must set Caveman full style without loading its full skill text and add a compact, read-only Graphify/Pinecone retrieval receipt when available. It must improve measured startup-context cost; no savings claim is valid before baseline evidence exists.
+Deploy a bounded first-request bootstrap across Studio, Worker, Main, and MacBook. It emits a one-line Caveman/SOUL/personality/environment-hint receipt plus a compact Graphify/Pinecone data pack; it never preloads a full skill body. The canonical stdlib-only implementation lives in `$HOME/Agents/fleet-capabilities/` and is release-installed outside worktrees. Native adapters provide only validated request metadata and delivery through a verified first-request seam.
 
-## Decision
+The data path is: adapter metadata → canonical bootstrap → local Graphify reader and partitioned Pinecone query → redaction/budget renderer → adapter delivery → captured model-bound request/receipt. No adapter may claim injection unless its first provider request contains the canary-delimited pack.
 
-Use the audited fleet capability library at `$HOME/Agents/fleet-capabilities/`: canonical skill source is `library/skills/{caveman,graphify,pinecone-memory}` and the current cross-runtime distribution surface is `adapters/{agents,claude,codex,cursor,gemini,grok,hermes,openclaw}/skills/`. Add a fleet-owned canonical Python bootstrap there, rather than add a product-specific integration to Hermes core. The bootstrap owns discovery, query derivation, bounded retrieval, sanitization, cache/receipt handling, timing, and compact rendering. Runtime adapters only translate native session metadata to a normalized request and place the returned receipt/context pack into their supported session surface.
+## Verified Hermes seam and required minimal core change
 
-Hermes uses its public `on_session_start` shell-hook/plugin path; it does **not** mutate a discarded hook context. Claude Code and Codex use their existing `SessionStart` command-hook surfaces. Cursor needs an adapter only after a fresh capability check confirms a supported start-event hook; the audited Studio/Worker/Main configs expose only `sessionEnd` and `preCompact`, so no unsupported start hook will be invented. Antigravity, Gemini, and Grok each require an adapter-specific discovery gate: no runtime presence means no config write and an explicit `not-installed` host/runtime receipt.
+`on_session_start` is observer-only: `agent/conversation_loop.py::_restore_or_build_system_prompt` calls it only after `_build_system_prompt` and ignores its result. It is **not** an injection path and remains only an optional lifecycle observer.
 
-## Audit evidence and inventory
+Hermes has a context-consuming shell-hook seam: `pre_llm_call` is a supported `hooks:` event (`hermes_cli/plugins.py::VALID_HOOKS`). `agent/turn_context.py::_collect_pre_llm_call_context` consumes a `{"context": "..."}` return and `build_api_messages` appends it to the current user message's API-sidecar before the first provider request. `agent/shell_hooks.py::_parse_response` supports that return shape for shell hooks. This preserves the byte-stable system prompt/cache; the compact pack is first-turn user-context, not a system-prompt section.
 
-### Fleet hosts
+The current wire payload uses process-global `Path.cwd()` in `agent/shell_hooks.py::_payload_fields`, while a multiplexed logical workspace is `agent.runtime_cwd.resolve_agent_cwd()`. Therefore COP-755 includes this minimal Hermes-core prerequisite, rather than inventing a hook return injector:
 
-| Host | Verified transport | Runtime findings | Graphify inventory |
-|---|---|---|---|
-| Studio | local `Jarviss-Mac-Studio.local` | Hermes (40 profile directories), Claude Code, Codex, Cursor; no verified Antigravity/Gemini/Grok executable | local scan required again during implementation; previous broad scan timed out |
-| Worker | `ssh worker` | Claude Code, Codex, 38 Hermes profiles; Cursor config exists but no `cursor-agent` binary | 50 `graphify-out/graph.json` files under `~/Projects`; Pinecone wrapper present |
-| Main | `ssh main` | Hermes, Claude Code, Codex, Cursor Agent, Gemini | 22 graph files; Pinecone wrapper present |
-| MacBook | `ssh macbook` | Hermes command, Claude Code, Codex, Antigravity (`agy`); no Hermes profiles returned | Graphify graphs in `~/Projects`; no wrapper confirmation because probe exited early |
+1. Modify `agent/turn_context.py` to pass `cwd=str(resolve_agent_cwd())` when invoking `pre_llm_call`.
+2. Modify `agent/shell_hooks.py::_payload_fields` to use a non-empty hook `cwd` kwarg first, then the current `Path.cwd()` fallback; preserve `profile` from `get_active_profile_name()`.
+3. Tests: `tests/agent/test_shell_hooks.py` proves the shell payload carries supplied logical CWD and profile; `tests/agent/test_api_content_sidecar.py` captures the actual first `build_api_messages` user request and asserts the exact `OPEN-GATE:<pack-digest>` canary appears there (not merely in hook output), including a logical-CWD Graphify fixture. A negative test proves `on_session_start` output alone does not count as delivery.
 
-The fleet topology assigns Hermes gateways to Studio, build/merge work to Worker, orchestration to Main, and mobile work to MacBook. Usernames differ; all implementation paths must use `$HOME`, never a hardcoded `/Users/<name>`.
+Hermes adapter registration is `hooks.pre_llm_call` with an allowlisted command and <=7s timeout. It retains existing `on_session_start` entries unchanged and does not claim they inject context. For Codex and Claude Code, only their documented `SessionStart` return/context surface may be used; their first provider request must contain the same canary. Cursor currently has no verified start hook in the audited configuration, so it stays `unsupported` with no config mutation until a separately documented native first-request seam passes the same request-shape test. Antigravity, Gemini, and Grok follow the same default-deny discovery rule.
 
-### Current session-start surfaces
+## Request, privacy, and namespace contract
 
-| Runtime | Current verified surface | Adapter decision |
-|---|---|---|
-| Hermes | profile `config.yaml`: `hooks.on_session_start`; Jarvis currently calls `~/.hermes/scripts/vault-writeback-reminder.sh`; logs show prior script may emit invalid non-JSON output and runs with 60s timeout | add profile-local wrapper registration through supported config/consent flow, retain existing hook, set explicit <=7s adapter timeout, reload gateway and prove loaded state |
-| Claude Code | `~/.claude/settings.json` `SessionStart`: comms-style, fleet-session-start, disk-health hooks | append a single short wrapper command after preserving existing entries; wrapper emits supported compact context/status only |
-| Codex | `~/.codex/hooks.json` `SessionStart`: fleet session and disk health; plugin hook registry also active | append single wrapper command after existing entries; do not alter plugin states or end hooks |
-| Cursor | `~/.cursor/hooks.json` contains `sessionEnd` and `preCompact` only | capability-discovery ticket first. If native session-start hook is unavailable, use supported project/global instruction pointer only and record adapter `unsupported`; never use polling, UI automation, or a fake hook API |
-| Antigravity | `agy` binary only observed on MacBook | inspect installed version/config docs; adapter only if canonical start hook exists |
-| Gemini | `gemini` binary only observed on Main | inspect installed version/config docs; adapter only if canonical start hook exists |
-| Grok | no executable found; fleet directive says xAI API path is inert due to zero credits | mark `not-installed/inert`; do not provision credentials or a new MCP |
-
-### Existing capability facts
-
-- Caveman is already a standing instruction in Claude/Codex/Cursor global instruction documents. Its full SKILL.md is too large to load automatically; inject a one-line policy receipt/pointer only.
-- Graphify's `graphify query` reads an existing `graphify-out/graph.json`; startup must never trigger detect/extract/update/build/cluster/export/watch.
-- `~/.claude/pinecone_memory.py` is the existing wrapper. Its query subcommand uses `claude-memory`, does embedding plus `/query`, and can output JSON. It also contains store/delete modes, so the bootstrap must allow only the exact `query` argv shape and test that no write endpoint is callable.
-- Existing Pinecone wrapper resolves a key from environment, `~/.hermes/.env`, or LastPass. The bootstrap may invoke it only if executable/readable and must never print command stderr that could reveal sensitive material.
-
-## Canonical contract
-
-### Inputs
-
-The adapter provides a JSON request over stdin only:
+Adapters submit JSON on stdin only:
 
 ```json
-{
-  "schema": 1,
-  "runtime": "codex",
-  "host": "macbook",
-  "session_id": "opaque-or-empty",
-  "cwd": "/absolute/path",
-  "objective": "bounded, redacted session objective",
-  "branch": "optional branch"
-}
+{"schema":2,"runtime":"hermes","host":"studio","tenant":"fleet","profile":"jarvis","session_id":"opaque","cwd":"/absolute/workspace","objective":"bounded redacted objective","branch":"optional"}
 ```
 
-The bootstrap derives project identity only after canonical-path validation: resolve `cwd`, locate Git root, reject worktree escape/symlink ambiguity, derive repo name and branch with bounded subprocess calls. Objective is truncated before any external query. Adapter input is untrusted data; no shell interpolation.
+All fields are untrusted. Canonicalize the CWD, require a Git root, bound objective length before queries, and never shell-interpolate. The rendered/vector query text includes only generic task terms plus a repository digest and branch digest; it excludes raw tenant/profile/host/session identifiers, role, usernames, email, objective identifiers, and retrieved PII.
 
-### Graphify path
+Default deny uses an explicit non-secret partition tuple:
 
-1. Look only for `<project-root>/graphify-out/graph.json`; outside a Git project, mark `unavailable:not-project`.
-2. Validate graph file is a regular file, limited size, UTF-8 JSON, and structurally readable before query. Malformed/oversize graph becomes `unavailable:invalid-graph`.
-3. Construct a deterministic, compact local query from role/runtime, repo identity, branch, and bounded objective. Execute the installed Graphify query command with an argv list, no shell, network disabled by contract, `timeout=3s`, and a strict output byte cap.
-4. Do not invoke graph construction/update/cluster/export/index mutation commands. A project with no graph records `unavailable:no-graph` and skips the subprocess.
+```
+namespace = v1/<sha256(tenant)>/<sha256(profile)>/<sha256(runtime)>/<sha256(host)>
+```
 
-### Pinecone path
+A per-install random salt held only in the 0600 local config is included in each digest. The bootstrap passes `--bucket <namespace>` to the already verified `~/.claude/pinecone_memory.py`; that wrapper's `build_query_filter()` produces `{"bucket":{"$eq": namespace}}` in the `/query` request. The namespace is included in cache-key material, cache directory, receipt (digest only), and every fixture. There is no shared-memory mode in this release. `claude-memory` remains usable only because its existing records have `bucket` metadata; records with missing/legacy bucket are ignored, never queried as a fallback. A later migration ticket must backfill from an audited source into the derived namespace using only redacted vector text, with readback counts and rollback; it is not part of startup activation.
 
-1. Build one generic compact query from runtime role, project identity, branch, and bounded objective; remove secrets/identifier-like fields before request.
-2. Invoke only `[python, ~/.claude/pinecone_memory.py, "query", query, "--top-k", "3", "--json"]` through an argv list. No bucket unless future requirements add one explicitly.
-3. Apply total 5s Pinecone deadline, at most one retry only for transient timeout/429/5xx within the 7s total startup budget. Credential absent becomes `unavailable:no-credential`; never cause an interactive LastPass prompt or a session block.
-4. Accept JSON only. Label every kept item `source:pinecone`, relevance score, and origin metadata. Treat retrieved text as untrusted data; strip instruction-shaped content into a quoted data section, redact secret/PII patterns, and truncate before rendering.
-5. Never execute `store`, `ingest-file`, `delete`, `fetch`, `stats`, or raw Pinecone calls. The implementation's command allowlist must reject every alternate subcommand before process launch.
+Cache key: `schema + release_hash + namespace + runtime + repo_HEAD + branch_digest + objective_digest + graph_digest + query_digest`. Receipts have 0600 mode, contain only namespace digest/availability/timing/counts, and never raw text, role, profile, host, tenant, session ID, credentials, or PII.
 
-### Context pack, cache, and receipts
+## Readers and hard safety boundaries
 
-- Render a stable, non-authoritative compact pack: `style=caveman-full`, `graphify=<available|unavailable:reason>`, `pinecone=<available|unavailable:reason>`, then labeled data excerpts. Include pointers to existing skills/config rather than their contents.
-- Cap combined injected retrieval at 800 tokens using a deterministic token/character conservative budget; reserve explicit overhead for status labels. Graphify and Pinecone compete for the same cap; neither has a guaranteed allocation.
-- Cache by `schema + bootstrap-hash + runtime + repo git HEAD + branch + normalized objective digest + graph file stat/hash + query digest`, with short TTL and per-host directory under `$HOME/.fleet/session-bootstrap/`. A cache hit must return the identical safe rendered pack and a `cache=hit` receipt.
-- Persist receipts and cache atomically with `0600` mode; no secrets, raw PII, full retrieval text, or credential errors. Receipts store hashes, source availability/reason, elapsed milliseconds, byte/token counts, truncation/redaction counters, adapter/version/hash, and cache status.
-- Use a per-key lock or atomic create/rename so concurrent sessions coalesce safely; lock failure falls open to a no-retrieval receipt rather than waiting beyond budget.
-- All bootstrap cache/receipt writes live outside source worktrees. The bootstrap itself has no session-start graph/Pinecone write side effects except these local receipts/caches.
+### Graphify: deterministic local reader only
 
-### Time and failure contract
+COP-753 adds `src/fleet_session_bootstrap/graphify_local.py`, using Python stdlib (`json`, `pathlib`, deterministic token overlap/ranking) to parse only `<git-root>/graphify-out/graph.json`. It performs no Graphify CLI invocation, no subprocess, no graph construction/update/build/cluster/export/watch, and no write. Invalid, oversized, symlinked, or absent graph returns a labeled unavailable result.
 
-- Whole adapter deadline: <=7s. Graphify allocation <=3s. Pinecone allocation <=5s, but it receives only remaining whole-budget time.
-- Any invalid input, unavailable executable, malformed output, timeout, nonzero exit, lock collision, or adapter integration error returns exit 0 plus a visibly labeled compact `unavailable:<reason>` receipt.
-- Adapter wrappers must be idempotent, preserve pre-existing hook order/behavior, and avoid leaking full stdout/stderr to user context or logs.
+Transport proof is mandatory: execute the helper in a test subprocess with a `sitecustomize` deny shim that raises and records calls for `socket.socket`, `socket.create_connection`, `socket.getaddrinfo`, `urllib.request.urlopen`, and `http.client.HTTPConnection`; assert zero calls, zero DNS/HTTP attempts, and zero subprocess launches. Static tests reject imports of `socket`, `urllib`, `http`, `requests`, `subprocess`, and `os.system` in this helper. Fixture graph hash/mtime before and after must match.
 
-## Files and implementation tasks
+### Pinecone: partitioned query only
 
-### T1 — canonical bootstrap library and contract
+COP-754 invokes only this argv list: `[python, ~/.claude/pinecone_memory.py, "query", query, "--top-k", "3", "--bucket", namespace, "--json"]`. It accepts JSON only, allows one bounded retry for timeout/429/5xx within the global deadline, and never prompts LastPass interactively. The command allowlist rejects `store`, `ingest-file`, `delete`, `fetch`, `stats`, arbitrary flags, and raw endpoints before process launch. Query metadata must show the exact bucket filter; returned metadata must match the namespace or is discarded.
 
-**Target:** canonical fleet skill/library source discovered during implementation; if no existing tracked source owns cross-runtime wrappers, create a dedicated `fleet-session-bootstrap` repository under the organization rather than adding a vendor-specific plugin to Hermes core.
+Negative tests cover profile, tenant, runtime, host, and session collision: identical repo/objective with one changed partition component has a different cache key, different query filter, cache miss, and receives no other partition's fixture. Tests also reject missing bucket, legacy unbucketed match, mismatched returned bucket, and vector/rendered text containing profile/role/PII markers. Fake transport asserts zero upsert/delete calls.
 
-1. Add `src/fleet_session_bootstrap.py` (or equivalent stdlib-only module) and `bin/fleet-session-bootstrap`.
-2. Implement stdin JSON validation, project discovery, objective normalization, subprocess allowlists, deadline budget, sanitization, cache/receipt atomic writer, and stable renderer.
-3. Add a machine-readable adapter manifest with content hash/version and expected runtime discovery paths.
-4. TDD: parser/allowlist before implementation; unit tests first for unsafe argv, invalid CWD, cache key stability, file modes, lock behavior, and fail-open result shape.
-5. Commit separately: `feat(fleet): add bounded session bootstrap core`.
+## Context, budget, and failure contract
 
-### T2 — Graphify reader
+Render only `OPEN-GATE:<digest>`, `style=caveman-full`, compact standing `SOUL/personality/environment_hint` identifiers (not bodies), source availability, and quoted/redacted data excerpts. Total retrieval pack cap is 800 tokens; no full `SKILL.md`, SOUL, personality, or environment file body may be preloaded. Any unavailable/invalid/timeout condition returns a labeled no-retrieval pack and exit 0. Whole startup budget is <=7s; Graphify <=3s and Pinecone uses only remaining time.
 
-1. Add read-only graph existence/validity checks and the bounded Graphify query executor.
-2. Prove the only Graphify subprocess is query mode and runs only for a valid existing graph.
-3. TDD: absent graph, malformed JSON, symlink/non-regular graph, query timeout, oversized output, malicious result text, and graph query response truncation.
-4. Commit separately: `feat(fleet): add bounded graphify startup reader`.
+## Mandatory measured cost gate
 
-### T3 — Pinecone reader
+Before any adapter activation, capture a **nonzero** baseline from actual model-bound first requests for every supported runtime/host/profile cohort. Capture system/developer/instructions, retained existing hooks, SOUL, personality, environment hint, tools, user content, and retrieval pack separately and as aggregate bytes/tokens. Baseline absence, zero samples, missing component, unknown tokenizer/version, or request capture failure is a hard fail; it cannot be labeled a saving.
 
-1. Add the exact Pinecone wrapper query executor and enforce command/subcommand allowlist before spawn.
-2. Add credential/noninteractive handling, JSON-only parser, bounded retry classifier, source/relevance labels, redaction, and data-only prompt-injection treatment.
-3. TDD with local fake wrapper/server: no key, timeout, 429, 500, malformed JSON, malicious/PII-rich content, oversized output, and assertion that no `/vectors/upsert` or `/vectors/delete` request occurs.
-4. Commit separately: `feat(fleet): add guarded pinecone startup reader`.
+Use the same version-pinned tokenizer/counter and deterministic capture format for before/after. For each supported runtime/host cohort, collect at least 30 synthetic first sessions across at least 3 representative profiles where present; report p50/p95 aggregate first-request tokens and bytes, p95 startup latency, and Pinecone calls/cost per session. Activation requires: p95 aggregate tokens not above baseline; p95 startup latency <=7s; <=1 Pinecone call/session; observed Pinecone cost/session <= the pre-approved budget recorded in COP-757; zero cross-namespace retrieval/cache events; and all request-shape canaries present. No savings percentage is claimed until this receipt exists.
 
-### T4 — adapters and host inventory
+Rollback immediately disables the adapter and restores the previous release/config fragment if aggregate p95 tokens increase, p95 latency exceeds 7s, a second Pinecone call occurs, cost exceeds budget, a namespace mismatch occurs, or any canary/request-shape assertion fails. Implementation owner performs code rollback; Colby Culbertson is rollback/activation owner.
 
-1. Implement adapters only for proven native hook APIs. Each adapter calls canonical bootstrap once and emits/places only the compact pack or pointer its runtime supports.
-2. Hermes: per-profile config adapter registration through `hermes config`; test a disposable profile, preserve existing entries, restart/reload affected Studio gateways only after plan gate approval, and read back loaded hook logs.
-3. Claude Code/Codex: use the current `SessionStart` JSON hook files, preserve entries and plugin state; test structural JSON and actual local dry run.
-4. Cursor/Antigravity/Gemini/Grok: add a discovery manifest and negative `unsupported/not-installed` receipts. Only introduce a write adapter after official/current runtime documentation plus an executable dry run proves a canonical start hook.
-5. Add host/profile inventory generator that reports all detected active profiles/runtimes and their adapter state without reading credentials.
-6. Commit separately per adapter family to keep rollback scoped.
+## Task manifest and Linear contract
 
-### T5 — installer, propagation, rollback
+All tickets are COP team, Todo until dependency gates clear, assigned to **Colby Culbertson** (the verified available accountable Linear user); **Codex** is the implementation agent named in each body; Colby Culbertson owns activation/rollback. Ticket descriptions below are authoritative and must match Linear bodies exactly.
 
-1. Package immutable artifact hash/variant and signed-or-hashed manifest. Install to `$HOME/.fleet/session-bootstrap/releases/<hash>/`; flip a `current` pointer atomically, never execute from a worktree.
-2. Propagate through canonical SSH aliases in order: Studio, Worker, Main, MacBook. Every remote command proves hostname, artifact SHA, file modes, adapter discovery result, and readback version.
-3. Keep adapters disabled until their per-host dry run is green. Gateway reload semantics: Hermes hook registry is process-cached, so restart/reload only the owning profile gateway after a successful install; CLI/Claude/Codex/Cursor require new sessions and a synthetic start test.
-4. Roll back atomically to prior release pointer plus exact previous config fragments; restart/reload only affected gateways; re-read adapter/config hash and generate rollback receipt.
-5. Never copy credentials, build graphs, populate Pinecone, or alter source worktrees.
+| Order | Ticket | Scope/files | Depends on / blocks | Acceptance and negative controls |
+|---|---|---|---|---|
+| T1 | COP-752 | fleet-capabilities: `src/fleet_session_bootstrap/{__init__,contract,render,cache}.py`, `bin/fleet-session-bootstrap`, `tests/test_contract.py` | first; blocks 753/754 | validated stdin, salted namespace/cache/receipt; reject bad CWD, PII/role vector text, missing partition, cache collision |
+| T2 | COP-753 | `src/fleet_session_bootstrap/graphify_local.py`, `tests/test_graphify_local.py`, `tests/sitecustomize_socket_deny.py` | after 752; blocks 755/757 | local graph result and transport-proof; reject socket/DNS/HTTP/subprocess/imports/writes |
+| T3 | COP-754 | `src/fleet_session_bootstrap/pinecone_query.py`, `tests/test_pinecone_query.py`, `tests/fake_pinecone.py` | after 752; blocks 755/757 | exact bucket-filter query and namespace isolation; reject legacy/unbucketed/cross-partition/upsert/delete |
+| T4 | COP-755 | Hermes core: `agent/turn_context.py`, `agent/shell_hooks.py`, `tests/agent/test_shell_hooks.py`, `tests/agent/test_api_content_sidecar.py`; fleet adapters/tests | after 753+754; blocks 756/757 | first-request canary + logical CWD; reject observer-only `on_session_start`, unsupported Cursor/Codex/Claude adapter, full-skill preload |
+| T5 | COP-756 | `installer/*`, `adapters/*`, `tests/test_install_rollback.py` | after 755; blocks 757 activation | immutable release/install/readback/rollback; reject worktree execution, config loss, unsupported runtime mutation |
+| T6 | COP-757 | `measurement/*`, `tests/test_measurement_contract.py`, receipt schema | after 753+754+755+756; sole activation gate | 30x3 cohort aggregate request evidence/cost gate; reject zero/missing baseline and p95 threshold violations |
 
-### T6 — measurements and acceptance evidence
+## Rollout and verification
 
-1. Baseline each runtime/host using existing session-start config and capture: preexisting injected startup bytes/tokens, new compact pack bytes/tokens, elapsed time, cache state, Graphify/Pinecone availability, and excluded full-skill bytes.
-2. Measure token count with one version-pinned deterministic counter declared in receipts. Compare per runtime and whole fleet. A pass needs measured injected context lower than baseline (or a transparent `baseline-unavailable`), not a projected percentage.
-3. Run host/runtime synthetic dry runs, no-network Graphify negative control, fake Pinecone server controls, concurrent-session race test, adapter reload checks, and independent security review.
-4. Produce immutable receipts bound to artifact hash, adapter version, host, runtime, and test fixture digest.
+Inventory Studio, Worker, Main, and MacBook without credentials. Install immutable releases at `$HOME/.fleet/session-bootstrap/releases/<hash>/` and atomically flip `current`; never run a source-worktree artifact. Per runtime, preserve existing hooks/config order and take a redacted config-hash backup. Only a supported adapter with all gates green is enabled. Cursor/Antigravity/Gemini/Grok remain receipt-only `unsupported/not-installed` until their own official start-event and first-request test pass.
 
-## Test matrix
-
-| Control | Required assertion |
-|---|---|
-| no graph / cwd outside project | Graphify skipped; receipt gives precise unavailable reason; exit 0 |
-| malformed/oversized/symlink graph | no query process; safe unavailable receipt |
-| valid graph | one bounded local query; no graph writes/network/build/update/cluster |
-| no Pinecone key/LastPass unavailable | no interactive prompt; skip cleanly |
-| Pinecone timeout, 429, 500 | bounded retry policy; total <=7s; exit 0 |
-| malicious/PII retrieval | treated only as quoted data; injection markers neutralized; secrets/PII redacted |
-| oversized result | deterministic truncation under combined <=800-token cap |
-| command mutation probe | alternate Pinecone subcommands rejected; fake transport sees zero upsert/delete calls |
-| full skill preload probe | pack contains policy pointer/receipt only; no SKILL.md body contents |
-| existing config | byte/semantic preservation outside added adapter entry |
-| concurrent sessions | singleflight/cache correctness; no corrupt receipt/cache; no deadline breach |
-| repeated same session | cache hit, identical safe pack, no duplicate remote Pinecone call |
-| hook/bootstrap failure | runtime remains usable; visible unavailable marker; exit success |
-| adapter discovery | every installed runtime has an explicit supported/unsupported/not-installed outcome |
-| end-to-end dry run | actual adapter invokes current artifact by immutable hash and produces readback receipt |
-
-## Security review gate
-
-A reviewer independent of the builder must review the exact committed plan and, before implementation, the exact implementation head. Review scope: command injection, objective/metadata privacy, retrieval prompt injection, cache path traversal and modes, race safety, Graphify network/write prohibition, Pinecone query-only enforcement, credential handling, output/log redaction, adapter config preservation, gateway reload/rollback, and host propagation integrity.
-
-Repair cap is **two** exact-head plan repair rounds. A third new trust-boundary finding creates a named Linear follow-up (`COP-751-security-boundary-follow-up` unless an existing issue is linked), blocks implementation, and requires a decomposed design rather than further prose patching.
+Run: canonical fleet-library tests; affected Hermes tests; `python scripts/check`; static plan contract checking ticket/manifest/namespace/transport/cost clauses; Linear readback of all six ticket bodies/assignees/team/state; and `git diff --check`. Commit only this plan, push normally, verify branch and PR API head, reply and resolve each current thread only after its correction is present, confirm zero unresolved threads, then trigger a fresh exact-head independent review. Do not merge or implement.
 
 ## Rejected alternatives
 
-1. **Preload Caveman/Graphify/Pinecone skill bodies into every system prompt.** Rejected: directly increases startup tokens and defeats objective.
-2. **One universal hook file/API.** Rejected: audit shows Hermes, Claude/Codex, Cursor, and Antigravity differ; unsupported APIs are unsafe and brittle.
-3. **Build/update/cluster Graphify at session start.** Rejected: nondeterministic, potentially expensive, writeful, and exceeds latency budget.
-4. **New Pinecone MCP/provider/credentials.** Rejected: existing wrapper/index suffices; new integration widens attack and cost surface.
-5. **Always retrieve from Pinecone.** Rejected: vendor call/cost and sensitive retrieval risk; cache, credential availability, tight budget, and clean skip are required.
-6. **Embed code in every existing hook.** Rejected: four-way drift; a single canonical implementation plus shims is auditable and rollbackable.
-7. **Cursor UI automation/polling fallback.** Rejected: not a canonical session start API and can make sessions unreliable.
-8. **Hermes core change or bundled vendor plugin.** Rejected: Hermes contribution rules require edge capability; fleet-specific Pinecone integration belongs outside core.
-
-## Rollout matrix
-
-| Host | Runtime | Initial state | Install action | Activation proof | Rollback |
-|---|---|---|---|---|---|
-| Studio | Hermes profiles | active gateway host | immutable release + profile-local adapter after inventory | gateway log/load + dry run receipt | restore config fragment/release pointer + gateway restart |
-| Studio | Claude/Codex/Cursor | active configs | wrapper/config only where supported | new-session dry run/readback | restore JSON backup fragment/release pointer |
-| Worker | Claude/Codex/Hermes profiles | build host | immutable release; no daemon disruption | dry run, no graph/Pinecone writes | pointer/config revert |
-| Main | Hermes/Claude/Codex/Cursor/Gemini | orchestration | immutable release + supported adapters | per-runtime dry run | pointer/config revert |
-| MacBook | Hermes CLI/Claude/Codex/Antigravity | roaming | immutable release + supported adapters | local dry run when online | pointer/config revert |
-| all | Grok | inert/not installed | none | explicit not-installed receipt | none |
+1. `on_session_start` context injection: observer-only and post-build.
+2. Full skill/SOUL/personality preload: violates the token objective.
+3. Graphify CLI/sandbox-by-contract: an external query could network; local stdlib parser is deterministic.
+4. Unpartitioned/shared Pinecone or legacy fallback: cross-profile retrieval risk.
+5. Cursor UI automation/polling: not a verified first-request seam.
 
 ## Completion criteria
 
-- Plan committed alone, pushed, PR opened non-draft and linked to COP-751.
-- Independent exact-head plan/security review reports no Critical/Important unresolved findings within two repair rounds.
-- No source implementation starts until that gate is terminal pass.
-- Implementation tickets are created from T1–T6, each with tests, owner/runtime scope, and rollback acceptance.
+- Exact-head independent review has no Critical/Important unresolved finding within the two-round cap.
+- COP-752..757 Linear bodies, assignment, team, status, dependencies, rollback owner, and manifest are read back one-to-one.
+- No implementation, runtime reload, config activation, credential, or merge action occurs under this plan-only PR.
