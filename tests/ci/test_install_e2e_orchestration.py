@@ -27,7 +27,25 @@ def test_result_chart_checks_picker_outcome_before_parsing_its_output():
     step = next(step for step in report["steps"] if "generate-e2e-matrix.mjs" in step.get("run", ""))
 
     assert step["env"]["PICK_RELEASES_RESULT"] == "${{ needs.pick-releases.result }}"
+    assert step["env"]["PICK_RELEASES_OUTCOME"] == "${{ needs.pick-releases.outputs.outcome }}"
     assert step["env"]["RELEASE_TAGS"] == "${{ needs.pick-releases.outputs.tags }}"
+    assert '"$PICK_RELEASES_OUTCOME" = "no_candidates"' in step["run"]
+    assert "No eligible releases; install E2E not run." in step["run"]
+    assert "This is not a passing install-coverage result." in step["run"]
     assert '"$PICK_RELEASES_RESULT" != "success"' in step["run"]
     assert 'jq -e' in step["run"]
     assert '"$RELEASE_TAGS"' in step["run"]
+
+
+def test_no_candidates_is_a_successful_typed_picker_outcome_that_skips_matrix_fan_out():
+    """Bootstrap repositories report unavailable coverage without faking a test pass."""
+    workflow = _workflow()
+    picker = workflow["jobs"]["pick-releases"]
+    picker_step = next(step for step in picker["steps"] if step.get("id") == "pick")
+    matrix = workflow["jobs"]["generate-matrix"]
+
+    assert picker["outputs"]["outcome"] == "${{ steps.pick.outputs.outcome }}"
+    assert 'echo "outcome=no_candidates" >> "$GITHUB_OUTPUT"' in picker_step["run"]
+    assert 'echo "tags=[]" >> "$GITHUB_OUTPUT"' in picker_step["run"]
+    assert 'exit 0' in picker_step["run"]
+    assert matrix["if"] == "needs.pick-releases.outputs.outcome == 'candidates'"
