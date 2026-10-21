@@ -5,6 +5,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { JSDOM } from 'jsdom'
 import { afterEach, expect, test, vi } from 'vitest'
+import { runBoundedChild } from './helpers/bounded-child.mjs'
 import updateUi from '../tests/install/e2e-assets/update-ui.cjs'
 import sourceBranchProbe from '../tests/install/e2e-assets/source-branch-probe.cjs'
 
@@ -123,7 +124,7 @@ test('test-only source probe pins staged main without changing other Python invo
   expect(sourceBranchProbe.branchProbeArgs(cmd, root, '/real&git')).toBe(cmd)
 })
 
-test.skipIf(process.platform === 'win32')('probe Git reaches the staged main even with global Git config isolated', () => {
+test.skipIf(process.platform === 'win32')('probe Git reaches the staged main even with global Git config isolated', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-staged-git-'))
   const git = process.env.HERMES_E2E_REAL_GIT || process.env.PATH.split(path.delimiter)
     .map(dir => path.join(dir, process.platform === 'win32' ? 'git.exe' : 'git')).find(file => fs.existsSync(file))
@@ -131,17 +132,21 @@ test.skipIf(process.platform === 'win32')('probe Git reaches the staged main eve
     const checkout = path.join(root, 'checkout')
     const bare = path.join(root, 'serve.git')
     fs.mkdirSync(checkout)
-    const run = (args, cwd = checkout, env = process.env) => execFileSync(git, args, { cwd, env, encoding: 'utf8' }).trim()
-    run(['init', '-b', 'main'])
-    run(['-c', 'user.name=Fixture', '-c', 'user.email=e2e@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'base'])
-    const base = run(['rev-parse', 'HEAD'])
-    run(['-c', 'user.name=Fixture', '-c', 'user.email=e2e@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'staged'])
-    const sha = run(['rev-parse', 'HEAD'])
-    run(['clone', '--bare', checkout, bare], root)
-    run(['reset', '--hard', base])
-    run(['remote', 'add', 'origin', 'https://github.com/NousResearch/hermes-agent.git'])
+    const run = async (args, cwd = checkout, env = process.env) => {
+      const result = await runBoundedChild(git, args, { cwd, env, timeoutMs: 3_000 })
+      expect(result.code, result.stderr).toBe(0)
+      return result.stdout.trim()
+    }
+    await run(['init', '-b', 'main'])
+    await run(['-c', 'user.name=Fixture', '-c', 'user.email=e2e@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'base'])
+    const base = await run(['rev-parse', 'HEAD'])
+    await run(['-c', 'user.name=Fixture', '-c', 'user.email=e2e@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'staged'])
+    const sha = await run(['rev-parse', 'HEAD'])
+    await run(['clone', '--bare', checkout, bare], root)
+    await run(['reset', '--hard', base])
+    await run(['remote', 'add', 'origin', 'https://github.com/NousResearch/hermes-agent.git'])
     const cfg = path.join(root, 'gitconfig')
-    run(['config', '--file', cfg, '--add', `url.file://${bare}.insteadOf`, 'https://github.com/NousResearch/hermes-agent.git'])
+    await run(['config', '--file', cfg, '--add', `url.file://${bare}.insteadOf`, 'https://github.com/NousResearch/hermes-agent.git'])
     const python = process.env.HERMES_PYTHON || 'python3'
     const source = fileURLToPath(new URL('../', import.meta.url))
     const launcher = path.join(checkout, '.hermes', 'bin', 'hermes')
@@ -155,22 +160,28 @@ test.skipIf(process.platform === 'win32')('probe Git reaches the staged main eve
       PYTHONPATH: source, GIT_ALLOW_PROTOCOL: 'file' }
     const home = path.join(root, 'profile')
     fs.mkdirSync(home)
-    const status = JSON.parse(execFileSync(launcher, ['--run-module', 'hermes_cli.source_check',
+    const sourceCheck = await runBoundedChild(launcher, ['--run-module', 'hermes_cli.source_check',
       '--install-root', checkout, '--home', home, '--git', git, '--force'],
-    { cwd: checkout, encoding: 'utf8', env }))
+    { cwd: checkout, env, timeoutMs: 7_000 })
+    expect(sourceCheck.code, sourceCheck.stderr).toBe(0)
+    const status = JSON.parse(sourceCheck.stdout)
     expect(status).toMatchObject({ supported: true, currentSha: base, branch: 'main', targetSha: sha, updateAvailable: true })
-    expect(execFileSync(launcher, ['--version'], { cwd: checkout, env, encoding: 'utf8' }).trim()).toBe('--version')
+    const version = await runBoundedChild(launcher, ['--version'], { cwd: checkout, env, timeoutMs: 3_000 })
+    expect(version.code, version.stderr).toBe(0)
+    expect(version.stdout.trim()).toBe('--version')
     const other = path.join(root, 'other-checkout')
     fs.mkdirSync(other)
-    const foreign = JSON.parse(execFileSync(launcher, ['--run-module', 'hermes_cli.source_check',
+    const foreignCheck = await runBoundedChild(launcher, ['--run-module', 'hermes_cli.source_check',
       '--install-root', other, '--home', home, '--git', git, '--force'],
-    { cwd: checkout, encoding: 'utf8', env }))
+    { cwd: checkout, env, timeoutMs: 3_000 })
+    expect(foreignCheck.code, foreignCheck.stderr).toBe(0)
+    const foreign = JSON.parse(foreignCheck.stdout)
     expect(foreign).toMatchObject({ supported: false, reason: 'not-a-git-checkout' })
     expect(() => sourceBranchProbe.prepareSourceBranchEnvironment(checkout, '0'.repeat(40), git, capturedEnv, launchEnv)).toThrow(/does not match expected/)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
-})
+}, 15_000)
 
 test.skipIf(process.platform === 'win32')('historical venv install without a PM launcher still checks staged Git main', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-legacy-branch-'))
