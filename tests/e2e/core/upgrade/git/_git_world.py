@@ -54,26 +54,60 @@ def reported_success(cp: subprocess.CompletedProcess) -> bool:
     return cp.returncode == 0 or SUCCESS in output(cp)
 
 
-def n1_tag() -> str:
-    """N-1: the newest release tag strictly before HEAD."""
-    return I.git("describe", "--tags", "--abbrev=0", "--match", "v20[0-9][0-9].*", "HEAD~1", cwd=H.WORKTREE)
+@dataclass(frozen=True)
+class UpgradeHistory:
+    """A local release -> upgrade ancestry independent of checkout tags or git config."""
+
+    source: Path
+    untagged: str
+    base: str
+    target: str
+    tag: str
 
 
-def n1_base() -> str:
-    """The commit an N-1 install sits on: N-1's tag, or ``HERMES_E2E_N1_REF`` (a patched commit
-    object, used to prove red a cell whose bug lives in N-1's own updater code)."""
-    return commit_of(os.environ.get("HERMES_E2E_N1_REF") or n1_tag())
+def _fixture_git_env(date: str) -> dict[str, str]:
+    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Hermes E2E", "GIT_AUTHOR_EMAIL": "e2e@hermes.invalid",
+            "GIT_COMMITTER_NAME": "Hermes E2E", "GIT_COMMITTER_EMAIL": "e2e@hermes.invalid",
+            "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
 
 
-def commit_of(ref: str) -> str:
-    return I.git("rev-parse", f"{ref}^{{commit}}", cwd=H.WORKTREE)
+def _commit(source: Path, tree: str, message: str, date: str, parent: str | None = None) -> str:
+    cp = subprocess.run(["git", "commit-tree", tree, *(["-p", parent] if parent else [])], cwd=str(source),
+                        input=message + "\n", text=True, capture_output=True, env=_fixture_git_env(date))
+    assert cp.returncode == 0, f"creating upgrade fixture commit failed: {cp.stderr}"
+    return cp.stdout.strip()
 
 
-def installer_script(ref: str | None) -> str:
+def build_upgrade_history(root: Path) -> UpgradeHistory:
+    """Build a dated release -> upgrade ancestry without checkout tags or global git config."""
+    source = root / "history.git"
+    root.mkdir(parents=True, exist_ok=True)
+    cp = subprocess.run(["git", "init", "-q", "--bare", str(source)], capture_output=True, text=True,
+                        env=_fixture_git_env("2026-01-01T00:00:00+0000"))
+    assert cp.returncode == 0, f"creating upgrade fixture repository failed: {cp.stderr}"
+    objects = I.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=H.WORKTREE)
+    (source / "objects" / "info" / "alternates").write_text(f"{Path(objects) / 'objects'}\n", encoding="utf-8")
+    tree = I.git("rev-parse", "HEAD^{tree}", cwd=H.WORKTREE)
+    untagged = _commit(source, tree, "e2e: untagged fixture root", "2026-01-01T00:00:00+0000")
+    base = _commit(source, tree, "e2e: release fixture", "2026-01-02T00:00:00+0000", untagged)
+    target = _commit(source, tree, "e2e: post-release upgrade", "2026-01-03T00:00:00+0000", base)
+    tag = "v2099.1.1"
+    for name, ref, date in (("e2e-not-a-release", untagged, "2026-01-01T00:00:01+0000"),
+                            (tag, base, "2026-01-02T00:00:01+0000")):
+        cp = subprocess.run(["git", "tag", "-a", name, ref, "-m", name], cwd=str(source), capture_output=True,
+                            text=True, env=_fixture_git_env(date))
+        assert cp.returncode == 0, f"creating upgrade fixture tag {name} failed: {cp.stderr}"
+    I.git("update-ref", "refs/heads/main", target, cwd=source)
+    I.git("symbolic-ref", "HEAD", "refs/heads/main", cwd=source)
+    return UpgradeHistory(source=source, untagged=untagged, base=base, target=target, tag=tag)
+
+
+def installer_script(ref: str | None, source: Path) -> str:
     """``scripts/install.sh`` as of ``ref`` (None: this worktree's copy)."""
     if ref is None:
         return (H.WORKTREE / "scripts" / "install.sh").read_text(encoding="utf-8")
-    return I.git("show", f"{ref}:scripts/install.sh", cwd=H.WORKTREE) + "\n"
+    return I.git("show", f"{ref}:scripts/install.sh", cwd=source) + "\n"
 
 
 @dataclass
@@ -204,13 +238,13 @@ def _preclone(sb: I.Sandbox, args: list[str], env: dict[str, str]) -> None:
 
 @contextlib.contextmanager
 def world(root: Path, *, base: str, installer_ref: str | None = None,
-          preclone: list[str] | None = None) -> Iterator[World]:
+          preclone: list[str] | None = None, source: Path = H.WORKTREE) -> Iterator[World]:
     """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
     of ``installer_ref`` (None: HEAD's). Yields the live ``World``; the server stops on exit."""
     root.mkdir(parents=True, exist_ok=True)
     srv_root = root / "srv"
     srv_root.mkdir(exist_ok=True)
-    bare = serve_bare(srv_root, REPO, H.WORKTREE, base)
+    bare = serve_bare(srv_root, REPO, source, base)
     with GitHTTPServer(srv_root) as srv:
         sb = I.new_sandbox(root / "sb")
         url = srv.url(REPO)
@@ -221,7 +255,7 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
         if preclone is not None:
             _preclone(sb, preclone, w.git_env())
         script = sb.root / "install.sh"
-        script.write_text(installer_script(installer_ref), encoding="utf-8")
+        script.write_text(installer_script(installer_ref, source), encoding="utf-8")
         cp = sb.run(["bash", str(script), "--non-interactive"], timeout=1800, input="")
         assert cp.returncode == 0, f"install ({installer_ref or 'HEAD'} installer, base {base[:12]}) failed:\n{w.diag(cp)}"
         head = w.head()
