@@ -31,6 +31,19 @@ def test_picker_reports_typed_no_candidates_for_a_checkout_without_release_tags(
     assert "fetch-depth: 0" in picked.stderr
 
 
+def test_picker_propagates_git_listing_failure_instead_of_no_candidates(tmp_path):
+    # An empty .git directory makes `git tag --list` exit 128. This is a
+    # broken checkout, not the successful-empty-list bootstrap condition.
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / ".git").mkdir()
+
+    picked = _pick(broken)
+
+    assert picked.returncode == 128
+    assert "no release tags found" not in picked.stderr
+
+
 def test_picker_errors_do_not_use_the_no_candidates_exit_code(tmp_path):
     _git(tmp_path, "init", "-q", "-b", "main")
 

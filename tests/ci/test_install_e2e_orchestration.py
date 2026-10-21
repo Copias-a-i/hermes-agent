@@ -37,6 +37,16 @@ def test_result_chart_checks_picker_outcome_before_parsing_its_output():
     assert '"$RELEASE_TAGS"' in step["run"]
 
 
+def test_picker_workflow_treats_only_exit_three_as_no_candidates():
+    """Broken picker invocations must fail the job rather than skip coverage."""
+    picker = _workflow()["jobs"]["pick-releases"]
+    picker_step = next(step for step in picker["steps"] if step.get("id") == "pick")
+
+    assert 'if [ "$picker_status" -eq 3 ]; then' in picker_step["run"]
+    assert 'echo "outcome=no_candidates" >> "$GITHUB_OUTPUT"' in picker_step["run"]
+    assert 'exit "$picker_status"' in picker_step["run"]
+
+
 def test_no_candidates_is_a_successful_typed_picker_outcome_that_skips_matrix_fan_out():
     """Bootstrap repositories report unavailable coverage without faking a test pass."""
     workflow = _workflow()
