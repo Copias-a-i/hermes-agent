@@ -66,7 +66,12 @@ fi
 
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
 # lexicographic sort gets wrong.
-mapfile -t tags < <(
+# Read with Bash 3-compatible primitives: macOS still ships Bash 3.2, which
+# lacks `mapfile`, while Git for Windows and Ubuntu also support this loop.
+tags=()
+while IFS= read -r tag; do
+  [ -n "$tag" ] && tags+=("$tag")
+done < <(
   git -C "$REPO" tag --list 'v*' \
     | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
     | sort -V
