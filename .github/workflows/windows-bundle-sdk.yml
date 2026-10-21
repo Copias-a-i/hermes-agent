@@ -29,7 +29,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [windows-11-arm, windows-11-arm]
+        # Keep two independent cold-SDK probes without duplicating a runner
+        # label in the matrix (which actionlint rejects).
+        include:
+          - runner: windows-11-arm
+            probe: 1
+          - runner: windows-11-arm
+            probe: 2
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
