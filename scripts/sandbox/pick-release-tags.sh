@@ -65,17 +65,46 @@ if [ -z "$REPO" ]; then
 fi
 
 # sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
-# lexicographic sort gets wrong.
+# lexicographic sort gets wrong. Keep the git command outside process
+# substitution: Bash otherwise exposes the consumer's status, not a failed
+# producer's. Exit 3 is reserved for a successful listing with no eligible
+# tags; failures to list or process tags keep their genuine non-3 status.
+tag_list=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
+eligible_tags=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
+sorted_tags=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
+cleanup() {
+  rm -f "$tag_list" "$eligible_tags" "$sorted_tags"
+}
+trap cleanup EXIT HUP INT TERM
+
+if git -C "$REPO" tag --list 'v*' > "$tag_list"; then
+  :
+else
+  git_status=$?
+  echo "error: failed to list release tags in $REPO" >&2
+  exit "$git_status"
+fi
+
+# grep status 1 means no matching lines, which is the typed no-candidates
+# condition after the successful git listing above. Any other grep error is
+# genuine and must not be converted to exit 3.
+if grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' "$tag_list" > "$eligible_tags"; then
+  :
+else
+  grep_status=$?
+  if [ "$grep_status" -ne 1 ]; then
+    echo "error: failed to filter release tags in $REPO" >&2
+    exit "$grep_status"
+  fi
+fi
+sort -V "$eligible_tags" > "$sorted_tags"
+
 # Read with Bash 3-compatible primitives: macOS still ships Bash 3.2, which
 # lacks `mapfile`, while Git for Windows and Ubuntu also support this loop.
 tags=()
 while IFS= read -r tag; do
   [ -n "$tag" ] && tags+=("$tag")
-done < <(
-  git -C "$REPO" tag --list 'v*' \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
-    | sort -V
-)
+done < "$sorted_tags"
 
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then
