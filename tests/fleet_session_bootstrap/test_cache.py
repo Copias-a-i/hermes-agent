@@ -16,9 +16,11 @@ def test_cache_reuses_safe_partition_without_storing_session_id(tmp_path: Path) 
 
     cache = CacheStore(tmp_path / "cache")
     key = "a" * 64
-    cache.put(key, {"availability": "available", "count": 1, "items": ["SOUL:pointer"]})
+    manifest: dict[str, object] = {"schema": 1}
+    metadata = {"partition_identity": "c" * 64, "manifest": manifest, "source_version": "v1", "now": 1}
+    cache.put(key, {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}, **metadata)
 
-    assert cache.get(key) == {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
+    assert cache.get(key, **metadata) == {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
     entry = cache.path_for(key)
     assert stat.S_IMODE(entry.stat().st_mode) == 0o600
     assert "session" not in entry.read_text(encoding="utf-8")
@@ -76,16 +78,31 @@ def test_state_stores_reject_git_roots_and_intermediate_symlinks(tmp_path: Path)
         ReceiptStore(tmp_path / "link" / "state")
 
 
+def test_git_probe_uses_platform_resolution_and_rejects_missing_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from fleet_session_bootstrap import cache
+    from hermes_platform.resolver import Candidate, Resolution
+
+    monkeypatch.setattr(cache, "locate_command", lambda _name: Resolution("missing"))
+    with pytest.raises(ValueError, match="Git probe is unavailable"):
+        cache._is_in_git_tree(tmp_path)
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cache, "locate_command", lambda _name: Resolution("path_executable", (Candidate("/sealed/git", "PATH", True),)))
+    monkeypatch.setattr(cache.subprocess, "run", lambda args, **_kwargs: calls.append(args) or subprocess.CompletedProcess(args, 1))
+    assert cache._is_in_git_tree(tmp_path) is False
+    assert calls == [["/sealed/git", "-C", str(tmp_path), "rev-parse", "--git-common-dir"]]
+
+
 def test_cache_marks_stale_envelopes_as_misses_and_replaces_them(tmp_path: Path) -> None:
     from fleet_session_bootstrap.cache import CacheStore
 
     cache = CacheStore(tmp_path / "state")
     key = "a" * 64
     manifest = {"schema": 1, "release_hash": "b" * 64, "cache_version": "v1", "readers": ["graphify", "pinecone"]}
-    cache.put(key, {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=100)
+    cache.put(key, {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=100, ttl_seconds=5)
     assert cache.get(key, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=101, ttl_seconds=5) == {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
     assert cache.get(key, partition_identity="c" * 64, manifest=manifest, source_version="v2", now=101, ttl_seconds=5) is None
-    cache.put(key, {"availability": "unavailable", "count": 0, "items": []}, partition_identity="c" * 64, manifest=manifest, source_version="v2", now=102)
+    cache.put(key, {"availability": "unavailable", "count": 0, "items": []}, partition_identity="c" * 64, manifest=manifest, source_version="v2", now=102, ttl_seconds=5)
     assert cache.get(key, partition_identity="c" * 64, manifest=manifest, source_version="v2", now=103, ttl_seconds=5) == {"availability": "unavailable", "count": 0, "items": []}
 
 
@@ -101,6 +118,70 @@ def test_receipts_use_session_digest_for_idempotency_and_separation(tmp_path: Pa
     first_data = json.loads(first.read_text(encoding="utf-8"))
     assert first_data["attempt_digest"] != "session-a"
     assert first_data["cache_state"] == "miss"
+
+
+def test_receipts_scope_same_session_to_the_trusted_partition(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.cache import ReceiptStore
+
+    store = ReceiptStore(tmp_path / "state")
+    base = {"cache_state": "miss", "manifest_version": "v1", "availability": "unavailable", "count": 0, "elapsed_ms": 1, "error": "none", "timestamp": 1}
+    first = store.write("shared-session", {**base, "namespace_digest": "a" * 64})
+    second = store.write("shared-session", {**base, "namespace_digest": "b" * 64})
+
+    assert first != second
+    assert json.loads(first.read_text(encoding="utf-8"))["namespace_digest"] == "a" * 64
+    assert json.loads(second.read_text(encoding="utf-8"))["namespace_digest"] == "b" * 64
+
+
+def test_concurrent_same_session_receipts_do_not_cross_partition(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    script = """
+from fleet_session_bootstrap.cache import ReceiptStore
+from pathlib import Path
+import sys
+namespace = sys.argv[2]
+ReceiptStore(Path(sys.argv[1])).write('shared-session', {
+    'cache_state': 'miss', 'manifest_version': 'v1', 'availability': 'unavailable',
+    'count': 0, 'elapsed_ms': 1, 'timestamp': 1, 'error': 'none',
+    'namespace_digest': namespace,
+})
+"""
+    processes = [subprocess.Popen([sys.executable, "-c", script, str(state), namespace]) for namespace in ("a" * 64, "b" * 64)]
+    assert [process.wait(timeout=30) for process in processes] == [0, 0]
+
+    receipts = list((state / "fleet-session-bootstrap" / "receipts").glob("*.json"))
+    assert len(receipts) == 2
+    assert {json.loads(receipt.read_text(encoding="utf-8"))["namespace_digest"] for receipt in receipts} == {"a" * 64, "b" * 64}
+
+
+def test_cache_never_reads_or_writes_an_unscoped_payload(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.cache import CacheStore
+
+    cache = CacheStore(tmp_path / "state")
+    key = "a" * 64
+    payload = {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
+    cache.path_for(key).write_text(json.dumps(payload), encoding="utf-8")
+
+    assert cache.get(key) is None
+    assert not cache.path_for(key).exists()
+    with pytest.raises(ValueError, match="metadata"):
+        cache.put(key, payload)
+
+
+def test_cache_rejects_partial_metadata_and_payload_digest_mismatch(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.cache import CacheStore
+
+    cache = CacheStore(tmp_path / "state")
+    key = "a" * 64
+    manifest: dict[str, object] = {"schema": 1}
+    payload = {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
+    with pytest.raises(ValueError, match="metadata"):
+        cache.put(key, payload, partition_identity="c" * 64, manifest=manifest)
+    cache.put(key, payload, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=100, ttl_seconds=5)
+    envelope = json.loads(cache.path_for(key).read_text(encoding="utf-8"))
+    envelope["payload_digest"] = "0" * 64
+    cache.path_for(key).write_text(json.dumps(envelope), encoding="utf-8")
+    assert cache.get(key, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=101, ttl_seconds=5) is None
 
 
 def test_multiprocess_readers_never_observe_partial_cache_json(tmp_path: Path) -> None:

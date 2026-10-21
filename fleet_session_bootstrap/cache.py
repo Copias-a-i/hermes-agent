@@ -13,6 +13,8 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+from hermes_platform.resolver import locate_command
+
 _SAFE_KEY = re.compile(r"[a-f0-9]{64}\Z")
 _RECEIPT_FIELDS = frozenset({"cache_state", "manifest_version", "availability", "count", "elapsed_ms", "timestamp", "error", "namespace_digest"})
 _AVAILABILITY = frozenset({"available", "unavailable", "timeout"})
@@ -21,6 +23,7 @@ _ERROR = frozenset({"none", "invalid", "io", "timeout"})
 _POINTER = re.compile(r"(?:SOUL|personality|environment):[a-z0-9._-]{1,64}\Z")
 _SOURCE_VERSION = re.compile(r"v[0-9]{1,8}\Z")
 _MAX_CACHE_BYTES = 4096
+_CACHE_ENVELOPE_FIELDS = frozenset({"schema", "partition_identity", "manifest_digest", "source_version", "created_at", "expires_at", "ttl_seconds", "payload_digest", "payload"})
 
 
 def _require_int(value: object, name: str, minimum: int, maximum: int) -> int:
@@ -78,14 +81,20 @@ def _existing_components(path: Path) -> tuple[Path, ...]:
 def _is_in_git_tree(path: Path) -> bool:
     if (path / ".git").exists() or (path / ".git").is_symlink():
         return True
-    completed = subprocess.run(
-        ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        timeout=5,
-    )
+    command = locate_command("git").command
+    if not command:
+        raise ValueError("Git probe is unavailable")
+    try:
+        completed = subprocess.run(
+            [*command, "-C", str(path), "rev-parse", "--git-common-dir"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise ValueError("Git probe is unavailable") from error
     return completed.returncode == 0
 
 
@@ -229,33 +238,49 @@ class CacheStore(_StateStore):
     def lock_path_for(self, key: str) -> Path:
         return self.path_for(key, ".lock")
 
+    @staticmethod
+    def _metadata(partition_identity: str | None, manifest: dict[str, object] | None, source_version: str | None, ttl_seconds: int) -> tuple[str, str, str, int]:
+        if partition_identity is None or manifest is None or source_version is None:
+            raise ValueError("complete cache metadata is required")
+        if (not _SAFE_KEY.fullmatch(partition_identity) or not _SOURCE_VERSION.fullmatch(source_version)
+                or type(ttl_seconds) is not int or not 0 <= ttl_seconds <= 86_400):
+            raise ValueError("invalid cache metadata")
+        return partition_identity, _manifest_digest(manifest), source_version, ttl_seconds
+
     def get(self, key: str, *, partition_identity: str | None = None, manifest: dict[str, object] | None = None, source_version: str | None = None, now: int | None = None, ttl_seconds: int = 300) -> dict[str, Any] | None:
         path = self.path_for(key)
+        try:
+            partition_identity, manifest_digest, source_version, ttl_seconds = self._metadata(partition_identity, manifest, source_version, ttl_seconds)
+        except ValueError:
+            with self.lock_for(key):
+                try:
+                    path.unlink()
+                    _fsync_directory(path.parent)
+                except FileNotFoundError:
+                    pass
+            return None
         with self.lock_for(key):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
             except (FileNotFoundError, OSError, json.JSONDecodeError):
                 return None
-            if partition_identity is None or manifest is None or source_version is None:
-                try:
-                    return _validate_cache_payload(data)
-                except ValueError:
-                    return None
-            if (not _SAFE_KEY.fullmatch(partition_identity) or not _SOURCE_VERSION.fullmatch(source_version)
-                    or type(ttl_seconds) is not int or not 0 <= ttl_seconds <= 86_400
-                    or now is not None and type(now) is not int):
+            if now is not None and type(now) is not int:
                 return None
             valid = (
                 isinstance(data, dict)
-                and type(data.get("schema")) is int
+                and set(data) == _CACHE_ENVELOPE_FIELDS
                 and data.get("schema") == 1
-                and type(data.get("created_at")) is int
+                and type(data.get("created_at")) is int and type(data.get("expires_at")) is int
                 and data.get("partition_identity") == partition_identity
-                and data.get("manifest_digest") == _manifest_digest(manifest)
+                and data.get("manifest_digest") == manifest_digest
                 and data.get("source_version") == source_version
+                and data.get("ttl_seconds") == ttl_seconds
                 and isinstance(data.get("payload"), dict)
                 and _is_valid_cache_payload(data.get("payload"))
-                and 0 <= (int(time()) if now is None else now) - data["created_at"] <= ttl_seconds
+                and type(data.get("payload_digest")) is str
+                and data["payload_digest"] == _manifest_digest(data["payload"])
+                and data["expires_at"] == data["created_at"] + ttl_seconds
+                and data["created_at"] <= (int(time()) if now is None else now) <= data["expires_at"]
             )
             if valid:
                 return data["payload"]
@@ -266,16 +291,12 @@ class CacheStore(_StateStore):
                 pass
             return None
 
-    def put(self, key: str, value: dict[str, Any], *, partition_identity: str | None = None, manifest: dict[str, object] | None = None, source_version: str | None = None, now: int | None = None) -> Path:
+    def put(self, key: str, value: dict[str, Any], *, partition_identity: str | None = None, manifest: dict[str, object] | None = None, source_version: str | None = None, now: int | None = None, ttl_seconds: int = 300) -> Path:
         path = self.path_for(key)
         safe_value = _validate_cache_payload(value)
-        if partition_identity is None or manifest is None or source_version is None:
-            payload = safe_value
-        else:
-            if not _SAFE_KEY.fullmatch(partition_identity) or not _SOURCE_VERSION.fullmatch(source_version):
-                raise ValueError("invalid cache metadata")
-            _require_int(int(time()) if now is None else now, "cache timestamp", 0, 4_102_444_800)
-            payload = {"schema": 1, "partition_identity": partition_identity, "manifest_digest": _manifest_digest(manifest), "source_version": source_version, "created_at": int(time()) if now is None else now, "payload": safe_value}
+        partition_identity, manifest_digest, source_version, ttl_seconds = self._metadata(partition_identity, manifest, source_version, ttl_seconds)
+        created_at = _require_int(int(time()) if now is None else now, "cache timestamp", 0, 4_102_444_800)
+        payload = {"schema": 1, "partition_identity": partition_identity, "manifest_digest": manifest_digest, "source_version": source_version, "created_at": created_at, "expires_at": created_at + ttl_seconds, "ttl_seconds": ttl_seconds, "payload_digest": _manifest_digest(safe_value), "payload": safe_value}
         with self.lock_for(key):
             _atomic_json(path, payload)
         return path
@@ -297,7 +318,8 @@ class ReceiptStore(_StateStore):
         attempt_digest = self.attempt_digest(session_id)
         safe_receipt = _validate_receipt(receipt)
         safe_receipt.update({"schema": 1, "attempt_digest": attempt_digest})
-        path = self.path_for(attempt_digest)
-        with self.lock_for(attempt_digest):
+        receipt_digest = sha256(b"COP-752/receipt/v1\0" + bytes.fromhex(safe_receipt["namespace_digest"]) + bytes.fromhex(attempt_digest)).hexdigest()
+        path = self.path_for(receipt_digest)
+        with self.lock_for(receipt_digest):
             _atomic_json(path, safe_receipt)
         return path

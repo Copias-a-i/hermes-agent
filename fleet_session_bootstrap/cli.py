@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 from hashlib import sha256
@@ -27,7 +28,9 @@ def _unavailable() -> None:
 
 
 def _load_identity(path: Path) -> TrustedIdentity:
-    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("trusted identity file is invalid")
+    if os.name == "posix" and stat.S_IMODE(path.stat().st_mode) != 0o600:
         raise ValueError("trusted identity file must be mode 0600")
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict) or set(raw) != {"tenant", "profile", "runtime", "host_or_project", "salt"}:
