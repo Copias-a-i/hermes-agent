@@ -64,11 +64,12 @@ if [ -z "$REPO" ]; then
   REPO="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$script_dir")"
 fi
 
-# sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
-# lexicographic sort gets wrong. Keep the git command outside process
-# substitution: Bash otherwise exposes the consumer's status, not a failed
-# producer's. Exit 3 is reserved for a successful listing with no eligible
-# tags; failures to list or process tags keep their genuine non-3 status.
+# Sort numeric version components without GNU sort -V so this remains usable by
+# the Bash 3.2 shipped with macOS as well as Linux and Git Bash. Keep the git
+# command outside process substitution: Bash otherwise exposes the consumer's
+# status, not a failed producer's. Exit 3 is reserved for a successful listing
+# with no eligible tags; failures to list or process tags keep their genuine
+# non-3 status.
 tag_list=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
 eligible_tags=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
 sorted_tags=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
@@ -97,7 +98,7 @@ else
     exit "$grep_status"
   fi
 fi
-sort -V "$eligible_tags" > "$sorted_tags"
+LC_ALL=C sort -t. -k1.2n -k2,2n -k3,3n -k4,4n "$eligible_tags" > "$sorted_tags"
 
 # Read with Bash 3-compatible primitives: macOS still ships Bash 3.2, which
 # lacks `mapfile`, while Git for Windows and Ubuntu also support this loop.
