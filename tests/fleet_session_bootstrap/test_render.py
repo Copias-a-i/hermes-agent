@@ -2,13 +2,8 @@
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-
 
 def test_renderer_emits_only_compact_pointers_with_budgeted_canary() -> None:
     from fleet_session_bootstrap.render import render_pack
@@ -32,3 +27,11 @@ def test_renderer_rejects_identity_and_pii_markers(marker: str) -> None:
 
     with pytest.raises(ValueError):
         render_pack("a" * 64, "available", (marker,))
+
+
+def test_renderer_rejects_oversized_serialized_pointer_pack() -> None:
+    from fleet_session_bootstrap.render import render_pack
+
+    pointers = tuple(f"SOUL:{index:064d}" for index in range(100))
+    with pytest.raises(ValueError, match="budget"):
+        render_pack("a" * 64, "available", pointers)

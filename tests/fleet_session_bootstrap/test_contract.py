@@ -2,13 +2,9 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
-
 
 def test_trusted_partition_is_stable_across_session_attempt_ids() -> None:
     from fleet_session_bootstrap.contract import (
@@ -157,3 +153,25 @@ def test_release_manifest_rejects_boolean_and_non_integer_schema(invalid_schema:
         validate_release_manifest(
             {"schema": invalid_schema, "release_hash": "a" * 64, "cache_version": "v1", "readers": ["graphify", "pinecone"]}
         )
+
+
+def test_validate_cwd_accepts_nested_directory_under_approved_git_worktree(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.contract import validate_cwd
+
+    repository = tmp_path / "repository"
+    nested = repository / "service" / "worker"
+    nested.mkdir(parents=True)
+    (repository / ".git").mkdir()
+
+    assert validate_cwd(str(nested), tmp_path) == nested
+
+
+def test_objective_digest_bounds_input_before_unicode_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    import fleet_session_bootstrap.contract as contract
+
+    seen: list[int] = []
+    original = contract.unicodedata.normalize
+    monkeypatch.setattr(contract.unicodedata, "normalize", lambda form, value: (seen.append(len(value)) or original(form, value)))
+    contract.objective_digest("x" * 100_000)
+
+    assert seen == [1024]

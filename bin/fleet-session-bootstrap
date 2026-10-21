@@ -1,76 +1,14 @@
 #!/usr/bin/env python3
-"""Offline, fail-open command boundary for the fleet session-bootstrap core."""
-
+"""Source-checkout launcher for the installed fleet-session-bootstrap entry point."""
 from __future__ import annotations
 
-import argparse
-import json
-import stat
 import sys
-from hashlib import sha256
 from pathlib import Path
-from time import time
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
-from fleet_session_bootstrap.cache import ReceiptStore
-from fleet_session_bootstrap.contract import BootstrapRequest, TrustedIdentity, validate_cwd, validated_partition
-from fleet_session_bootstrap.render import render_pack
-
-
-def _unavailable() -> None:
-    pack = render_pack(sha256(b"unavailable").hexdigest(), "unavailable", ())
-    print(json.dumps({"availability": "unavailable", "pack": pack}, separators=(",", ":")))
-
-
-def _load_identity(path: Path) -> TrustedIdentity:
-    if stat.S_IMODE(path.stat().st_mode) != 0o600:
-        raise ValueError("trusted identity file must be mode 0600")
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    if set(raw) != {"tenant", "profile", "runtime", "host_or_project", "salt"}:
-        raise ValueError("trusted identity schema is invalid")
-    return TrustedIdentity(**raw)
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--trusted-identity", type=Path, required=True)
-    parser.add_argument("--approved-root", type=Path, required=True)
-    parser.add_argument("--state-root", type=Path, required=True)
-    try:
-        options = parser.parse_args()
-        raw = json.load(sys.stdin)
-        request = BootstrapRequest(
-            tenant=raw["tenant"],
-            profile=raw["profile"],
-            runtime=raw["runtime"],
-            host_or_project=raw["host"],
-            session_id=raw["session_id"],
-            cwd=raw["cwd"],
-            objective=raw["objective"],
-        )
-        partition = validated_partition(request, _load_identity(options.trusted_identity))
-        validate_cwd(request.cwd, options.approved_root)
-        ReceiptStore(options.state_root).write(
-            request.session_id,
-            {
-                "cache_state": "unavailable",
-                "manifest_version": "v1",
-                "availability": "unavailable",
-                "count": 0,
-                "elapsed_ms": 0,
-                "timestamp": int(time()),
-                "error": "none",
-                "namespace_digest": sha256(partition.namespace.encode()).hexdigest(),
-            },
-        )
-        pack = render_pack(sha256(partition.namespace.encode()).hexdigest(), "unavailable", ())
-        print(json.dumps({"availability": "unavailable", "pack": pack}, separators=(",", ":")))
-    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
-        _unavailable()
-    return 0
-
+from fleet_session_bootstrap.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

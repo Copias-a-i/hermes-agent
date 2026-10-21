@@ -63,7 +63,7 @@ def objective_digest(objective: str) -> str:
     """Bound untrusted objective in memory before a domain-separated one-way digest."""
     if not isinstance(objective, str):
         raise ValueError("objective is invalid")
-    normalized = unicodedata.normalize("NFC", objective).replace("\x00", " ")[:1024]
+    normalized = unicodedata.normalize("NFC", objective[:1024]).replace("\x00", " ")
     return sha256(b"COP-752/objective/v1\0" + normalized.encode("utf-8")).hexdigest()
 
 
@@ -103,7 +103,10 @@ def validate_cwd(cwd: str, approved_root: Path) -> Path:
         raise ValueError("cwd or approved root contains a symlink")
     root = approved_root.resolve(strict=True)
     resolved = candidate.resolve(strict=True)
-    if root not in (resolved, *resolved.parents) or not (resolved / ".git").exists():
+    if root not in (resolved, *resolved.parents):
+        raise ValueError("cwd is outside the approved Git worktree root")
+    ancestors = (resolved, *resolved.parents)
+    if not any((ancestor / ".git").exists() for ancestor in ancestors[: ancestors.index(root) + 1]):
         raise ValueError("cwd is outside the approved Git worktree root")
     return resolved
 
