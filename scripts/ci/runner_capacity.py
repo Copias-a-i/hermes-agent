@@ -20,12 +20,19 @@ def capacity(lane: str, runner: str = "") -> Capacity:
         return Capacity(workers=0, file_timeout=0, workspace_checks=2)
     if lane == "linux-tests":
         return Capacity(workers=4, file_timeout=600)
-    if lane == "windows-os":
+    if lane == "os-tests":
+        # The marked macOS suite is split in two and runs under the same
+        # max-parallel: 2 cap as Windows. Two file workers leave capacity for
+        # pytest collection and host services on both Intel (macos-13) and
+        # ARM (macos-14/latest) hosted runners; 600 seconds retains the
+        # measured Windows per-file ceiling instead of falling back to CPU count.
+        if runner in {"macos-13", "macos-14", "macos-latest"}:
+            return Capacity(workers=2, file_timeout=600)
         if runner == "windows-11-arm":
             return Capacity(workers=2, file_timeout=600, job_timeout=75)
         if runner == "windows-latest":
             return Capacity(workers=3, file_timeout=600, job_timeout=30)
-        raise ValueError(f"unknown Windows runner: {runner}")
+        raise ValueError(f"unsupported OS-test runner: {runner}")
     if lane == "windows-install-update":
         return Capacity(workers=3, file_timeout=3600, install_slots=2, job_timeout=75)
     raise ValueError(f"unknown capacity lane: {lane}")
