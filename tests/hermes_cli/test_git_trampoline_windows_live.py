@@ -63,7 +63,7 @@ class TestGitTrampolineLive:
         assert real is not None, "expected a resolver-discovered git on windows-latest"
         assert real == Path(resolved[0])
         assert real.exists()
-        assert real.name == "git.exe"
+        assert real.name.lower() == "git.exe"
         probe = subprocess.run(
             [str(real), "--version"], capture_output=True, text=True, timeout=30
         )
@@ -80,7 +80,7 @@ class TestGitTrampolineLive:
         assert healed != broken_cmd, "broken trampoline must be swapped"
         assert healed[1:] == broken_cmd[1:], "git config args must survive"
         real = Path(healed[0])
-        assert real.exists() and real.name == "git.exe"
+        assert real.exists() and real.name.lower() == "git.exe"
         # The healed command must actually work.
         result = subprocess.run(
             healed[:1] + ["--version"], capture_output=True, text=True, timeout=30
