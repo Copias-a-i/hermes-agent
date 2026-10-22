@@ -68,6 +68,7 @@ export function runBoundedChild(file, args, {
     let onStderr
     let onError
     let onClose
+    let cleanedUp = false
 
     const details = () => ({
       stdout: clippedText(output.stdout),
@@ -80,23 +81,37 @@ export function runBoundedChild(file, args, {
       clearTimeout(cleanupDeadline)
       clearTimeout(cleanupPoll)
     }
-    const releaseResources = () => {
+    const safely = callback => {
+      try { callback?.() } catch { /* teardown must not replace the original outcome */ }
+    }
+    const cleanup = () => {
+      if (cleanedUp) return
+      cleanedUp = true
+      clearTimers()
       for (const [stream, listener] of [[child.stdout, onStdout], [child.stderr, onStderr]]) {
         if (!stream) continue
-        if (listener) stream.removeListener('data', listener)
-        stream.unpipe()
-        stream.destroy()
+        safely(() => listener && stream.removeListener('data', listener))
+        safely(() => stream.unpipe?.())
+        safely(() => stream.destroy?.())
       }
-      if (onError) child.removeListener('error', onError)
-      if (onClose) child.removeListener('close', onClose)
+      safely(() => onError && child.removeListener('error', onError))
+      safely(() => onClose && child.removeListener('close', onClose))
     }
-    const finishFailure = extra => {
+    const rejectOnce = error => {
       if (settled) return
       settled = true
-      const error = failure(`${reason}: ${file} ${args.join(' ')}\n${details().stderr}${extra || ''}`, details())
-      clearTimers()
-      releaseResources()
+      cleanup()
       reject(error)
+    }
+    const resolveOnce = value => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(value)
+    }
+    const finishFailure = extra => {
+      const error = failure(`${reason}: ${file} ${args.join(' ')}\n${details().stderr}${extra || ''}`, details())
+      rejectOnce(error)
     }
     const settleAfterCleanup = () => {
       if (settled || !closed || !reason) return
@@ -176,17 +191,13 @@ export function runBoundedChild(file, args, {
     child.stdout.on('data', onStdout)
     child.stderr.on('data', onStderr)
     onError = error => {
-      if (!reason) {
-        clearTimers()
-        reject(error)
-      }
+      if (!reason) rejectOnce(error)
     }
     child.once('error', onError)
     onClose = (code, signal) => {
       closed = true
       if (!reason) {
-        clearTimers()
-        resolve({ code, signal, ...details() })
+        resolveOnce({ code, signal, ...details() })
         return
       }
       settleAfterCleanup()
