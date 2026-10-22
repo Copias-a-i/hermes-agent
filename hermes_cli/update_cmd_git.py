@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from hermes_platform.resolver import locate_command
 from hermes_cli._subprocess_compat import NO_LAZY_FETCH_ENV, noninteractive_git_env, windows_hide_flags
 from hermes_cli.update_cmd_common import _record_stop
 
@@ -561,36 +562,18 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     return _probe_fork_bomb(git_cmd) is True
 
 
-def _portable_git_candidates() -> list:
-    """PortableGit candidates: shared root first (where the managed tree actually lives, not the
-    profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
-
-    The Hermes-managed PortableGit tree lives under the SHARED root (``<root>/git/...``), not the
-    profile-scoped HERMES_HOME (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must look
-    there (monerostar review, #87876).
-    """
-    from hermes_constants import get_default_hermes_root, get_hermes_home
-    candidates = []
-    with suppress(Exception):
-        candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
-    return candidates
-
-
 def _locate_real_git() -> Optional[Path]:
-    """Find a real Git-for-Windows ``git-core/git.exe`` (standard locations + managed PortableGit) that runs
-    without the trampoline guard. None when nothing suits — callers keep the broken command and let the
-    fetch-failure ZIP fallback handle it. A failed probe (None) disqualifies a candidate like a guard hit.
+    """Find the platform-resolved Git executable when it is not a trampoline.
 
-    The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe`` (both ~46KB shims) fail to
-    re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
-    invoked directly (#87876).
+    Runner images and managed Git installs need not use Git-for-Windows'
+    ``git-core`` layout. ``locate_command`` is the shared command-discovery
+    boundary; the fork-bomb probe remains the validation boundary.
     """
-    candidates = [
-        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
-        for arch in ("clangarm64", "mingw64", "mingw32")
-    ] + _portable_git_candidates()
-    return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
+    command = locate_command("git").command
+    if not command:
+        return None
+    candidate = Path(command[0])
+    return candidate if candidate.exists() and _probe_fork_bomb([str(candidate)]) is False else None
 
 
 def _ensure_non_trampoline_git(git_cmd: list) -> list:

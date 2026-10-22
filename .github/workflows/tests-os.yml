@@ -97,7 +97,12 @@ jobs:
           - name: Windows-only tests (arm64)
             runner: windows-11-arm
             marker: windows
-            timeout: 60
+            # The 4-worker ARM run took 37 minutes wall time (including 23
+            # minutes of native dependency setup) and starved a real
+            # PowerShell child past its 60-second discovery window. Two file
+            # workers preserve every marked test while reserving CPU for its
+            # nested process trees; 75 minutes remains a bounded job budget.
+            timeout: 75
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -191,8 +196,11 @@ jobs:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
           # Four isolated file workers leave CPU and memory for the PowerShell
-          # process trees on standard hosted Windows runners.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && '4' || '' }}
+          # process trees on standard x64 hosted Windows runners. ARM uses two
+          # workers after the 4-worker lane delayed an update child past its
+          # 60-second discovery window; its per-file deadline stays bounded.
+          HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || matrix.marker == 'windows' && '4' || '' }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
