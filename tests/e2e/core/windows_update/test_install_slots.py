@@ -1,4 +1,4 @@
-"""Native Windows process proof for the E2E installer disk semaphore."""
+"""Native Windows process proof for crash-safe installer mutex slots."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ import json, os, sys, time
 from tests.e2e.core.windows_update._install_slots import acquire_install_slot
 mode, hold = sys.argv[1], float(sys.argv[2])
 try:
+    print(json.dumps({"event":"waiting", "at":time.monotonic()}), flush=True)
     with acquire_install_slot() as slot:
         print(json.dumps({"event":"acquired", "at":time.monotonic(), "waited":slot.waited_seconds}), flush=True)
         if mode == "crash":
@@ -76,9 +78,11 @@ def test_windows_install_slots_bound_workers_and_recover_from_failure_and_crash(
     root = tmp_path / "shared-machine-root"
     first = _start(root, "hold", 1.0)
     second = _start(root, "hold", 1.0)
+    assert _event(first)["event"] == _event(second)["event"] == "waiting"
     first_acquired, second_acquired = _event(first), _event(second)
 
     third = _start(root, "hold", 0.0)
+    assert _event(third)["event"] == "waiting"
     third_acquired = _event(third)
     _, first_code = _finish(first)
     _, second_code = _finish(second)
@@ -91,17 +95,21 @@ def test_windows_install_slots_bound_workers_and_recover_from_failure_and_crash(
     assert float(third_acquired["at"]) >= min(float(first_acquired["at"]), float(second_acquired["at"]))
 
     failing = _start(root, "raise", 0.0, slots=1)
+    assert _event(failing)["event"] == "waiting"
     assert _event(failing)["event"] == "acquired"
     failure, failure_code = _finish(failing)
     assert failure_code == 0 and failure["event"] == "exception"
     after_exception = _start(root, "hold", 0.0, slots=1)
+    assert _event(after_exception)["event"] == "waiting"
     assert _event(after_exception)["event"] == "acquired"
     _, after_exception_code = _finish(after_exception)
     assert after_exception_code == 0
 
     holder = _start(root, "hold", 0.8, slots=1)
+    assert _event(holder)["event"] == "waiting"
     assert _event(holder)["event"] == "acquired"
     timed = _start(root, "hold", 0.0, slots=1, timeout=0.15)
+    assert _event(timed)["event"] == "waiting"
     timeout_event, timeout_code = _finish(timed)
     assert timeout_code == 0 and timeout_event["event"] == "timeout"
     assert "timed out" in str(timeout_event["message"]) and "slots=1" in str(timeout_event["message"])
@@ -109,9 +117,33 @@ def test_windows_install_slots_bound_workers_and_recover_from_failure_and_crash(
     assert holder_code == 0
 
     crashed = _start(root, "crash", 0.0, slots=1)
+    assert _event(crashed)["event"] == "waiting"
     assert _event(crashed)["event"] == "acquired"
     assert crashed.wait(timeout=10) == 17
     after_crash = _start(root, "hold", 0.0, slots=1, timeout=2.0)
+    assert _event(after_crash)["event"] == "waiting"
     assert _event(after_crash)["event"] == "acquired"
     _, after_crash_code = _finish(after_crash)
     assert after_crash_code == 0
+
+
+def test_windows_waiter_claims_abandoned_slot_while_other_slot_remains_owned(tmp_path: Path) -> None:
+    """A pre-existing waiter claims B's abandoned mutex without borrowing A's."""
+    root = tmp_path / "shared-machine-root"
+    holder_a = _start(root, "hold", 4.0)
+    holder_b = _start(root, "hold", 4.0)
+    assert _event(holder_a)["event"] == _event(holder_b)["event"] == "waiting"
+    assert _event(holder_a)["event"] == _event(holder_b)["event"] == "acquired"
+
+    waiter_c = _start(root, "hold", 0.0, timeout=2.0)
+    assert _event(waiter_c)["event"] == "waiting"
+    time.sleep(0.2)
+    holder_b.kill()
+    assert holder_b.wait(timeout=10) != 0
+    acquired_c = _event(waiter_c)
+    assert acquired_c["event"] == "acquired"
+    assert holder_a.poll() is None
+    _, waiter_code = _finish(waiter_c)
+    assert waiter_code == 0
+    holder_a.kill()
+    assert holder_a.wait(timeout=10) != 0

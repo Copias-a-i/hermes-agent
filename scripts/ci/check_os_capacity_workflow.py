@@ -10,6 +10,13 @@ import sys
 import tempfile
 from typing import Any
 
+# This script is launched by path from the hermetic test runner, which clears
+# PYTHONPATH. Import the checkout's first-party YAML facade explicitly rather
+# than depending on the caller's working directory.
+CHECKOUT_ROOT = Path(__file__).resolve().parents[2]
+if str(CHECKOUT_ROOT) not in sys.path:
+    sys.path.insert(0, str(CHECKOUT_ROOT))
+
 import hermes_yaml as yaml
 
 
