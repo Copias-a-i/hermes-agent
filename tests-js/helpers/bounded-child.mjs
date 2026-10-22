@@ -1,19 +1,51 @@
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 
-function terminate(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  if (process.platform !== 'win32' && child.pid) {
-    try { process.kill(-child.pid, 'SIGTERM') } catch { /* process group already exited */ }
+const DEFAULT_OUTPUT_BYTES = 8_388_608
+const DEFAULT_GRACE_MS = 250
+const CLEANUP_TIMEOUT_MS = 5_000
+
+function groupExists(pgid) {
+  try {
+    process.kill(-pgid, 0)
+    return true
+  } catch (error) {
+    if (error.code === 'ESRCH') return false
+    if (error.code === 'EPERM') return true
+    throw error
   }
-  try { child.kill('SIGTERM') } catch { /* child already exited */ }
+}
+
+function signalGroup(pgid, signal) {
+  if (!groupExists(pgid)) return false
+  process.kill(-pgid, signal)
+  return true
+}
+
+function clippedText(chunks) {
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+function failure(message, details) {
+  const error = new Error(message)
+  Object.assign(error, details)
+  return error
 }
 
 /**
- * Runs a test subprocess with a deadline and closes its process group on timeout.
- * The result intentionally includes non-zero exits so callers can assert refusal
- * paths without losing stdout/stderr diagnostics.
+ * Runs a test subprocess with a deadline, output ceilings, and tree cleanup.
+ * On POSIX it owns a new process group; after TERM it still sends KILL while
+ * that group exists, even if the spawned leader has already exited. On Windows
+ * taskkill /T /F is the supported tree termination mechanism.
  */
-export function runBoundedChild(file, args, { cwd, env, timeoutMs = 5_000 } = {}) {
+export function runBoundedChild(file, args, {
+  cwd,
+  env,
+  timeoutMs = 5_000,
+  graceMs = DEFAULT_GRACE_MS,
+  maxStdoutBytes = DEFAULT_OUTPUT_BYTES,
+  maxStderrBytes = DEFAULT_OUTPUT_BYTES,
+  maxOutputBytes = DEFAULT_OUTPUT_BYTES * 2,
+} = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
       cwd,
@@ -21,41 +53,119 @@ export function runBoundedChild(file, args, { cwd, env, timeoutMs = 5_000 } = {}
       detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    let stdout = ''
-    let stderr = ''
-    let timedOut = false
+    const pgid = child.pid
+    const output = { stdout: [], stderr: [], stdoutBytes: 0, stderrBytes: 0, totalBytes: 0 }
+    let reason = null
+    let outputTruncated = false
+    let cleanupFailure = null
+    let closed = false
     let forceKill
-    const deadline = setTimeout(() => {
-      timedOut = true
-      terminate(child)
-      forceKill = setTimeout(() => {
-        if (child.exitCode === null && child.signalCode === null) {
-          if (process.platform !== 'win32' && child.pid) {
-            try { process.kill(-child.pid, 'SIGKILL') } catch { /* process group already exited */ }
-          }
-          try { child.kill('SIGKILL') } catch { /* child already exited */ }
-        }
-      }, 250)
-      forceKill.unref()
-    }, timeoutMs)
-    deadline.unref()
-    child.stdout.setEncoding('utf8')
-    child.stderr.setEncoding('utf8')
-    child.stdout.on('data', chunk => { stdout += chunk })
-    child.stderr.on('data', chunk => { stderr += chunk })
-    child.once('error', error => {
-      clearTimeout(deadline)
-      clearTimeout(forceKill)
-      reject(error)
+    let cleanupDeadline
+    let cleanupPoll
+
+    const details = () => ({
+      stdout: clippedText(output.stdout),
+      stderr: clippedText(output.stderr),
+      outputTruncated,
     })
-    child.once('close', (code, signal) => {
+    const clearTimers = () => {
       clearTimeout(deadline)
       clearTimeout(forceKill)
-      if (timedOut) {
-        reject(new Error(`Child exceeded ${timeoutMs}ms: ${file} ${args.join(' ')}\n${stderr}`))
+      clearTimeout(cleanupDeadline)
+      clearTimeout(cleanupPoll)
+    }
+    const finishFailure = extra => {
+      clearTimers()
+      reject(failure(`${reason}: ${file} ${args.join(' ')}\n${details().stderr}${extra || ''}`, details()))
+    }
+    const settleAfterCleanup = () => {
+      if (!closed || !reason) return
+      if (process.platform === 'win32' || !groupExists(pgid)) {
+        finishFailure(cleanupFailure ? `\nCleanup failure: ${cleanupFailure}` : '')
+      }
+    }
+    const awaitGroupAbsence = () => {
+      if (!groupExists(pgid)) return settleAfterCleanup()
+      cleanupPoll = setTimeout(awaitGroupAbsence, 25)
+      cleanupPoll.unref()
+    }
+    const forceTerminate = () => {
+      if (process.platform === 'win32') return
+      try {
+        // Do not use child.exitCode as the decision: descendants can remain.
+        signalGroup(pgid, 'SIGKILL')
+      } catch (error) {
+        cleanupFailure = `SIGKILL process group failed: ${error.message}`
+      }
+      awaitGroupAbsence()
+    }
+    const terminateWindowsTree = () => {
+      try {
+        execFileSync('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+          timeout: CLEANUP_TIMEOUT_MS,
+          stdio: 'ignore',
+          windowsHide: true,
+        })
+      } catch (error) {
+        cleanupFailure = `taskkill /T /F failed: ${error.message}`
+        try { child.kill('SIGKILL') } catch { /* report unverified tree cleanup below */ }
+      }
+      settleAfterCleanup()
+    }
+    const beginTermination = why => {
+      if (reason) return
+      reason = why
+      if (process.platform === 'win32') {
+        terminateWindowsTree()
         return
       }
-      resolve({ code, signal, stdout, stderr })
+      try {
+        // A live process group cannot have reused this PGID: its members retain it.
+        signalGroup(pgid, 'SIGTERM')
+      } catch (error) {
+        cleanupFailure = `SIGTERM process group failed: ${error.message}`
+      }
+      forceKill = setTimeout(forceTerminate, graceMs)
+      forceKill.unref()
+      cleanupDeadline = setTimeout(() => {
+        cleanupFailure ||= `process group ${pgid} remained after ${CLEANUP_TIMEOUT_MS}ms`
+        settleAfterCleanup()
+      }, CLEANUP_TIMEOUT_MS)
+      cleanupDeadline.unref()
+    }
+    const deadline = setTimeout(() => beginTermination(`Child exceeded ${timeoutMs}ms`), timeoutMs)
+    deadline.unref()
+
+    const capture = (stream, chunk, streamLimit) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const available = Math.max(0, Math.min(streamLimit - output[`${stream}Bytes`], maxOutputBytes - output.totalBytes))
+      const captured = Math.min(available, bytes.length)
+      if (captured < bytes.length) {
+        outputTruncated = true
+        beginTermination(`Child exceeded output limit (${stream})`)
+      }
+      if (captured > 0) {
+        output[stream].push(bytes.subarray(0, captured))
+        output[`${stream}Bytes`] += captured
+        output.totalBytes += captured
+      }
+    }
+    child.stdout.on('data', chunk => capture('stdout', chunk, maxStdoutBytes))
+    child.stderr.on('data', chunk => capture('stderr', chunk, maxStderrBytes))
+    child.once('error', error => {
+      if (!reason) {
+        clearTimers()
+        reject(error)
+      }
+    })
+    child.once('close', (code, signal) => {
+      closed = true
+      if (!reason) {
+        clearTimers()
+        resolve({ code, signal, ...details() })
+        return
+      }
+      settleAfterCleanup()
     })
   })
 }
