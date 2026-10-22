@@ -9,9 +9,9 @@ function groupExists(pgid) {
     process.kill(-pgid, 0)
     return true
   } catch (error) {
-    if (error.code === 'ESRCH') return false
-    if (error.code === 'EPERM') return true
-    throw error
+    // Only ESRCH proves absence. Treat permission and probe errors as a live,
+    // unverified group so the cleanup deadline retains ownership of settlement.
+    return error.code !== 'ESRCH'
   }
 }
 
@@ -45,6 +45,7 @@ export function runBoundedChild(file, args, {
   maxStdoutBytes = DEFAULT_OUTPUT_BYTES,
   maxStderrBytes = DEFAULT_OUTPUT_BYTES,
   maxOutputBytes = DEFAULT_OUTPUT_BYTES * 2,
+  cleanupTimeoutMs = CLEANUP_TIMEOUT_MS,
 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
@@ -59,9 +60,14 @@ export function runBoundedChild(file, args, {
     let outputTruncated = false
     let cleanupFailure = null
     let closed = false
+    let settled = false
     let forceKill
     let cleanupDeadline
     let cleanupPoll
+    let onStdout
+    let onStderr
+    let onError
+    let onClose
 
     const details = () => ({
       stdout: clippedText(output.stdout),
@@ -74,18 +80,32 @@ export function runBoundedChild(file, args, {
       clearTimeout(cleanupDeadline)
       clearTimeout(cleanupPoll)
     }
+    const releaseResources = () => {
+      for (const [stream, listener] of [[child.stdout, onStdout], [child.stderr, onStderr]]) {
+        if (!stream) continue
+        if (listener) stream.removeListener('data', listener)
+        stream.unpipe()
+        stream.destroy()
+      }
+      if (onError) child.removeListener('error', onError)
+      if (onClose) child.removeListener('close', onClose)
+    }
     const finishFailure = extra => {
+      if (settled) return
+      settled = true
+      const error = failure(`${reason}: ${file} ${args.join(' ')}\n${details().stderr}${extra || ''}`, details())
       clearTimers()
-      reject(failure(`${reason}: ${file} ${args.join(' ')}\n${details().stderr}${extra || ''}`, details()))
+      releaseResources()
+      reject(error)
     }
     const settleAfterCleanup = () => {
-      if (!closed || !reason) return
+      if (settled || !closed || !reason) return
       if (process.platform === 'win32' || !groupExists(pgid)) {
         finishFailure(cleanupFailure ? `\nCleanup failure: ${cleanupFailure}` : '')
       }
     }
     const awaitGroupAbsence = () => {
-      if (!groupExists(pgid)) return settleAfterCleanup()
+      if (settled || !groupExists(pgid)) return settleAfterCleanup()
       cleanupPoll = setTimeout(awaitGroupAbsence, 25)
       cleanupPoll.unref()
     }
@@ -128,9 +148,10 @@ export function runBoundedChild(file, args, {
       forceKill = setTimeout(forceTerminate, graceMs)
       forceKill.unref()
       cleanupDeadline = setTimeout(() => {
-        cleanupFailure ||= `process group ${pgid} remained after ${CLEANUP_TIMEOUT_MS}ms`
-        settleAfterCleanup()
-      }, CLEANUP_TIMEOUT_MS)
+        const cleanupUnverified = `process group ${pgid} remained after ${cleanupTimeoutMs}ms`
+        cleanupFailure ||= cleanupUnverified
+        finishFailure(`\nCleanup unverified: ${cleanupUnverified}`)
+      }, cleanupTimeoutMs)
       cleanupDeadline.unref()
     }
     const deadline = setTimeout(() => beginTermination(`Child exceeded ${timeoutMs}ms`), timeoutMs)
@@ -150,15 +171,18 @@ export function runBoundedChild(file, args, {
         output.totalBytes += captured
       }
     }
-    child.stdout.on('data', chunk => capture('stdout', chunk, maxStdoutBytes))
-    child.stderr.on('data', chunk => capture('stderr', chunk, maxStderrBytes))
-    child.once('error', error => {
+    onStdout = chunk => capture('stdout', chunk, maxStdoutBytes)
+    onStderr = chunk => capture('stderr', chunk, maxStderrBytes)
+    child.stdout.on('data', onStdout)
+    child.stderr.on('data', onStderr)
+    onError = error => {
       if (!reason) {
         clearTimers()
         reject(error)
       }
-    })
-    child.once('close', (code, signal) => {
+    }
+    child.once('error', onError)
+    onClose = (code, signal) => {
       closed = true
       if (!reason) {
         clearTimers()
@@ -166,6 +190,7 @@ export function runBoundedChild(file, args, {
         return
       }
       settleAfterCleanup()
-    })
+    }
+    child.once('close', onClose)
   })
 }
