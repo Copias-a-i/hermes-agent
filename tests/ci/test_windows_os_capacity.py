@@ -66,4 +66,4 @@ def test_windows_install_capacity_bounds_disk_heavy_journeys() -> None:
         capture_output=True,
         check=True,
     )
-    assert result.stdout.strip() == '{"file_timeout": 3600, "install_slots": 2, "job_timeout": 75, "workers": 3}'
+    assert result.stdout.strip() == '{"file_timeout": 3600, "install_slots": 2, "job_timeout": 165, "workers": 2}'

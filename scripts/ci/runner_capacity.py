@@ -34,7 +34,12 @@ def capacity(lane: str, runner: str = "") -> Capacity:
             return Capacity(workers=3, file_timeout=600, job_timeout=30)
         raise ValueError(f"unsupported OS-test runner: {runner}")
     if lane == "windows-install-update":
-        return Capacity(workers=3, file_timeout=3600, install_slots=2, job_timeout=75)
+        # Hosted evidence: two disk-safe install slots completed the first two
+        # heavy files in 25–28 minutes, while a third worker only waited on a
+        # slot. Match workers to slots; ten heavy files then need five waves
+        # (~140 minutes) plus setup, so 165 minutes is bounded completion
+        # headroom without allowing a third simultaneous disk expansion.
+        return Capacity(workers=2, file_timeout=3600, install_slots=2, job_timeout=165)
     raise ValueError(f"unknown capacity lane: {lane}")
 
 

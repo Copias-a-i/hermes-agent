@@ -89,12 +89,60 @@ def validate(workflow: Path, repository: Path) -> None:
             _required_outputs(output_path)
 
 
+def validate_windows_install(workflow: Path, repository: Path) -> None:
+    """Bind native Windows workflow limits to executable capacity policy."""
+
+    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    jobs = document.get("jobs") if isinstance(document, dict) else None
+    if not isinstance(jobs, dict) or not isinstance(jobs.get("install-update"), dict):
+        raise ValueError("workflow has no install-update job")
+    job = jobs["install-update"]
+    if not isinstance(job.get("timeout-minutes"), int):
+        raise ValueError("install-update must have an explicit integer timeout")
+    steps = _steps(job)
+    capacity_steps = [step for step in steps if step.get("id") == "capacity"]
+    if len(capacity_steps) != 1 or capacity_steps[0].get("if") is not None:
+        raise ValueError("install-update must always execute one capacity step")
+    test_steps = [step for step in steps if step.get("name") == "Run Windows install + update E2E"]
+    if len(test_steps) != 1 or not isinstance(test_steps[0].get("env"), dict):
+        raise ValueError("install-update must have one test step with an environment")
+    env = test_steps[0]["env"]
+    for name, env_name in (("workers", "HERMES_TEST_WORKERS"), ("install_slots", "HERMES_E2E_INSTALL_SLOTS"),
+                           ("file_timeout", "HERMES_TEST_FILE_TIMEOUT")):
+        if env.get(env_name) != f"${{{{ steps.capacity.outputs.{name} }}}}":
+            raise ValueError(f"install-update test step must consume {name}")
+
+    policy = repository / "scripts/ci/runner_capacity.py"
+    with tempfile.TemporaryDirectory() as temporary:
+        output_path = Path(temporary) / "github-output"
+        result = subprocess.run(
+            [sys.executable, str(policy), "windows-install-update", "--github-output"],
+            cwd=repository,
+            env={**os.environ, "GITHUB_OUTPUT": str(output_path)},
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode:
+            raise ValueError(f"install capacity policy failed: {result.stderr.strip()}")
+        values = dict(line.split("=", 1) for line in output_path.read_text(encoding="utf-8").splitlines())
+    expected = {"workers", "install_slots", "file_timeout", "job_timeout"}
+    if set(values) != expected or any(not value.isdecimal() or int(value) < 1 for value in values.values()):
+        raise ValueError(f"invalid install capacity outputs: {values}")
+    if job["timeout-minutes"] != int(values["job_timeout"]):
+        raise ValueError("install-update timeout must equal capacity policy job_timeout")
+    if int(values["workers"]) > int(values["install_slots"]):
+        raise ValueError("install-update workers may not exceed disk-safe install slots")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workflow", type=Path, default=Path(".github/workflows/tests-os.yml"))
+    parser.add_argument("--windows-install-workflow", type=Path, default=Path(".github/workflows/windows-install-update-e2e.yml"))
     parser.add_argument("--repository", type=Path, default=Path.cwd())
     args = parser.parse_args()
-    validate(args.workflow.resolve(), args.repository.resolve())
+    repository = args.repository.resolve()
+    validate(args.workflow.resolve(), repository)
+    validate_windows_install(args.windows_install_workflow.resolve(), repository)
 
 
 if __name__ == "__main__":

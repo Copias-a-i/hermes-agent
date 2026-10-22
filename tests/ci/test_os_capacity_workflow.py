@@ -36,3 +36,30 @@ def test_os_test_workflow_contract_rejects_unsupported_matrix_runner(tmp_path: P
     )
     assert result.returncode != 0
     assert "capacity policy rejected macos-future" in result.stderr
+
+
+def test_capacity_workflow_contract_rejects_windows_timeout_drift(tmp_path: Path) -> None:
+    workflow = tmp_path / "windows-install-update-e2e.yml"
+    workflow.write_text(
+        (REPOSITORY / ".github/workflows/windows-install-update-e2e.yml")
+        .read_text(encoding="utf-8")
+        .replace("timeout-minutes: 165", "timeout-minutes: 75", 1),
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(CHECK),
+            "--workflow",
+            str(WORKFLOW),
+            "--windows-install-workflow",
+            str(workflow),
+            "--repository",
+            str(REPOSITORY),
+        ],
+        cwd=REPOSITORY,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode != 0
+    assert "timeout must equal capacity policy job_timeout" in result.stderr

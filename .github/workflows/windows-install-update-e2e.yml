@@ -45,8 +45,10 @@ jobs:
   install-update:
     name: Windows install.ps1 + hermes update E2E
     runs-on: windows-latest
-    # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 75
+    # Current native evidence: the disk-safe two-slot policy completed its first
+    # two heavy files in 25–28 minutes. Ten heavy files require five such waves,
+    # plus setup, so 165 minutes supplies bounded completion headroom.
+    timeout-minutes: 165
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -83,10 +85,9 @@ jobs:
           HERMES_E2E_MACHINE_ROOT: ${{ runner.temp }}\wm
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-          # A clean journey expands a multi-GB toolchain, venv, and checkout. Three file
-          # workers preserve the 75-minute deadline, while the two cross-process install slots
-          # cap disk-heavy installs. Each fixture snapshots diagnostics and deletes its
-          # profile/work root before the next wave (Machine.teardown).
+          # A clean journey expands a multi-GB toolchain, venv, and checkout. Two file
+          # workers exactly match the two cross-process install slots: no worker waits
+          # while holding host capacity, and no third disk-heavy expansion can begin.
           HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
           # The harness serializes cross-process installs to this measured disk budget even if
           # a future runner changes its default.

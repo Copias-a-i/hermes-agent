@@ -27,4 +27,4 @@ def test_os_test_lanes_keep_separate_measured_budgets() -> None:
     assert (mac_latest.workers, mac_latest.file_timeout) == (2, 600)
     assert (x64.workers, x64.file_timeout, x64.job_timeout) == (3, 600, 30)
     assert (arm.workers, arm.file_timeout, arm.job_timeout) == (2, 600, 75)
-    assert (install.workers, install.install_slots, install.file_timeout, install.job_timeout) == (3, 2, 3600, 75)
+    assert (install.workers, install.install_slots, install.file_timeout, install.job_timeout) == (2, 2, 3600, 165)
