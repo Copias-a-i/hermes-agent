@@ -33,15 +33,17 @@ concurrency:
 
 jobs:
   test:
-    # Two 32-core slices instead of one box: on one runner the suite is ~10 min of
-    # nearly fully packed work, and a single bigger runner (96-core) scaled ~1.8x for
-    # 3x the price because files contend for the shared machine. Separate machines
-    # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
-    # both slices agree on the split without a planning job.
+    # Two standard hosted slices split the file set deterministically. Each slice
+    # caps per-file processes at four, avoiding the oversubscription that caused
+    # unrelated timing failures after the private 32-core labels were removed.
     name: Run tests (${{ matrix.slice }}/2)
-    runs-on: ubuntu-latest-32-core
-    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    # Standard two-way slices exceeded 30 minutes while making continuous
+    # progress; per-file timeouts still fail real hangs before this budget.
+    timeout-minutes: 60
     strategy:
+      # Exactly two shards are scheduled together; do not fan out unboundedly.
+      max-parallel: 2
       fail-fast: false
       matrix:
         slice: [1, 2]
@@ -107,7 +109,9 @@ jobs:
           scripts/run_tests.sh
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
+          # Four workers match standard hosted capacity and leave resources for
+          # test-spawned subprocesses.
+          HERMES_TEST_WORKERS: "4"
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -127,9 +131,9 @@ jobs:
 
   e2e:
     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
-    # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+    # writer processes per test, so this lane deliberately caps file concurrency.
     if: inputs.e2e
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -193,9 +197,11 @@ jobs:
           # 32 files at once the hosted run starved live children before their
           # ready frames (empty stderr, still alive) and hit 60–120s deadlines
           # across unrelated SQLite, tenancy, provider and terminal suites.
-          # Bound the trees, not the child readiness/turn timeouts. At 4 the
-          # PTY turn and serve-SIGTERM deadlines still starved intermittently.
-          HERMES_TEST_WORKERS: "3"
+          # Bound the trees, not the child readiness/turn timeouts. At three,
+          # the hosted run 39701325791 delayed the first TUI heartbeat 1.64s
+          # and missed its five-heartbeat liveness contract in a 2.25s turn.
+          # Two leaves capacity for the live gateway/PTY process tree.
+          HERMES_TEST_WORKERS: "2"
           # Multi-process episodes (torture chamber, compaction kill -9,
           # gateway liveness, delivery exactly-once through a real gateway,
           # the cron virtual-clock soak) legitimately run past the 300 s default.
@@ -250,9 +256,12 @@ jobs:
     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
     name: e2e-upgrade (${{ matrix.shard }})
     needs: e2e-upgrade-plan
-    runs-on: ubuntu-latest-32-core
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
+      # Suite directories are independent, but limit simultaneous cold
+      # environments on standard hosted runners.
+      max-parallel: 2
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.e2e-upgrade-plan.outputs.shards) }}
