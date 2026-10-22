@@ -7,14 +7,13 @@ on:
 jobs:
   check:
     name: JS & TS checks
-    # One 32-core job replaces a 14-leg matrix. The matrix spread about 612s
-    # of check payload over 4-core runners. It paid about 371s of repeated
-    # setup to do it: 14 checkouts, 14 node installs, 14 node_modules
-    # restores.
-    #
-    # One larger runner installs one time. vitest, tsc and eslint each size
-    # their own worker pool from the core count.
-    runs-on: ubuntu-latest-32-core
+    # One standard hosted job avoids repeated checkouts, Node installs, and
+    # node_modules restores from the old matrix. The current ubuntu-latest
+    # image exposed four logical CPUs in run 39701325791. Two concurrent
+    # workspace checks leave capacity for the checks' own Vitest/TypeScript
+    # subprocesses; deriving this from availableParallelism reintroduces
+    # oversubscription when GitHub changes the image's CPU topology.
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -86,5 +85,9 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
+      - name: Select workspace-check capacity
+        id: capacity
+        run: python scripts/ci/runner_capacity.py workspace-checks --github-output
+
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency ${{ steps.capacity.outputs.workspace_checks }}

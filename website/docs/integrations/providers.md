@@ -43,7 +43,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Tencent TokenHub** | `TOKENHUB_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenhub`, aliases: `tencent`, `tokenhub`, `tencentmaas`) |
 | **Tencent TokenPlan** | `TOKENPLAN_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenplan`, aliases: `tokenplan`, `tencent-lkeap`; Anthropic Messages endpoint) |
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
-| **CommandCode** | `COMMANDCODE_API_KEY` in `~/.hermes/.env` (provider: `commandcode`, alias: `commandcode-chat`; Claude models via `commandcode-anthropic`, alias: `commandcode-claude`). Works with GOAT/Pro/Max/Provider plans (not the $1 Go plan — no API access). |
+| **CommandCode** | `COMMANDCODE_API_KEY` in `~/.hermes/.env` (provider: `commandcode`, alias: `commandcode-chat`; Claude models via `commandcode-anthropic`, alias: `commandcode-claude`). `CMD_API_KEY` remains a compatibility alias for existing models.dev setups; when both are set they must be identical, otherwise Hermes refuses to choose a key. Works with GOAT/Pro/Max/Provider plans (not the $1 Go plan — no API access). |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
 | **DeepSeek** | `DEEPSEEK_API_KEY` in `~/.hermes/.env` (provider: `deepseek`) |
 | **Hugging Face** | `HF_TOKEN` in `~/.hermes/.env` (provider: `huggingface`, aliases: `hf`) |

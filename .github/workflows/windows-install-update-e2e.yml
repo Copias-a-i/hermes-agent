@@ -44,9 +44,11 @@ concurrency:
 jobs:
   install-update:
     name: Windows install.ps1 + hermes update E2E
-    runs-on: windows-latest-32-core
-    # A typical run is ~17 min; one slow runner took 28 min for the same work (run 36295230146).
-    timeout-minutes: 75
+    runs-on: windows-latest
+    # Current native evidence: the disk-safe two-slot policy completed its first
+    # two heavy files in 25–28 minutes. Ten heavy files require five such waves,
+    # plus setup, so 165 minutes supplies bounded completion headroom.
+    timeout-minutes: 165
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -63,6 +65,11 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Select bounded Windows install capacity
+        id: capacity
+        shell: bash
+        run: python scripts/ci/runner_capacity.py windows-install-update --github-output
+
       - name: Run Windows install + update E2E
         shell: bash
         run: |
@@ -78,11 +85,16 @@ jobs:
           HERMES_E2E_MACHINE_ROOT: ${{ runner.temp }}\wm
           HERMES_E2E_PROFILES_ROOT: C:\Users
           HERMES_E2E_ARTIFACTS: ${{ runner.temp }}\win-update-e2e
-          # One journey per file, all in parallel (each is mostly network + subprocess wait).
-          HERMES_TEST_WORKERS: '6'
+          # A clean journey expands a multi-GB toolchain, venv, and checkout. Two file
+          # workers exactly match the two cross-process install slots: no worker waits
+          # while holding host capacity, and no third disk-heavy expansion can begin.
+          HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
+          # The harness serializes cross-process installs to this measured disk budget even if
+          # a future runner changes its default.
+          HERMES_E2E_INSTALL_SLOTS: ${{ steps.capacity.outputs.install_slots }}
           # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
           # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.
-          HERMES_TEST_FILE_TIMEOUT: '3600'
+          HERMES_TEST_FILE_TIMEOUT: ${{ steps.capacity.outputs.file_timeout }}
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''

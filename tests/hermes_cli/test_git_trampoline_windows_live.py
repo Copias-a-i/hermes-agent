@@ -7,9 +7,9 @@ helpers against the runner's genuine Git-for-Windows install plus a real
 broken-trampoline stand-in (a .bat that reproduces the launcher's
 "BUG (fork bomb)" guard output and refuses to run).
 
-windows-latest ships full Git for Windows at ``C:\\Program Files\\Git`` with
-the real ``mingw64\\libexec\\git-core\\git.exe`` — exactly the layout the
-locator targets — so the swap path is exercised end to end.
+The runner's Git layout is not part of the contract. The platform command
+resolver identifies its executable, then the locator verifies that executable
+is not itself a broken trampoline.
 """
 
 from __future__ import annotations
@@ -53,15 +53,17 @@ class TestGitTrampolineLive:
         bat = _make_broken_trampoline(tmp_path)
         assert update_cmd._git_is_trampoline([str(bat)]) is True
 
-    def test_locate_real_git_finds_runner_git_core(self):
+    def test_locate_real_git_finds_runner_resolved_git(self):
         from hermes_cli import update_cmd
+        from hermes_platform.resolver import locate_command
 
+        resolved = locate_command("git").command
+        assert resolved, "expected the platform resolver to find git on windows-latest"
         real = update_cmd._locate_real_git()
-        # windows-latest ships Git for Windows under Program Files with the
-        # canonical git-core layout the locator searches first.
-        assert real is not None, "expected git-core git.exe on windows-latest"
+        assert real is not None, "expected a resolver-discovered git on windows-latest"
+        assert real == Path(resolved[0])
         assert real.exists()
-        assert real.name == "git.exe"
+        assert real.name.lower() == "git.exe"
         probe = subprocess.run(
             [str(real), "--version"], capture_output=True, text=True, timeout=30
         )
@@ -78,7 +80,7 @@ class TestGitTrampolineLive:
         assert healed != broken_cmd, "broken trampoline must be swapped"
         assert healed[1:] == broken_cmd[1:], "git config args must survive"
         real = Path(healed[0])
-        assert real.exists() and real.name == "git.exe"
+        assert real.exists() and real.name.lower() == "git.exe"
         # The healed command must actually work.
         result = subprocess.run(
             healed[:1] + ["--version"], capture_output=True, text=True, timeout=30

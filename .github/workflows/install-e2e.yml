@@ -173,6 +173,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
+      outcome: ${{ steps.pick.outputs.outcome }}
     steps:
       # This job only reads tag names and trees, so take the cheap
       # checkout: no blobs (filter), no other files (sparse), but DO fetch
@@ -181,6 +182,7 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
           filter: blob:none
+          fetch-depth: 0
           fetch-tags: true
           sparse-checkout: |
             scripts/sandbox/pick-release-tags.sh
@@ -213,7 +215,27 @@ jobs:
           elif [ "$RELEASE_MODE" = true ]; then
             tags="$(python3 -m scripts.releases.pick_tags --count "$TAG_COUNT" --exclude-ref "$EXCLUDE_REF")"
           else
-            tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"
+            # A repository with no eligible release tag is a real bootstrap
+            # state, not a successful install/update test. The picker uses
+            # status 3 exclusively for that typed answer; every other error
+            # remains a failing diagnostic.
+            if tags="$(scripts/sandbox/pick-release-tags.sh --count "$TAG_COUNT")"; then
+              :
+            else
+              picker_status=$?
+              if [ "$picker_status" -eq 3 ]; then
+                echo "outcome=no_candidates" >> "$GITHUB_OUTPUT"
+                echo "tags=[]" >> "$GITHUB_OUTPUT"
+                {
+                  echo "### Install & Update E2E"
+                  echo
+                  echo "No eligible releases; install E2E not run."
+                  echo "Install E2E coverage unavailable: this repository has no eligible release tags."
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              exit "$picker_status"
+            fi
           fi
           echo "Testing updates from: $tags"
           # Annotate each tag with what its own tree supports, so run
@@ -227,12 +249,14 @@ jobs:
           done | jq -sc .)"
           echo "Annotated: $enriched"
           echo "tags=$enriched" >> "$GITHUB_OUTPUT"
+          echo "outcome=candidates" >> "$GITHUB_OUTPUT"
 
   # Expand the support matrix against the picked tags: one leg per
   # {os, install-method, update-method, tag}, split into a matrix per OS.
   generate-matrix:
     name: Expand combinations
     needs: pick-releases
+    if: needs.pick-releases.outputs.outcome == 'candidates'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -464,8 +488,39 @@ jobs:
           sparse-checkout-cone-mode: false
       - env:
           GH_TOKEN: ${{ github.token }}
+          PICK_RELEASES_RESULT: ${{ needs.pick-releases.result }}
+          PICK_RELEASES_OUTCOME: ${{ needs.pick-releases.outputs.outcome }}
+          RELEASE_TAGS: ${{ needs.pick-releases.outputs.tags }}
         run: |
           set -euo pipefail
+          unavailable() {
+            echo "::error::$1"
+            {
+              echo "### Install & Update E2E results"
+              echo
+              echo "$1"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+          if [ "$PICK_RELEASES_OUTCOME" = "no_candidates" ]; then
+            {
+              echo "### Install & Update E2E results"
+              echo
+              echo "No eligible releases; install E2E not run."
+              echo "Install E2E coverage unavailable: this repository has no eligible release tags."
+              echo "This is not a passing install-coverage result."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$PICK_RELEASES_RESULT" != "success" ]; then
+            unavailable "Result chart unavailable: Pick release tags concluded $PICK_RELEASES_RESULT, so there is no trustworthy matrix to chart. Inspect the Pick release tags job."
+          fi
+          if [ "$PICK_RELEASES_OUTCOME" != "candidates" ]; then
+            unavailable "Result chart unavailable: Pick release tags succeeded but emitted unknown outcome $PICK_RELEASES_OUTCOME. Inspect that job's output."
+          fi
+          if ! printf '%s' "$RELEASE_TAGS" | jq -e 'type == "array" and length > 0 and all(.[]; type == "object" and (.ref | type == "string") and (.desktop | type == "boolean"))' >/dev/null; then
+            unavailable "Result chart unavailable: Pick release tags succeeded but did not emit a valid non-empty tag annotation array. Inspect that job's output."
+          fi
           # The repo's GITHUB_TOKEN shares one hourly API budget with every
           # other workflow; a busy hour answered "API rate limit exceeded for
           # installation" and turned a green matrix red here. Retry, then
@@ -494,6 +549,6 @@ jobs:
             echo 'Legend: ✅ upgrade passed · known [n] = exact historical failure, see footnote · ❌ unexpected failure · pre-desktop / TODO = why a leg skipped · 📼 opens the leg player (recording + synced logs)'
             echo
             node scripts/sandbox/generate-e2e-matrix.mjs --format results \
-              --tags '${{ needs.pick-releases.outputs.tags }}' \
+              --tags "$RELEASE_TAGS" \
               --artifacts /tmp/e2e-artifacts.ndjson < /tmp/e2e-jobs.ndjson
           } >> "$GITHUB_STEP_SUMMARY"
