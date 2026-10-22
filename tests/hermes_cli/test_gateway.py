@@ -554,6 +554,29 @@ class TestRestartWaitsForApiServerPort:
 
 
 class TestStopProfileGateway:
+    def test_wait_for_terminal_stopped_state_requires_readback_and_no_live_pid(self, monkeypatch):
+        states = iter(({"gateway_state": "draining"}, {"gateway_state": "stopped"}))
+        pids = iter((None, None))
+        clock = {"now": 0.0}
+        monkeypatch.setattr("gateway.status.read_runtime_status", lambda: next(states))
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: next(pids))
+        monkeypatch.setattr(gateway.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(gateway.time, "sleep", lambda delay: clock.__setitem__("now", clock["now"] + delay))
+
+        assert gateway._wait_for_terminal_stopped_state(timeout=1.0) is True
+
+    def test_stop_profile_gateway_reports_failure_when_terminal_state_never_confirms(self, monkeypatch):
+        pid = 12345
+        running_pids = iter((pid, None))
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: next(running_pids))
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+        monkeypatch.setattr(gateway.os, "kill", lambda *_args: None)
+        monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+        monkeypatch.setattr(gateway, "_reap_unsupervised_gateway_orphans", lambda **_kwargs: False)
+        monkeypatch.setattr(gateway, "_wait_for_terminal_stopped_state", lambda: False)
+
+        assert gateway.stop_profile_gateway() is False
+
     @pytest.mark.platforms("windows")
     def test_windows_stop_drains_marker_before_force_termination(self, monkeypatch):
         """Windows must let the marker watcher run before escalating (#112750)."""
@@ -647,7 +670,7 @@ class TestStopProfileGateway:
         assert gateway.stop_profile_gateway() is True
         assert calls == [(pid, True, 100)]
 
-    def test_stop_profile_gateway_keeps_pid_file_when_process_still_running(self, monkeypatch):
+    def test_stop_profile_gateway_fails_when_process_still_running(self, monkeypatch):
         calls = {"kill": 0, "alive_probes": 0, "remove": 0, "reap_calls": 0}
 
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: 12345)
@@ -677,17 +700,18 @@ class TestStopProfileGateway:
             lambda extra_exclude=None: calls.__setitem__("reap_calls", calls["reap_calls"] + 1) or False,
         )
 
-        assert gateway.stop_profile_gateway() is True
+        assert gateway.stop_profile_gateway() is False
         assert calls["kill"] == 1          # one SIGTERM
         assert calls["remove"] == 0
-        assert calls["reap_calls"] == 1    # orphan sweep ran after kill
+        assert calls["reap_calls"] == 0    # do not sweep while the recorded gateway remains live
 
     def test_stop_profile_gateway_excludes_killed_pid_from_orphan_reap(self, monkeypatch):
         """The PID we killed must be excluded from the orphan sweep (#75936)."""
         killed_pid = 99999
         reap_extra_excludes = []
 
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: killed_pid)
+        running_pids = iter((killed_pid, None))
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: next(running_pids))
         monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: None)
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
         monkeypatch.setattr("time.sleep", lambda _: None)
@@ -699,6 +723,7 @@ class TestStopProfileGateway:
             return False
 
         monkeypatch.setattr(gateway, "_reap_unsupervised_gateway_orphans", fake_reap)
+        monkeypatch.setattr(gateway, "_wait_for_terminal_stopped_state", lambda: True)
 
         assert gateway.stop_profile_gateway() is True
         assert len(reap_extra_excludes) == 1
