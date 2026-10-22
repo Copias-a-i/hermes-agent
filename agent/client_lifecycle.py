@@ -695,8 +695,12 @@ class ClientLifecycleMixin:
             return None
         pconfig = PROVIDER_REGISTRY.get(self.provider)
         if pconfig and getattr(pconfig, "auth_type", "") == "api_key" and getattr(pconfig, "api_key_env_vars", ()):
-            # First non-empty env var wins (lazy: later vars are not read).
-            api_key = next((k for k in (get_env_prefer_dotenv(v).strip() for v in pconfig.api_key_env_vars) if k), "")
+            if getattr(self, "provider", "") in {"commandcode", "commandcode-anthropic"}:
+                from hermes_cli.providers import resolve_commandcode_api_key_env
+                api_key, _source = resolve_commandcode_api_key_env(get_env_prefer_dotenv)
+            else:
+                # First non-empty env var wins (lazy: later vars are not read).
+                api_key = next((k for k in (get_env_prefer_dotenv(v).strip() for v in pconfig.api_key_env_vars) if k), "")
             if not api_key:
                 return None
             url_var = pconfig.base_url_env_var
