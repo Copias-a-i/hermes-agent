@@ -8,14 +8,14 @@ INSTALL_UPDATE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflo
 TEST_RUNNER = Path(__file__).resolve().parents[2] / "scripts/run_tests.sh"
 
 
-def test_windows_install_update_e2e_has_a_two_journey_disk_budget():
-    """Standard hosted Windows cannot retain more than two clean install toolchains."""
+def test_windows_install_update_e2e_has_bounded_worker_and_disk_budgets():
+    """Three workers meet the deadline while at most two clean toolchains consume disk."""
     workflow = INSTALL_UPDATE_WORKFLOW.read_text(encoding="utf-8")
     runner = TEST_RUNNER.read_text(encoding="utf-8")
 
     assert "runs-on: windows-latest" in workflow
     assert "timeout-minutes: 75" in workflow
-    assert "HERMES_TEST_WORKERS: '2'" in workflow
+    assert "HERMES_TEST_WORKERS: '3'" in workflow
     assert "HERMES_E2E_INSTALL_SLOTS: '2'" in workflow
     assert "HERMES_TEST_FILE_RETRIES: '0'" in workflow
     assert "HERMES_E2E_INSTALL_SLOTS" in runner
