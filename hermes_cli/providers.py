@@ -21,6 +21,7 @@ class HermesOverlay:
     is_aggregator: bool = False
     auth_type: str = "api_key"            # api_key | oauth_device_code | oauth_external | external_process
     extra_env_vars: Tuple[str, ...] = ()  # env vars models.dev doesn't list
+    api_key_env_vars_override: Tuple[str, ...] = ()  # ordered replacement for models.dev key vars
     base_url_override: str = ""           # override if models.dev URL is wrong/missing
     base_url_env_var: str = ""            # env var for user-custom base URL
 
@@ -73,6 +74,9 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
                          base_url_env_var="GMI_BASE_URL"),
     "fireworks": HermesOverlay(extra_env_vars=("FIREWORKS_API_KEY",),
                                base_url_override="https://api.fireworks.ai/inference/v1"),
+    # Hermes introduced COMMANDCODE_API_KEY before models.dev advertised CMD_API_KEY.
+    # Keep CMD_API_KEY as a read-only compatibility alias, but publish the Hermes spelling first.
+    "commandcode": HermesOverlay(api_key_env_vars_override=("COMMANDCODE_API_KEY", "CMD_API_KEY")),
     "actual": HermesOverlay(transport="chat_completions", extra_env_vars=("ACTUAL_API_KEY",),
                             base_url_override="https://api.actual.inc/v1", base_url_env_var="ACTUAL_BASE_URL"),
     "upstage": HermesOverlay(extra_env_vars=("UPSTAGE_API_KEY",), base_url_override="https://api.upstage.ai/v1",
@@ -108,6 +112,33 @@ class ProviderDef:
     auth_type: str = "api_key"
     doc: str = ""
     source: str = ""                      # "models.dev", "hermes", "user-config"
+
+
+class ProviderCredentialConflictError(RuntimeError):
+    """Configured credential aliases disagree and cannot be selected safely."""
+
+
+_COMMANDCODE_CANONICAL_API_KEY_ENV = "COMMANDCODE_API_KEY"
+_COMMANDCODE_LEGACY_API_KEY_ENV = "CMD_API_KEY"
+
+
+def resolve_commandcode_api_key_env(read_env) -> tuple[str, str]:
+    """Resolve CommandCode's canonical key and models.dev compatibility alias.
+
+    Both names may coexist only when their non-empty values are identical.  The
+    exception intentionally names variables, never credential values.
+    """
+    canonical = str(read_env(_COMMANDCODE_CANONICAL_API_KEY_ENV) or "").strip()
+    legacy = str(read_env(_COMMANDCODE_LEGACY_API_KEY_ENV) or "").strip()
+    if canonical and legacy and canonical != legacy:
+        raise ProviderCredentialConflictError(
+            "CommandCode API key environment variables disagree; set only one or make them identical."
+        )
+    if canonical:
+        return canonical, _COMMANDCODE_CANONICAL_API_KEY_ENV
+    if legacy:
+        return legacy, _COMMANDCODE_LEGACY_API_KEY_ENV
+    return "", ""
 
 
 # -- Aliases: human-friendly / legacy names grouped by canonical (models.dev where possible) id;
@@ -199,7 +230,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     overlay = HERMES_OVERLAYS.get(canonical)
     if mdev_info is not None:
         ov = overlay or HermesOverlay()
-        env_vars = list(mdev_info.env)
+        env_vars = list(ov.api_key_env_vars_override or mdev_info.env)
         for ev in ov.extra_env_vars:
             if ev not in env_vars:
                 env_vars.append(ev)

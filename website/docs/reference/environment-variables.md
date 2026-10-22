@@ -54,6 +54,8 @@ Hermes reads environment variables from the process environment and, for user-ma
 | `MINIMAX_CN_BASE_URL` | Override MiniMax China base URL (default: `https://api.minimaxi.com/anthropic`). **Not used by `minimax-oauth`**. |
 | `KILOCODE_API_KEY` | Kilo Code API key ([kilo.ai](https://kilo.ai)) |
 | `KILOCODE_BASE_URL` | Override Kilo Code base URL (default: `https://api.kilo.ai/api/gateway`) |
+| `COMMANDCODE_API_KEY` | Canonical CommandCode API key (providers `commandcode` and `commandcode-anthropic`). |
+| `CMD_API_KEY` | Legacy compatibility alias for `COMMANDCODE_API_KEY` (CommandCode). Prefer `COMMANDCODE_API_KEY`; if both are set, their values must match. |
 | `XIAOMI_API_KEY` | Xiaomi MiMo API key ([platform.xiaomimimo.com](https://platform.xiaomimimo.com)) |
 | `XIAOMI_BASE_URL` | Override Xiaomi MiMo base URL (default: `https://api.xiaomimimo.com/v1`) |
 | `UPSTAGE_API_KEY` | Upstage API key for Solar models ([console.upstage.ai](https://console.upstage.ai/api-keys)) |
