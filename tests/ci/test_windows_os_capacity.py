@@ -4,6 +4,21 @@ from pathlib import Path
 
 
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/tests-os.yml"
+INSTALL_UPDATE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-install-update-e2e.yml"
+TEST_RUNNER = Path(__file__).resolve().parents[2] / "scripts/run_tests.sh"
+
+
+def test_windows_install_update_e2e_has_a_two_journey_disk_budget():
+    """Standard hosted Windows cannot retain more than two clean install toolchains."""
+    workflow = INSTALL_UPDATE_WORKFLOW.read_text(encoding="utf-8")
+    runner = TEST_RUNNER.read_text(encoding="utf-8")
+
+    assert "runs-on: windows-latest" in workflow
+    assert "timeout-minutes: 75" in workflow
+    assert "HERMES_TEST_WORKERS: '2'" in workflow
+    assert "HERMES_E2E_INSTALL_SLOTS: '2'" in workflow
+    assert "HERMES_TEST_FILE_RETRIES: '0'" in workflow
+    assert "HERMES_E2E_INSTALL_SLOTS" in runner
 
 
 def test_windows_lanes_use_separate_bounded_capacity_budgets():
