@@ -123,6 +123,12 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Select OS-runner capacity
+        id: capacity
+        if: runner.os == 'Windows'
+        shell: bash
+        run: python scripts/ci/runner_capacity.py windows-os --runner '${{ matrix.runner }}' --github-output
+
       - name: Run ${{ matrix.marker }} tests
         # scripts/run_tests.sh — the canonical runner, same as every other
         # lane: per-file subprocess isolation (run_tests_parallel.py). It
@@ -200,8 +206,8 @@ jobs:
           # the 300-second default by seconds in run 39701325791, so give only
           # that lane a bounded 600-second per-file deadline. ARM remains its
           # separately measured two-worker budget.
-          HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || matrix.runner == 'windows-latest' && '3' || '' }}
-          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || matrix.runner == 'windows-latest' && '600' || '' }}
+          HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ steps.capacity.outputs.file_timeout }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

@@ -97,6 +97,10 @@ jobs:
           restore-keys: |
             test-durations-
 
+      - name: Select standard-runner test capacity
+        id: capacity
+        run: python scripts/ci/runner_capacity.py linux-tests --github-output
+
       - name: Run tests
         # Per-file isolation via scripts/run_tests.sh: each test file runs
         # in its own freshly-spawned `python -m pytest <file>` subprocess
@@ -111,8 +115,8 @@ jobs:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/2
           # Four workers match standard hosted capacity and leave resources for
           # test-spawned subprocesses.
-          HERMES_TEST_WORKERS: "4"
-          HERMES_TEST_FILE_TIMEOUT: 600
+          HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ steps.capacity.outputs.file_timeout }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

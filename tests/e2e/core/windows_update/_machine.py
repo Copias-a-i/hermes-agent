@@ -63,6 +63,7 @@ from tests.e2e.core.windows._helpers import (
     kill_tree,
     wait_until,
 )
+from tests.e2e.core.windows_update._install_slots import acquire_install_slot
 from tests.fakes.fake_llm_provider import write_hermes_home
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -367,9 +368,15 @@ class Machine:
         shutil.copyfile(REPO_ROOT / "scripts" / "install.ps1", script)
         cwd = self.root / "install-cwd"
         cwd.mkdir(parents=True, exist_ok=True)
-        return self._run_logged(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-NonInteractive"],
-            "install", timeout=INSTALL_TIMEOUT, cwd=cwd)
+        # A slot is a Windows kernel semaphore, shared by the isolated pytest
+        # file workers.  It releases on normal exceptions and is reclaimed by
+        # Windows if a worker dies while its installer child is still running.
+        with acquire_install_slot() as slot:
+            if slot is not None:
+                self.timings.append((slot.diagnostic, 0.0))
+            return self._run_logged(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-NonInteractive"],
+                "install", timeout=INSTALL_TIMEOUT, cwd=cwd)
 
     def hermes(self, *args: str, label: str | None = None, timeout: float = CMD_TIMEOUT,
                env_extra: dict[str, str] | None = None) -> Run:

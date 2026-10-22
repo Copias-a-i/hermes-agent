@@ -1,37 +1,21 @@
-"""Capacity contracts for the native Windows OS-test matrix."""
+"""Executable capacity contracts for native Windows lanes."""
 
-from pathlib import Path
+from __future__ import annotations
 
+import pytest
 
-WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/tests-os.yml"
-INSTALL_UPDATE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-install-update-e2e.yml"
-TEST_RUNNER = Path(__file__).resolve().parents[2] / "scripts/run_tests.sh"
-
-
-def test_windows_install_update_e2e_has_bounded_worker_and_disk_budgets():
-    """Three workers meet the deadline while at most two clean toolchains consume disk."""
-    workflow = INSTALL_UPDATE_WORKFLOW.read_text(encoding="utf-8")
-    runner = TEST_RUNNER.read_text(encoding="utf-8")
-
-    assert "runs-on: windows-latest" in workflow
-    assert "timeout-minutes: 75" in workflow
-    assert "HERMES_TEST_WORKERS: '3'" in workflow
-    assert "HERMES_E2E_INSTALL_SLOTS: '2'" in workflow
-    assert "HERMES_TEST_FILE_RETRIES: '0'" in workflow
-    assert "HERMES_E2E_INSTALL_SLOTS" in runner
+from scripts.ci.runner_capacity import capacity
 
 
-def test_windows_lanes_use_separate_bounded_capacity_budgets():
-    """x64 and ARM preserve their individually measured process-tree budgets."""
-    source = WORKFLOW.read_text(encoding="utf-8")
+def test_windows_os_capacity_is_runner_specific_and_rejects_unknown_hosts() -> None:
+    assert capacity("windows-os", "windows-latest").workers == 3
+    assert capacity("windows-os", "windows-11-arm").workers == 2
+    with pytest.raises(ValueError, match="unknown Windows runner"):
+        capacity("windows-os", "windows-future")
 
-    arm_lane = source.index("runner: windows-11-arm")
-    assert "timeout: 75" in source[arm_lane:source.index("steps:", arm_lane)]
-    assert (
-        "HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || "
-        "matrix.runner == 'windows-latest' && '3' || '' }}"
-    ) in source
-    assert (
-        "HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || "
-        "matrix.runner == 'windows-latest' && '600' || '' }}"
-    ) in source
+
+def test_windows_install_capacity_bounds_disk_heavy_journeys() -> None:
+    policy = capacity("windows-install-update")
+    assert policy.workers == 3
+    assert policy.install_slots == 2
+    assert policy.job_timeout == 75

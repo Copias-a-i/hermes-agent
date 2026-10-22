@@ -1,26 +1,24 @@
-"""Source locks for measured standard-hosted-runner CI capacity."""
+"""Executable capacity-policy contracts for standard hosted runners."""
 
-from pathlib import Path
+from __future__ import annotations
 
-
-ROOT = Path(__file__).resolve().parents[2]
-JS_WORKFLOW = ROOT / ".github/workflows/js-tests.yml"
-WORKSPACE_RUNNER = ROOT / ".github/scripts/run-workspace-checks.mjs"
-TESTS_WORKFLOW = ROOT / ".github/workflows/tests.yml"
+from scripts.ci.runner_capacity import capacity
 
 
-def test_js_checks_use_explicit_two_check_standard_runner_budget():
-    workflow = JS_WORKFLOW.read_text(encoding="utf-8")
-    runner = WORKSPACE_RUNNER.read_text(encoding="utf-8")
-
-    assert "runs-on: ubuntu-latest" in workflow
-    assert "run: node .github/scripts/run-workspace-checks.mjs --concurrency 2" in workflow
-    assert "availableParallelism" not in runner
-    assert "Math.min(units.length, 2)" in runner
+def test_workspace_checks_have_a_two_check_budget() -> None:
+    policy = capacity("workspace-checks")
+    assert policy.workspace_checks == 2
 
 
-def test_linux_e2e_reserves_capacity_for_heartbeat_processes():
-    workflow = TESTS_WORKFLOW.read_text(encoding="utf-8")
+def test_linux_tests_preserve_workers_and_heartbeat_headroom() -> None:
+    policy = capacity("linux-tests")
+    assert (policy.workers, policy.file_timeout) == (4, 600)
 
-    assert 'HERMES_TEST_WORKERS: "2"' in workflow
-    assert 'HERMES_TEST_FILE_TIMEOUT: "900"' in workflow
+
+def test_windows_lanes_keep_separate_measured_budgets() -> None:
+    x64 = capacity("windows-os", "windows-latest")
+    arm = capacity("windows-os", "windows-11-arm")
+    install = capacity("windows-install-update")
+    assert (x64.workers, x64.file_timeout) == (3, 600)
+    assert (arm.workers, arm.file_timeout, arm.job_timeout) == (2, 600, 75)
+    assert (install.workers, install.install_slots, install.file_timeout, install.job_timeout) == (3, 2, 3600, 75)

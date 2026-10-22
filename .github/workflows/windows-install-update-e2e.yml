@@ -63,6 +63,11 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Select bounded Windows install capacity
+        id: capacity
+        shell: bash
+        run: python scripts/ci/runner_capacity.py windows-install-update --github-output
+
       - name: Run Windows install + update E2E
         shell: bash
         run: |
@@ -82,13 +87,13 @@ jobs:
           # workers preserve the 75-minute deadline, while the two cross-process install slots
           # cap disk-heavy installs. Each fixture snapshots diagnostics and deletes its
           # profile/work root before the next wave (Machine.teardown).
-          HERMES_TEST_WORKERS: '3'
+          HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
           # The harness serializes cross-process installs to this measured disk budget even if
           # a future runner changes its default.
-          HERMES_E2E_INSTALL_SLOTS: '2'
+          HERMES_E2E_INSTALL_SLOTS: ${{ steps.capacity.outputs.install_slots }}
           # test_crash_cells.py runs its whole journey (install, gateway phase, six crash cells)
           # inside one file: ~2,100 s on a normal runner, past 2,400 s on a slow one.
-          HERMES_TEST_FILE_TIMEOUT: '3600'
+          HERMES_TEST_FILE_TIMEOUT: ${{ steps.capacity.outputs.file_timeout }}
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
           OPENAI_API_KEY: ''
