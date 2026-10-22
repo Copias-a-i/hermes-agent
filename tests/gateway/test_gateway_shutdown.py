@@ -96,6 +96,42 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_does_not_signal_exit_before_terminal_state_persists(monkeypatch):
+    """The process main loop must not exit while the terminal status writer is pending.
+
+    ``start_gateway`` returns as soon as ``wait_for_shutdown`` resolves.  Setting that
+    event in the release phase used to let the process exit with the prior ``draining``
+    snapshot still on disk.  Hold the terminal persistence phase at a deterministic
+    barrier and prove that the shutdown waiter remains blocked behind it.
+    """
+    runner, _adapter = make_restart_runner()
+    persisted_phase_started = asyncio.Event()
+    allow_terminal_persist = asyncio.Event()
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def delayed_persist(self, _ctx):
+        persisted_phase_started.set()
+        await allow_terminal_persist.wait()
+
+    # Isolate the lifecycle signal ordering from teardown internals: this makes the
+    # old race deterministic instead of waiting on adapters/worker cleanup.
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_begin_teardown", no_op)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_drain_active_work", no_op)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_finalize_agents_and_adapters", no_op)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_release_runtime_state", no_op)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_quiesce_and_close_session_dbs", lambda *_args: None)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_persist_exit_state", delayed_persist)
+    stopping = asyncio.create_task(runner.stop())
+    waiting_for_exit = asyncio.create_task(runner.wait_for_shutdown())
+    await asyncio.wait_for(persisted_phase_started.wait(), timeout=1.0)
+    assert not waiting_for_exit.done(), "exit was released before terminal status persistence"
+    allow_terminal_persist.set()
+    await asyncio.wait_for(stopping, timeout=1.0)
+    await asyncio.wait_for(waiting_for_exit, timeout=1.0)
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect():
     runner, adapter = make_restart_runner()
     runner._completion_notification_batch_window = 3600

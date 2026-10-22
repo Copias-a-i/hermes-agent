@@ -2046,7 +2046,6 @@ class GatewayShutdownMixin:
         for _attr in ("_active_session_leases", "_busy_ack_ts"):  # absent on bare shutdown-path doubles
             if hasattr(self, _attr):
                 getattr(self, _attr).clear()
-        self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
         await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
@@ -2180,16 +2179,19 @@ class GatewayShutdownMixin:
         self._draining = False
         # Terminal gateway_state: "stopped", or "running" on an UNEXPECTED signal (docker restart,
         # OOM) — container_boot.py only auto-starts gateways last seen "running".
+        terminal_gateway_state = "stopped"
         if getattr(self, "_signal_initiated_shutdown", False) and not self._restart_requested:
+            terminal_gateway_state = "running"
             logger.info(
                 "Gateway stopped by an unexpected signal — persisting "
                 "gateway_state=running so container_boot auto-starts on the next boot (issue #42675)"
             )
-            self._update_runtime_status("running", self._exit_reason)
+            self._update_runtime_status(terminal_gateway_state, self._exit_reason)
         else:
-            self._update_runtime_status("stopped", self._exit_reason)
+            self._update_runtime_status(terminal_gateway_state, self._exit_reason)
+        terminal_state_confirmed = False
         try:
-            from gateway.status import flush_runtime_status_async
+            from gateway.status import flush_runtime_status_async, read_runtime_status
             # Never outlive the launchd exit budget (``_launchd_exit_timeout_s`` is set by the
             # supervised-restart path when it exists; a plain 2 s bound otherwise). The cap only
             # applies to signal-driven stops — a programmatic stop is not racing the supervisor.
@@ -2200,8 +2202,27 @@ class GatewayShutdownMixin:
                 flush_timeout = max(0.0, min(flush_timeout, budget - ctx.elapsed()))
             if not await flush_runtime_status_async(timeout=flush_timeout):
                 logger.warning("Timed out flushing terminal gateway runtime status")
+            else:
+                # A queue flush alone is not the contract: prove the terminal
+                # snapshot is visible to a fresh reader before allowing the
+                # process main loop to exit.
+                terminal_state_confirmed = (
+                    (read_runtime_status() or {}).get("gateway_state") == terminal_gateway_state
+                )
+                if not terminal_state_confirmed:
+                    logger.warning(
+                        "Terminal gateway runtime status was not visible after flush (expected %s)",
+                        terminal_gateway_state,
+                    )
         except Exception:
             logger.debug("Failed to flush terminal gateway runtime status", exc_info=True)
+        self._terminal_runtime_status_confirmed = terminal_state_confirmed
+        if not terminal_state_confirmed:
+            self._exit_reason = self._exit_reason or "Terminal gateway runtime status was not durably persisted"
+            # Preserve the service-restart verdict (75), which is already a
+            # truthful non-zero failure to the service manager.
+            if self._exit_code is None:
+                self._exit_code = 1
         _shutdown_gateway_health_export(self)
         logger.info("Gateway stopped (total teardown %.2fs)", ctx.elapsed())
 
@@ -2258,6 +2279,15 @@ class GatewayShutdownMixin:
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
         finally:
+            # ``start_gateway`` exits as soon as ``wait_for_shutdown`` resolves.  Do
+            # not unblock it from the release phase: the terminal status write is a
+            # separate asynchronous writer and must finish before the process can
+            # leave the event loop.  The finally keeps genuine teardown failures
+            # from stranding callers behind this event; their exit verdict remains
+            # responsible for reporting the failure.
+            shutdown_event = getattr(self, "_shutdown_event", None)
+            if shutdown_event is not None:
+                shutdown_event.set()
             _watchdog_done.set()
 
     async def stop(
