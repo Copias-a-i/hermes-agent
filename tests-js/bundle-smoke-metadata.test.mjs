@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { execFileSync, spawnSync } from 'node:child_process'
+import { runBoundedChild } from './helpers/bounded-child.mjs'
 import { bundleIdentity, verifyBundleStamp, verifyMacMetadata } from '../tests/install/e2e-assets/bundle-smoke-metadata.mjs'
 import { stampAssertions } from '../tests/install/e2e-assets/mac-bundled-manifest.cjs'
 import { randomBytes } from 'node:crypto'
@@ -45,7 +46,12 @@ test('identity uses the production bundled variant and exact input tokens, not i
   expect(JSON.parse(execFileSync(process.execPath, [cli, 'identity', '--commit', commit], { env: hostileEnvironment, encoding: 'utf8' }))).toEqual(tagless)
 })
 
-test('channel smoke binds the complete admitted request, not a commit-build identity or display version', () => {
+test('bounded child runner terminates a timed-out process', async () => {
+  await expect(runBoundedChild(process.execPath, ['-e', 'setInterval(() => {}, 1_000)'], { timeoutMs: 100 }))
+    .rejects.toThrow('Child exceeded 100ms')
+})
+
+test('channel smoke binds the complete admitted request, not a commit-build identity or display version', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'channel-smoke-'))
   const token = randomBytes(8).toString('hex'), sequence = 65537
   const request = { schema: 1, buildId: randomBytes(16).toString('hex'), channel: `smoke-${token}`,
@@ -57,12 +63,12 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       msixAppIdWithOrg: `Example.Smoke${token}`, cliName: `smoke-${token}`, windowsExecutableName: `smoke-${token}` } }
   const cli = path.resolve(import.meta.dirname, '../tests/install/e2e-assets/bundle-smoke-metadata.mjs')
   const requestPath = path.join(temp, 'request.json'), stampPath = path.join(temp, 'stamp.json')
-  const run = (command, args = []) => spawnSync(process.execPath,
-    [cli, command, '--commit', commit, '--channel-request', requestPath, ...args], { encoding: 'utf8' })
+  const run = (command, args = []) => runBoundedChild(process.execPath,
+    [cli, command, '--commit', commit, '--channel-request', requestPath, ...args], { timeoutMs: 5_000 })
   try {
     fs.writeFileSync(requestPath, JSON.stringify(request))
-    const identity = run('identity')
-    expect(identity.status, identity.stderr).toBe(0)
+    const identity = await run('identity')
+    expect(identity.code, identity.stderr).toBe(0)
     expect(JSON.parse(identity.stdout)).toMatchObject({ appId: request.identity.appId,
       msixIdentity: request.identity.msixAppIdWithOrg, applicationId: request.identity.appNamePascal,
       windowsVersion: request.windowsVersion })
@@ -72,8 +78,8 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       const stamp = buildStampPayload({ commit, dirty: false }, env, platform,
         { runtime: { commands: { hermes: 'bin/hermes' } } })
       fs.writeFileSync(stampPath, JSON.stringify(stamp))
-      const result = run('stamp', ['--platform', platform, '--stamp', stampPath])
-      expect(result.status, result.stderr).toBe(0)
+      const result = await run('stamp', ['--platform', platform, '--stamp', stampPath])
+      expect(result.code, result.stderr).toBe(0)
       expect(JSON.parse(result.stdout)).toBe(platform === 'darwin' ? request.version : request.windowsVersion)
       const options = { commit, platform, channelRequest: request }
       for (const key of Object.keys(request)) {
@@ -98,15 +104,15 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
           { commit, tag: null, channelRequest: request }).join(';')).toContain('channelBuild')
       }
     }
-    expect(run('identity', ['--tag', 'v1.2.3']).status).not.toBe(0)
+    expect((await run('identity', ['--tag', 'v1.2.3'])).code).not.toBe(0)
     for (const raw of ['', JSON.stringify(request).replace('{', '{"channel":"duplicate",')]) {
       fs.writeFileSync(requestPath, raw)
-      expect(run('identity').status).not.toBe(0)
+      expect((await run('identity')).code).not.toBe(0)
     }
     for (const invalid of [{ ...request, commit: 'b'.repeat(40) }, { ...request, channel: 'smoke/invalid' },
       { ...request, windowsVersion: '1.2.3.0' }, { ...request, identity: { token } }]) {
       fs.writeFileSync(requestPath, JSON.stringify(invalid))
-      expect(run('identity').status).not.toBe(0)
+      expect((await run('identity')).code).not.toBe(0)
     }
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
 }, 15_000)
