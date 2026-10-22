@@ -25,7 +25,7 @@ def _steps(job: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _required_outputs(output_path: Path) -> dict[str, int]:
     values: dict[str, int] = {}
-    for line in output_path.read_text(encoding="utf-8").splitlines():
+    for line in output_path.read_text(encoding="utf-8-sig").splitlines():
         key, separator, value = line.partition("=")
         if not separator or not value.isdecimal() or int(value) <= 0:
             raise ValueError(f"invalid capacity output: {line!r}")
@@ -38,7 +38,7 @@ def _required_outputs(output_path: Path) -> dict[str, int]:
 
 
 def validate(workflow: Path, repository: Path) -> None:
-    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    document = yaml.safe_load(workflow.read_text(encoding="utf-8-sig"))
     if not isinstance(document, dict):
         raise ValueError("workflow must be a mapping")
     jobs = document.get("jobs")
@@ -83,6 +83,7 @@ def validate(workflow: Path, repository: Path) -> None:
                 env={**os.environ, "GITHUB_OUTPUT": str(output_path)},
                 text=True,
                 capture_output=True,
+                timeout=30,
             )
             if result.returncode:
                 raise ValueError(f"capacity policy rejected {row['runner']}: {result.stderr.strip()}")
@@ -92,7 +93,7 @@ def validate(workflow: Path, repository: Path) -> None:
 def validate_windows_install(workflow: Path, repository: Path) -> None:
     """Bind native Windows workflow limits to executable capacity policy."""
 
-    document = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+    document = yaml.safe_load(workflow.read_text(encoding="utf-8-sig"))
     jobs = document.get("jobs") if isinstance(document, dict) else None
     if not isinstance(jobs, dict) or not isinstance(jobs.get("install-update"), dict):
         raise ValueError("workflow has no install-update job")
@@ -121,10 +122,11 @@ def validate_windows_install(workflow: Path, repository: Path) -> None:
             env={**os.environ, "GITHUB_OUTPUT": str(output_path)},
             text=True,
             capture_output=True,
+            timeout=30,
         )
         if result.returncode:
             raise ValueError(f"install capacity policy failed: {result.stderr.strip()}")
-        values = dict(line.split("=", 1) for line in output_path.read_text(encoding="utf-8").splitlines())
+        values = dict(line.split("=", 1) for line in output_path.read_text(encoding="utf-8-sig").splitlines())
     expected = {"workers", "install_slots", "file_timeout", "job_timeout"}
     if set(values) != expected or any(not value.isdecimal() or int(value) < 1 for value in values.values()):
         raise ValueError(f"invalid install capacity outputs: {values}")
