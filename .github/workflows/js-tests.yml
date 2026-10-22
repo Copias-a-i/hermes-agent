@@ -8,9 +8,11 @@ jobs:
   check:
     name: JS & TS checks
     # One standard hosted job avoids repeated checkouts, Node installs, and
-    # node_modules restores from the old matrix. The workspace check runner
-    # owns bounded check-level concurrency so this lane does not rely on a
-    # larger private runner.
+    # node_modules restores from the old matrix. The current ubuntu-latest
+    # image exposed four logical CPUs in run 39701325791. Two concurrent
+    # workspace checks leave capacity for the checks' own Vitest/TypeScript
+    # subprocesses; deriving this from availableParallelism reintroduces
+    # oversubscription when GitHub changes the image's CPU topology.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -84,4 +86,4 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2

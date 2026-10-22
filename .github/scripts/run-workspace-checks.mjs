@@ -17,8 +17,6 @@
 // `--concurrency N` sets the limit. `--list` prints the units and exits.
 
 import { execFileSync, spawn } from 'node:child_process'
-import { availableParallelism } from 'node:os'
-
 const IS_CI = Boolean(process.env.GITHUB_ACTIONS)
 const NPM = process.platform === 'win32' ? 'npm.cmd' : 'npm'
 
@@ -91,10 +89,10 @@ async function main() {
   }
 
   const flagIdx = argv.indexOf('--concurrency')
-  const concurrency = Math.max(
-    1,
-    flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, availableParallelism()),
-  )
+  // CI supplies a measured, explicit budget. Keep the local fallback
+  // conservative as well: workspace checks launch their own worker pools, so
+  // host CPU count is not a safe check-level concurrency budget.
+  const concurrency = Math.max(1, flagIdx !== -1 ? Number(argv[flagIdx + 1]) : Math.min(units.length, 2))
 
   console.log(`running ${units.length} checks, up to ${concurrency} at a time:`)
   for (const u of units) console.log(`  ${u.pkg} :: ${u.script}`)

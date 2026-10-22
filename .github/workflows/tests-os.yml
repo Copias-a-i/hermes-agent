@@ -195,12 +195,13 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          # Four isolated file workers leave CPU and memory for the PowerShell
-          # process trees on standard x64 hosted Windows runners. ARM uses two
-          # workers after the 4-worker lane delayed an update child past its
-          # 60-second discovery window; its per-file deadline stays bounded.
-          HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || matrix.marker == 'windows' && '4' || '' }}
-          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || '' }}
+          # Standard x64 has four vCPUs. Three isolated file workers reserve a
+          # core for nested PowerShell trees; the two known x64 files exceeded
+          # the 300-second default by seconds in run 39701325791, so give only
+          # that lane a bounded 600-second per-file deadline. ARM remains its
+          # separately measured two-worker budget.
+          HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || matrix.runner == 'windows-latest' && '3' || '' }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || matrix.runner == 'windows-latest' && '600' || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
