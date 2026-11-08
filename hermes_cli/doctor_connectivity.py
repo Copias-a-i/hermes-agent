@@ -175,10 +175,21 @@ def _probe_anthropic() -> ProbeResult:
 
 
 def _probe_apikey_provider(pname, env_vars, default_url, base_env, supports_health_check) -> ProbeResult:
-    key = next((k for k in (os.getenv(ev, "") for ev in env_vars) if k), "")
+    label = pname.ljust(20)
+    if {"COMMANDCODE_API_KEY", "CMD_API_KEY"}.issubset(env_vars):
+        from hermes_cli.providers import ProviderCredentialConflictError, resolve_commandcode_api_key_env
+        try:
+            key, _source = resolve_commandcode_api_key_env(os.getenv)
+        except ProviderCredentialConflictError:
+            return _row(
+                pname, "fail", "(conflicting API key aliases)",
+                ["CommandCode API key environment variables disagree; set only one or make them identical."],
+                label=label,
+            )
+    else:
+        key = next((k for k in (os.getenv(ev, "") for ev in env_vars) if k), "")
     if not key:
         return _skip(pname)
-    label = pname.ljust(20)
     if not supports_health_check:
         return _row(pname, "ok", "(key configured)", label=label)
     try:
