@@ -153,11 +153,37 @@ class TestCommandCodeFetchModelsPickerContract:
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
-        assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+        assert chat.api_key_env_vars == ("COMMANDCODE_API_KEY", "CMD_API_KEY")
 
         anth = resolve_provider_full("commandcode-anthropic", {}, [])
         assert anth is not None and anth.id == "commandcode-anthropic"
         assert anth.transport == "anthropic_messages"
+        assert anth.api_key_env_vars == ("COMMANDCODE_API_KEY", "CMD_API_KEY")
+
+    @pytest.mark.parametrize(
+        ("env", "expected_source"),
+        [
+            ({}, ""),
+            ({"COMMANDCODE_API_KEY": "canonical"}, "COMMANDCODE_API_KEY"),
+            ({"CMD_API_KEY": "legacy"}, "CMD_API_KEY"),
+            ({"COMMANDCODE_API_KEY": "same", "CMD_API_KEY": "same"}, "COMMANDCODE_API_KEY"),
+        ],
+    )
+    def test_resolve_commandcode_api_key_env_matrix(self, env, expected_source):
+        """Canonical key wins; the models.dev spelling remains a safe compatibility alias."""
+        from hermes_cli.providers import resolve_commandcode_api_key_env
+
+        value, source = resolve_commandcode_api_key_env(env.get)
+
+        assert value == (env.get(expected_source, "") if expected_source else "")
+        assert source == expected_source
+
+    def test_resolve_commandcode_api_key_rejects_conflicting_alias_values(self):
+        """Ambiguous CommandCode credentials must not silently select either value."""
+        from hermes_cli.providers import ProviderCredentialConflictError, resolve_commandcode_api_key_env
+
+        with pytest.raises(ProviderCredentialConflictError, match="CommandCode API key environment variables disagree"):
+            resolve_commandcode_api_key_env({"COMMANDCODE_API_KEY": "canonical", "CMD_API_KEY": "legacy"}.get)
 
 
 # ── base_url endpoint override ───────────────────────────────────────────────
