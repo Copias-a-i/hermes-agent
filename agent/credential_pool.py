@@ -2943,7 +2943,6 @@ def _env_key_var_candidates(env_vars: List[str], entries: List[PooledCredential]
                 names.append(env_name)
     return names
 
-
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     seed = _Seeder(provider, entries)
     # Copilot's singleton branch exchanges the raw ghu_ OAuth token for the
@@ -2952,7 +2951,6 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # ("not available for integrator copilot-language-server").
     if provider == "copilot":
         return seed.result
-
     if provider == "openrouter":
         for env_var in _env_key_var_candidates(["OPENROUTER_API_KEY"], entries):
             token = get_env_prefer_dotenv(env_var)
@@ -2962,20 +2960,23 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             ):
                 _warn_env_ingestion_once(provider, env_var)
         return seed.result
-
     pconfig = PROVIDER_REGISTRY.get(provider)
     if not pconfig or pconfig.auth_type != AUTH_TYPE_API_KEY:
         return seed.result
-
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
-
+    if provider in {"commandcode", "commandcode-anthropic"}:
+        from hermes_cli.providers import resolve_commandcode_api_key_env
+        token, env_var = resolve_commandcode_api_key_env(get_env_prefer_dotenv)
+        if token:
+            base_url = env_url or pconfig.inference_base_url
+            seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
+        return seed.result
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
         env_vars = ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
     env_vars = _env_key_var_candidates(env_vars, entries)
-
     resolve_base_url = _ENV_BASE_URL_RESOLVERS.get(provider)
     for env_var in env_vars:
         token = get_env_prefer_dotenv(env_var)
@@ -2986,7 +2987,6 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             base_url = resolve_base_url(token, pconfig.inference_base_url, env_url)
         seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
     return seed.result
-
 
 def _prune_stale_seeded_entries(
     entries: List[PooledCredential],
