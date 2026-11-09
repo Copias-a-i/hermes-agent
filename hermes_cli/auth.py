@@ -376,7 +376,6 @@ def _model_level_key_env(provider_id: str) -> str:
         return ""
     return str(model_cfg.get("key_env") or model_cfg.get("api_key_env") or "").strip()
 
-
 def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
@@ -396,7 +395,6 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
     # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation in .env isn't shadowed by
     # a stale shell export inherited from a parent process (Codex CLI, test runners, etc.).
     from hermes_cli.config import get_env_value_prefer_dotenv
-
     # Desktop-saved credential pointer: the settings UI persists registry-provider keys as
     # model.key_env → $HERMES_HOME/.env (e.g. HERMES_CUSTOM_LMSTUDIO_API_KEY) while keeping
     # model.provider on the registry id, so the pointer must be honored here or the UI-saved
@@ -406,7 +404,9 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
         val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(key_env), key_env)
         if val:
             return val, key_env
-
+    if provider_id in {"commandcode", "commandcode-anthropic"}:
+        from hermes_cli.providers import resolve_commandcode_api_key_env
+        return resolve_commandcode_api_key_env(get_env_value_prefer_dotenv)
     for env_var in pconfig.api_key_env_vars:
         val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(env_var), env_var)
         if val:
@@ -2151,13 +2151,8 @@ def _external_process_spec(
                or str(getattr(profile, "process_command", "") or ""))
     raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
     args = shlex.split(raw_args) if raw_args else list(getattr(profile, "process_args", ()) or [])
-    resolved = shutil.which(command) if command else None
-    if command and not resolved:
-        # A GUI/service launch (LaunchAgent, Desktop backend) has a bare PATH: probe Claude Code's
-        # install prefixes as the Anthropic adapter does. Any other command stays PATH-only.
-        from agent.anthropic_adapter import find_claude_code_cli
-        resolved = find_claude_code_cli(command)
-    return command, args, base_url, resolved, command_env_vars
+    from hermes_cli.auth_external_process import resolve_external_process_command
+    return command, args, base_url, resolve_external_process_command(command), command_env_vars
 
 
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
