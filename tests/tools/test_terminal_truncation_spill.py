@@ -31,11 +31,12 @@ class TestTruncationSpill:
         assert r["output_total_chars"] > 2000
         p = Path(r["full_output_path"])
         assert p.exists()
-        full = p.read_text()
-        record = next(json.loads(line) for line in full.splitlines() if json.loads(line)["id"] == r["full_output_record_id"])
-        assert "marker_head" in record["output"] and "marker_tail" in record["output"]
+        from tools.environments.spill_journal import reconstruct_record
+        record = reconstruct_record(p, r["full_output_record_id"])
+        assert record is not None
+        assert "marker_head" in record and "marker_tail" in record
         # The spill contains rows that were cut from the visible window.
-        assert "row_100 " in record["output"]
+        assert "row_100 " in record
         assert "read_file" in r["truncation_note"]
 
     def test_small_output_has_no_metadata(self, small_cap):

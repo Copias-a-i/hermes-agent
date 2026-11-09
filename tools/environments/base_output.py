@@ -63,20 +63,31 @@ class _BoundedOutputCollector:
             # Disk trouble must never break command execution.
             self._spill_path = None
 
-    def close_spill(self) -> str | None:
-        """Atomically append one completed spill record and return its shard path."""
+    def close_spill(self, redact: Callable[[str], str]) -> tuple[str, str] | None:
+        """Redact in memory, then atomically append one completed spill record.
+
+        The journal intentionally receives only the redacted value.  In
+        particular, staging raw overflow on disk and redacting it later leaves
+        a secret-bearing crash window.
+        """
         with self._lock:
             if self._spill_journal is None:
                 return None
             try:
-                closed = self._spill_journal.close()
+                closed = self._spill_journal.close(redact)
             except OSError:
                 closed = None
             self._spill_journal = None
             if closed is None:
                 return None
             path, self._spill_record_id = closed
-            return path
+            return closed
+
+    def discard_spill(self) -> None:
+        """Drop unredacted in-memory overflow when ownership is handed off."""
+        with self._lock:
+            self._spill_journal = None
+            self._spill_record_id = None
 
     @property
     def spill_record_id(self) -> str | None:
@@ -191,13 +202,15 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
 
 
 def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None) -> dict:
-    """Assemble a wait result, attaching spill metadata when overflow occurred."""
+    """Assemble a wait result, retaining an unpersisted spill until redaction.
+
+    Foreground finalization is the first point with the command-aware redactor.
+    Keep overflow solely in this process until then; no raw byte reaches disk.
+    """
     result = {"output": rendered, "returncode": returncode}
-    spill = collector.close_spill()
-    if spill:
+    if collector._spill_journal is not None:
         result["output_total_chars"] = collector.total_chars
-        result["full_output_path"] = spill
-        result["full_output_record_id"] = collector.spill_record_id
+        result["_spill_collector"] = collector
     return result
 
 

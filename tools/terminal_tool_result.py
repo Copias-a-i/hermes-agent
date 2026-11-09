@@ -167,27 +167,21 @@ def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Opti
     return None
 
 
-def _redact_spill_file(path, total_chars, command, record_id=None) -> list[tuple[str, Any]]:
-    """Return a redacted handle for exactly one completed spill record.
-
-    Daily journals are shared by concurrent terminal calls, so replacing the
-    whole file would expose or lose unrelated records. A record id is mandatory
-    for journal-backed spills and redaction occurs under the journal lock.
-    """
-    if not path or not record_id:
+def _redact_spill_file(collector, total_chars, command) -> list[tuple[str, Any]]:
+    """Redact the in-memory spill fully before its first persistent write."""
+    if collector is None:
         return []
     try:
         from agent.redact import redact_terminal_output
         from tools.ansi_strip import strip_ansi
-        from tools.environments.spill_journal import redact_record
-
-        if not redact_record(
-            Path(path), record_id,
+        closed = collector.close_spill(
             lambda raw: redact_terminal_output(strip_ansi(raw), command),
-        ):
+        )
+        if closed is None:
             return []
+        path, record_id = closed
     except Exception:
-        logger.debug("spill redaction failed; dropping shared-journal handle", exc_info=True)
+        logger.debug("spill redaction failed; dropping in-memory spill", exc_info=True)
         return []
     note = ("Output exceeded the capture window (head+tail shown). "
             f"Full output ({total_chars:,} chars) is record {record_id} in {path} — search "
@@ -269,8 +263,7 @@ def finalize_foreground_result(
         ("cwd", changed_cwd),
         ("environment_recreated", _ENV_RECREATED_NOTE if result.get("environment_recreated") else None),
         *_redact_spill_file(
-            result.get("full_output_path"), result.get("output_total_chars"), command,
-            result.get("full_output_record_id"),
+            result.get("_spill_collector"), result.get("output_total_chars"), command,
         ),
         ("verification_evidence", _verification_evidence(
             command, command_cwd, session_id or task_id or effective_task_id or "default",
