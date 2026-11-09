@@ -184,8 +184,9 @@ def _redact_spill_file(collector, total_chars, command) -> list[tuple[str, Any]]
         logger.debug("spill redaction failed; dropping in-memory spill", exc_info=True)
         return []
     note = ("Output exceeded the capture window (head+tail shown). "
-            f"Full output ({total_chars:,} chars) is record {record_id} in {path} — search "
-            "for that record id, then page the matching line instead of re-running the command.")
+            f"Full output ({total_chars:,} chars) is record {record_id} in {path} — use read_file "
+            "to page the journal, search for that record id, then page the matching line instead "
+            "of re-running the command.")
     return [
         ("output_total_chars", total_chars),
         ("full_output_path", path),

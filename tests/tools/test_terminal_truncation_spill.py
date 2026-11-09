@@ -54,15 +54,22 @@ class TestTruncationSpill:
         full = p.read_text()
         assert "a1B2c3D4e5F6g7H8i9J0a1B2c3D4e5F6g7H8i9J0" not in full
 
-    def test_old_spills_cleaned(self, small_cap, tmp_path):
+    def test_legacy_spills_are_archived_before_removal(self, small_cap, tmp_path):
         spill_dir = tmp_path / ".hermes" / "cache" / "terminal-output"
         spill_dir.mkdir(parents=True, exist_ok=True)
-        stale = spill_dir / "out-1-2-dead.log"
-        stale.write_text("old")
-        os.utime(stale, (1, 1))
+        legacy = spill_dir / "out-1-2-dead.log"
+        legacy.write_text("legacy evidence")
+        os.utime(legacy, (1, 1))
         json.loads(terminal_tool(
             "python3 -c \"[print('z'*90) for i in range(200)]\"", task_id="t-spill-4"))
-        assert not stale.exists()
+        assert not legacy.exists()
+        bundles = list((spill_dir / "archive").glob("legacy-spills-*.tar.gz"))
+        assert len(bundles) == 1
+        import tarfile
+        with tarfile.open(bundles[0], "r:gz") as archive:
+            extracted = archive.extractfile("out-1-2-dead.log")
+            assert extracted is not None
+            assert extracted.read() == b"legacy evidence"
 
     @pytest.mark.platforms("linux")
     def test_failed_command_still_gets_spill(self, small_cap):

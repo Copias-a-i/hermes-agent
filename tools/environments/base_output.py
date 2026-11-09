@@ -23,9 +23,6 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 # never evicts, so bounded and unbounded modes share one code path.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
-_SPILL_MAX_AGE_S = 7 * 86400
-
-
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text. When ``spill_path`` is set,
     the FULL stream is also teed to that file once eviction begins (up to ``_SPILL_CAP_CHARS``)
@@ -188,14 +185,6 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
     try:
         spill_dir = get_hermes_home() / "cache" / "terminal-output"
         spill_path = spill_dir / f"out-{int(time.time())}-{os.getpid()}-{id(proc) & 0xffff:x}.log"
-        if spill_dir.is_dir():
-            cutoff = time.time() - _SPILL_MAX_AGE_S
-            for old in spill_dir.glob("out-*.log"):
-                try:
-                    if old.stat().st_mtime < cutoff:
-                        old.unlink()
-                except OSError:
-                    pass
     except Exception:
         spill_path = None
     return _BoundedOutputCollector(capture_limit, spill_path=spill_path)
