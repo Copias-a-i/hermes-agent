@@ -29,6 +29,7 @@ from agent.credential_persistence import (
     sanitize_borrowed_credential_payload,
 )
 import hermes_cli.auth as auth_mod
+from hermes_cli.auth_oauth_grants import owned_profile_reads_root_state
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     PROVIDER_REGISTRY,
@@ -2639,14 +2640,8 @@ def _seed_anthropic_singletons(seed: _Seeder) -> None:
 
 def _seed_nous_singleton(seed: _Seeder, auth_store: Dict[str, Any]) -> None:
     state, source_path = _load_provider_state_with_source(auth_store, "nous")
-    global_root = _global_auth_file_path()
-    if (
-        source_path is not None and global_root is not None and _same_path(source_path, global_root)
-        and _store_owns_pool_provider(auth_store, "nous")
-    ):
-        # A profile that owns local nous rows (e.g. an agent_key-only row surviving a
-        # fork strip/heal) must not re-seed root's single-use refresh token into its
-        # own pool from the global-root fallback: that re-creates the fork.
+    if owned_profile_reads_root_state(auth_store, "nous", source_path):
+        # e.g. an agent_key-only row surviving a fork strip/heal
         return
     has_runtime_material = bool(
         isinstance(state, dict)
@@ -2808,7 +2803,9 @@ def _seed_tokens_singleton(seed: _Seeder, auth_store: Dict[str, Any]) -> None:
     Codex CLI / VS Code causes refresh_token_reused races. Adoption is an
     explicit one-time prompt via `hermes auth openai-codex`.
     """
-    state = _load_provider_state(auth_store, seed.provider)
+    state, source_path = _load_provider_state_with_source(auth_store, seed.provider)
+    if owned_profile_reads_root_state(auth_store, seed.provider, source_path):
+        return
     tokens = state.get("tokens") if isinstance(state, dict) else None
     if not (isinstance(tokens, dict) and tokens.get("access_token")):
         return
@@ -2946,7 +2943,6 @@ def _env_key_var_candidates(env_vars: List[str], entries: List[PooledCredential]
                 names.append(env_name)
     return names
 
-
 def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool, Set[str]]:
     seed = _Seeder(provider, entries)
     # Copilot's singleton branch exchanges the raw ghu_ OAuth token for the
@@ -2955,7 +2951,6 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # ("not available for integrator copilot-language-server").
     if provider == "copilot":
         return seed.result
-
     if provider == "openrouter":
         for env_var in _env_key_var_candidates(["OPENROUTER_API_KEY"], entries):
             token = get_env_prefer_dotenv(env_var)
@@ -2965,20 +2960,23 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             ):
                 _warn_env_ingestion_once(provider, env_var)
         return seed.result
-
     pconfig = PROVIDER_REGISTRY.get(provider)
     if not pconfig or pconfig.auth_type != AUTH_TYPE_API_KEY:
         return seed.result
-
     env_url = ""
     if pconfig.base_url_env_var:
         env_url = get_env_prefer_dotenv(pconfig.base_url_env_var).rstrip("/")
-
+    if provider in {"commandcode", "commandcode-anthropic"}:
+        from hermes_cli.providers import resolve_commandcode_api_key_env
+        token, env_var = resolve_commandcode_api_key_env(get_env_prefer_dotenv)
+        if token:
+            base_url = env_url or pconfig.inference_base_url
+            seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
+        return seed.result
     env_vars = list(pconfig.api_key_env_vars)
     if provider == "anthropic":
         env_vars = ["ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]
     env_vars = _env_key_var_candidates(env_vars, entries)
-
     resolve_base_url = _ENV_BASE_URL_RESOLVERS.get(provider)
     for env_var in env_vars:
         token = get_env_prefer_dotenv(env_var)
@@ -2989,7 +2987,6 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             base_url = resolve_base_url(token, pconfig.inference_base_url, env_url)
         seed.upsert(f"env:{env_var}", _env_payload(env_var=env_var, token=token, base_url=base_url))
     return seed.result
-
 
 def _prune_stale_seeded_entries(
     entries: List[PooledCredential],

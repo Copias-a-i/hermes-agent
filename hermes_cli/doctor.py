@@ -51,6 +51,7 @@ from hermes_cli.doctor_tools import (
 )
 from hermes_cli.doctor_state import (
     _check_checkpoint_store,
+    _check_cron_store,
     _check_directory_structure,
     _check_memory_provider,
     _check_profiles,
@@ -63,7 +64,7 @@ _PROVIDER_ENV_HINTS = (
     "OPENAI_BASE_URL", "NOUS_API_KEY", "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "KIMI_API_KEY",
     "KIMI_CN_API_KEY", "GMI_API_KEY", "FIREWORKS_API_KEY", "ACTUAL_API_KEY", "ACTUAL_BASE_URL", "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY", "KILOCODE_API_KEY", "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "HF_TOKEN",
-    "AI_GATEWAY_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY", "COMMANDCODE_API_KEY", "XIAOMI_API_KEY",
+    "AI_GATEWAY_API_KEY", "OPENCODE_ZEN_API_KEY", "OPENCODE_GO_API_KEY", "COMMANDCODE_API_KEY", "CMD_API_KEY", "XIAOMI_API_KEY",
     "TOKENHUB_API_KEY", "TOKENPLAN_API_KEY",
 )
 
@@ -117,7 +118,8 @@ DOCTOR_CHECKS = (
     ('xAI Model Retirement (May 15, 2026)', _check_xai_retirement),
     ('Session Reset (timers removed Sep 7, 2026)', _check_retired_session_reset),
     ('Auth Providers', _check_auth_providers),
-    ('Directory Structure', _check_directory_structure), (None, _check_state_db), (None, _check_checkpoint_store),
+    ('Directory Structure', _check_directory_structure), (None, _check_state_db), (None, _check_cron_store),
+    (None, _check_checkpoint_store),
     (None, _check_gateway_supervision), (None, _check_command_installation),
     ('External Tools', _check_git_and_rg), (None, _check_terminal_backend), (None, _check_node_and_browser),
     (None, _check_npm_audit), ('API Connectivity', _check_api_connectivity),

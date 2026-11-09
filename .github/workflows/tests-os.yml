@@ -12,7 +12,7 @@ name: OS-specific tests
 # is where those markers actually execute:
 #
 #   macos    → ``-m platforms``    on macos-latest
-#   windows  → ``-m platforms``    on windows-latest-32-core and windows-latest-32-arm-core
+#   windows  → ``-m platforms``    on windows-latest and windows-11-arm
 #
 # (tests/conftest.py's ``pytest_collection_modifyitems`` hook skips
 # foreign-OS ``platforms(...)`` markers on each host, so one shared ``-m
@@ -75,6 +75,9 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout || 30 }}
     strategy:
+      # Keep standard hosted Windows/macOS capacity bounded even when all
+      # platform lanes are selected by a push.
+      max-parallel: 2
       fail-fast: false
       matrix:
         include:
@@ -89,12 +92,17 @@ jobs:
             marker: macos
             slice: 2/2
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            runner: windows-latest
             marker: windows
           - name: Windows-only tests (arm64)
-            runner: windows-latest-32-arm-core
+            runner: windows-11-arm
             marker: windows
-            timeout: 60
+            # The 4-worker ARM run took 37 minutes wall time (including 23
+            # minutes of native dependency setup) and starved a real
+            # PowerShell child past its 60-second discovery window. Two file
+            # workers preserve every marked test while reserving CPU for its
+            # nested process trees; 75 minutes remains a bounded job budget.
+            timeout: 75
     steps:
       - name: Checkout code
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
@@ -114,6 +122,14 @@ jobs:
           extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
           test-environment: 'true'
           prune-python-cache: true
+
+      - name: Select bounded OS-runner capacity
+        # Every matrix row consumes these outputs. runner_capacity.py rejects an
+        # unknown runner before tests launch, so a newly added OS cannot fall
+        # back to os.cpu_count() or an empty workflow expression.
+        id: capacity
+        shell: bash
+        run: python scripts/ci/runner_capacity.py os-tests --runner '${{ matrix.runner }}' --github-output
 
       - name: Run ${{ matrix.marker }} tests
         # scripts/run_tests.sh — the canonical runner, same as every other
@@ -140,6 +156,19 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+
+          # Do not silently let an empty Actions output reach the test runner:
+          # its default would otherwise derive parallelism from os.cpu_count().
+          if [ "${HERMES_TEST_CAPACITY_VALIDATED:-false}" != "true" ]; then
+            echo "::error::capacity policy did not emit required bounded outputs"
+            exit 1
+          fi
+          case "${HERMES_TEST_WORKERS:-}" in
+            ''|*[!0-9]*) echo "::error::invalid bounded worker count"; exit 1 ;;
+          esac
+          case "${HERMES_TEST_FILE_TIMEOUT:-}" in
+            ''|*[!0-9]*) echo "::error::invalid bounded file timeout"; exit 1 ;;
+          esac
 
           LIST="${RUNNER_TEMP:-.}/selected-tests.txt"
 
@@ -187,7 +216,14 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          # Standard x64 has four vCPUs. Three isolated file workers reserve a
+          # core for nested PowerShell trees; the two known x64 files exceeded
+          # the 300-second default by seconds in run 39701325791, so give only
+          # that lane a bounded 600-second per-file deadline. ARM remains its
+          # separately measured two-worker budget.
+          HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ steps.capacity.outputs.file_timeout }}
+          HERMES_TEST_CAPACITY_VALIDATED: ${{ steps.capacity.outputs.workers != '' && steps.capacity.outputs.file_timeout != '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
@@ -221,10 +257,10 @@ jobs:
     # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
     name: Windows E2E (real processes)
     if: inputs.e2e
-    # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
-    # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
-    # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: windows-latest-32-core
+    # Standard hosted Windows has limited CPU for these process-tree tests.
+    # Four isolated file workers avoid startup starvation while the 25-minute
+    # job budget preserves headroom for cold setup and cleanup.
+    runs-on: windows-latest
     timeout-minutes: 25
     steps:
       - name: Checkout code
@@ -245,7 +281,7 @@ jobs:
             -m "platforms and integration" -v --tb=short -rA
         env:
           HERMES_E2E_STRICT_ACCEPTANCE: ${{ inputs.strict_acceptance }}
-          HERMES_TEST_WORKERS: '6'
+          HERMES_TEST_WORKERS: '4'
           HERMES_TEST_FILE_TIMEOUT: '900'
           HERMES_TEST_FILE_RETRIES: '0'
           OPENROUTER_API_KEY: ''
