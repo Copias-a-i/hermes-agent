@@ -227,6 +227,20 @@ def test_receipt_waits_without_an_open_send_window_and_is_recorded_at_once_when_
     assert not receipt.exists() and len(marks.rows) == 1
 
 
+def test_receipt_age_uses_the_shared_metrics_clock(marks, monkeypatch):
+    """A receipt created under the store's clock must not be judged against wall time from another day."""
+    clock = {"now": datetime(2026, 10, 6, 9, tzinfo=timezone.utc)}
+    monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
+    fresh = _park(marks.home, _receipt(
+        finished_at=int((clock["now"] - timedelta(days=6, hours=23)).timestamp()),
+        started_at=int((clock["now"] - timedelta(days=6, hours=23, minutes=1)).timestamp()),
+    ))
+
+    install_run.report_pending_installs(marks.home)
+
+    assert not fresh.exists() and len(marks.rows) == 1
+
+
 def test_unreadable_and_week_old_receipts_are_deleted_unreported(marks):
     directory = install_run.pending_installs_dir(marks.home)
     directory.mkdir(parents=True)

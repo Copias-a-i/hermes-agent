@@ -2840,9 +2840,8 @@ OPTIONAL_ENV_VARS = {
         "Qwen Portal base URL (leave empty for default)", None, password=False),
     "OPENCODE_ZEN_API_KEY": _prov("OpenCode Zen API key (pay-as-you-go access to curated models)",
         "OpenCode Zen API key", "https://opencode.ai/auth"),
-    "COMMANDCODE_API_KEY": _prov(
-        "CommandCode API key (GOAT/Pro/Max/Provider plans — 30+ models via one key)",
-        "CommandCode API key", "https://commandcode.ai/studio/"),
+    "COMMANDCODE_API_KEY": _prov("CommandCode API key (GOAT/Pro/Max/Provider plans — 30+ models via one key)", "CommandCode API key", "https://commandcode.ai/studio/"),
+    "CMD_API_KEY": _prov("Legacy alias for COMMANDCODE_API_KEY (prefer the canonical name)", "CommandCode API key (legacy alias)", "https://commandcode.ai/studio/", advanced=True),
     "OPENCODE_ZEN_BASE_URL": _base_url("OpenCode Zen"),
     "OPENCODE_GO_API_KEY": _prov("OpenCode Go API key ($10/month subscription for open models)",
         "OpenCode Go API key", "https://opencode.ai/auth"),
