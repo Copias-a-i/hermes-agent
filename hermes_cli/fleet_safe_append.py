@@ -74,7 +74,25 @@ def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path, 
 
 
 @contextmanager
-def _target_parent(root: Path, components: tuple[str, ...]) -> Iterator[int]:
+def _root_directory(root: Path) -> Iterator[int]:
+    """Open an absolute vault root without following any ancestor symlink."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    try:
+        fd = os.open(root.anchor, flags)
+        for component in root.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+    except OSError as exc:
+        raise SafeAppendError("vault root must be an existing non-symlink directory") from exc
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _target_parent(root_fd: int, components: tuple[str, ...]) -> Iterator[int]:
     """Traverse and pin every parent component without following symlinks.
 
     Every component is opened relative to the preceding descriptor with
@@ -82,10 +100,7 @@ def _target_parent(root: Path, components: tuple[str, ...]) -> Iterator[int]:
     post-validation pathname is ever followed during the write.
     """
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
-    try:
-        fd = os.open(root, flags)
-    except OSError as exc:
-        raise SafeAppendError("target parent changed after validation") from exc
+    fd = root_fd
     try:
         for component in components:
             if component in ("", ".", ".."):
@@ -97,11 +112,13 @@ def _target_parent(root: Path, components: tuple[str, ...]) -> Iterator[int]:
                 next_fd = os.open(component, flags, dir_fd=fd)
             except OSError as exc:
                 raise SafeAppendError("target parent changed after validation") from exc
-            os.close(fd)
+            if fd != root_fd:
+                os.close(fd)
             fd = next_fd
         yield fd
     finally:
-        os.close(fd)
+        if fd != root_fd:
+            os.close(fd)
 
 
 def _read_target(parent_fd: int, name: str) -> tuple[str, os.stat_result | None]:
@@ -160,8 +177,8 @@ def _locked(parent_fd: int, target_name: str, timeout_seconds: float) -> Iterato
     lock_name = _lock_name(target_name)
     try:
         metadata = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise SafeAppendError("lock path must be a regular non-symlink file")
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise SafeAppendError("lock path must be a regular unlinked file")
     except FileNotFoundError:
         pass
     try:
@@ -173,7 +190,14 @@ def _locked(parent_fd: int, target_name: str, timeout_seconds: float) -> Iterato
         )
     except OSError as exc:
         raise SafeAppendError("lock path must be a regular non-symlink file") from exc
-    deadline = time.monotonic() + timeout_seconds
+    try:
+        opened_metadata = os.fstat(fd)
+        if not stat.S_ISREG(opened_metadata.st_mode) or opened_metadata.st_nlink != 1:
+            raise SafeAppendError("lock path must be a regular unlinked file")
+        deadline = time.monotonic() + timeout_seconds
+    except Exception:
+        os.close(fd)
+        raise
     try:
         while True:
             try:
@@ -228,21 +252,25 @@ def append_markdown(
             "entry appears to contain a secret; refuse durable note write"
         )
     marker = f"{_MARKER_PREFIX}{dedupe_key} -->"
-    with _target_parent(safe_root, parent_components) as parent_fd:
-        with _locked(parent_fd, safe_target.name, timeout_seconds):
-            current, previous = _read_target(parent_fd, safe_target.name)
-            if marker in current:
-                return AppendResult(False, safe_target, dedupe_key)
-            document = _normalize_markdown(current) if current else ""
-            payload = _normalize_markdown(entry)
-            next_text = _normalize_markdown(
-                (document.rstrip("\n") + "\n\n" if document else "") + marker + "\n" + payload
-            )
-            _publish(
-                parent_fd,
-                safe_target.name,
-                next_text,
-                (previous.st_mode & 0o777) if previous else 0o600,
-                before_replace,
-            )
+    with _root_directory(safe_root) as root_fd:
+        with _target_parent(root_fd, parent_components) as parent_fd:
+            with _locked(parent_fd, safe_target.name, timeout_seconds):
+                current, previous = _read_target(parent_fd, safe_target.name)
+                if marker in current:
+                    return AppendResult(False, safe_target, dedupe_key)
+                document = _normalize_markdown(current) if current else ""
+                payload = _normalize_markdown(entry)
+                next_text = _normalize_markdown(
+                    (document.rstrip("\n") + "\n\n" if document else "")
+                    + marker
+                    + "\n"
+                    + payload
+                )
+                _publish(
+                    parent_fd,
+                    safe_target.name,
+                    next_text,
+                    (previous.st_mode & 0o777) if previous else 0o600,
+                    before_replace,
+                )
     return AppendResult(True, safe_target, dedupe_key)

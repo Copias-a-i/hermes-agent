@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 from pathlib import Path
 
 import pytest
 
 from hermes_cli.fleet_safe_append import (
     SafeAppendError,
+    _root_directory,
     _target_parent,
     _validate_target,
     append_markdown,
@@ -108,9 +110,10 @@ def test_parent_swap_after_validation_is_refused(tmp_path: Path) -> None:
     moved = root / "moved"
     parent.rename(moved)
     parent.symlink_to(outside, target_is_directory=True)
-    with pytest.raises(SafeAppendError):
-        with _target_parent(safe_root, components):
-            pass
+    with _root_directory(safe_root) as root_fd:
+        with pytest.raises(SafeAppendError):
+            with _target_parent(root_fd, components):
+                pass
 
 
 def test_secret_payload_and_stale_dead_owner_lock_are_handled(tmp_path: Path) -> None:
@@ -142,3 +145,33 @@ def test_lock_symlink_cannot_escape_pinned_parent(tmp_path: Path) -> None:
 
     assert outside.read_text(encoding="utf-8") == "do not touch\n"
     assert not target.exists()
+
+
+def test_lock_hardlink_cannot_overwrite_outside_file(tmp_path: Path) -> None:
+    root = tmp_path / "vault"
+    target = root / "jarvis" / "working-memory.md"
+    outside = tmp_path / "outside-lock"
+    root.mkdir()
+    target.parent.mkdir()
+    outside.write_text("do not touch\n", encoding="utf-8")
+    os.link(outside, target.with_name(f".{target.name}.fleet-safe.lock"))
+
+    with pytest.raises(SafeAppendError, match="regular unlinked"):
+        append_markdown(root, target, "## attack", dedupe_key="lock-hardlink")
+
+    assert outside.read_text(encoding="utf-8") == "do not touch\n"
+    assert not target.exists()
+
+
+def test_symlinked_root_ancestor_is_rejected(tmp_path: Path) -> None:
+    actual_parent = tmp_path / "actual"
+    linked_parent = tmp_path / "linked"
+    root = linked_parent / "vault"
+    actual_parent.mkdir()
+    linked_parent.symlink_to(actual_parent, target_is_directory=True)
+    (actual_parent / "vault").mkdir()
+
+    with pytest.raises(SafeAppendError, match="vault root"):
+        append_markdown(root, "jarvis/working-memory.md", "## attack", dedupe_key="root-link")
+
+    assert not (actual_parent / "vault" / "jarvis" / "working-memory.md").exists()
