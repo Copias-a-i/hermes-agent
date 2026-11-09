@@ -126,3 +126,19 @@ def test_secret_payload_and_stale_dead_owner_lock_are_handled(tmp_path: Path) ->
     assert result.appended is True
     assert "pid=" in lock.read_text(encoding="ascii")
     assert "dead-owner" in target.read_text(encoding="utf-8-sig")
+
+
+def test_lock_symlink_cannot_escape_pinned_parent(tmp_path: Path) -> None:
+    root = tmp_path / "vault"
+    target = root / "jarvis" / "working-memory.md"
+    outside = tmp_path / "outside-lock"
+    root.mkdir()
+    target.parent.mkdir()
+    outside.write_text("do not touch\n", encoding="utf-8")
+    target.with_name(f".{target.name}.fleet-safe.lock").symlink_to(outside)
+
+    with pytest.raises(SafeAppendError, match="lock path"):
+        append_markdown(root, target, "## attack", dedupe_key="lock-symlink")
+
+    assert outside.read_text(encoding="utf-8") == "do not touch\n"
+    assert not target.exists()

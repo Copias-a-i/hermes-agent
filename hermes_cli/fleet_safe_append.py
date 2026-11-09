@@ -140,28 +140,39 @@ def _publish(parent_fd: int, name: str, text: str, mode: int, before_replace: Ca
             pass
 
 
-def _safe_lock_path(target: Path) -> Path:
-    lock = target.with_name(f".{target.name}.fleet-safe.lock")
-    if lock.exists() and (lock.is_symlink() or not lock.is_file()):
-        raise SafeAppendError("lock path must be a regular non-symlink file")
-    return lock
+def _lock_name(target_name: str) -> str:
+    return f".{target_name}.fleet-safe.lock"
 
 
 @contextmanager
-def _locked(target: Path, timeout_seconds: float) -> Iterator[None]:
-    """Serialize updates and recover stale *metadata* only after its owner dies.
+def _locked(parent_fd: int, target_name: str, timeout_seconds: float) -> Iterator[None]:
+    """Serialize updates using a lock opened beneath a pinned parent directory.
 
     Kernel flock ownership is released on process crash, so a stale lock file is
-    harmless.  Its PID metadata is retained solely for inspection; after taking
-    the kernel lock we replace stale/dead-owner metadata, never a live owner.
+    harmless. Its PID metadata is retained solely for inspection. The lock name
+    is opened through ``parent_fd`` with ``O_NOFOLLOW``: no lock-file creation or
+    opening can follow an attacker-controlled absolute target path.
     """
     try:
         import fcntl
     except ImportError as exc:
         raise SafeAppendError("fleet-safe append requires POSIX file locking") from exc
-    lock = _safe_lock_path(target)
-    lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock_name = _lock_name(target_name)
+    try:
+        metadata = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SafeAppendError("lock path must be a regular non-symlink file")
+    except FileNotFoundError:
+        pass
+    try:
+        fd = os.open(
+            lock_name,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+    except OSError as exc:
+        raise SafeAppendError("lock path must be a regular non-symlink file") from exc
     deadline = time.monotonic() + timeout_seconds
     try:
         while True:
@@ -170,7 +181,9 @@ def _locked(target: Path, timeout_seconds: float) -> Iterator[None]:
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for fleet-safe lock: {lock}")
+                    raise TimeoutError(
+                        f"timed out waiting for fleet-safe lock: {lock_name}"
+                    )
                 time.sleep(0.01)
         # Kernel flock ownership is authoritative.  Once acquired, any existing
         # metadata is from a prior holder; overwrite it without unlinking the
@@ -215,8 +228,8 @@ def append_markdown(
             "entry appears to contain a secret; refuse durable note write"
         )
     marker = f"{_MARKER_PREFIX}{dedupe_key} -->"
-    with _locked(safe_target, timeout_seconds):
-        with _target_parent(safe_root, parent_components) as parent_fd:
+    with _target_parent(safe_root, parent_components) as parent_fd:
+        with _locked(parent_fd, safe_target.name, timeout_seconds):
             current, previous = _read_target(parent_fd, safe_target.name)
             if marker in current:
                 return AppendResult(False, safe_target, dedupe_key)
