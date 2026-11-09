@@ -45,48 +45,42 @@ class _BoundedOutputCollector:
         self._total_chars = 0
         self._lock = threading.Lock()
         self._spill_path = spill_path
-        self._spill_fh: IO[str] | None = None
-        self._spill_chars = 0
-        self._spill_capped = False
+        self._spill_journal = None
+        self._spill_record_id: str | None = None
 
     def _maybe_spill(self, text: str) -> None:
-        """Tee ``text`` to the spill file (opened lazily on first overflow)."""
-        if self._spill_path is None or self._spill_capped:
+        """Buffer one overflow then atomically append it to the UTC daily journal."""
+        if self._spill_path is None:
             return
         try:
-            if self._spill_fh is None:
-                from tools.spill_safety import ensure_spill_dir, open_exclusive
-                # Raw pre-redaction output: private perms + symlink-refusing
-                # exclusive create (a planted link must fail, never redirect).
-                ensure_spill_dir(self._spill_path.parent, private=True)
-                self._spill_fh = open_exclusive(self._spill_path, private=True, errors="replace")
-                # Backfill what's retained so the file holds the stream from byte 0.
-                backlog = "".join(self._head) + "".join(self._tail)
-                self._spill_fh.write(backlog)
-                self._spill_chars = len(backlog)
-            budget = self._SPILL_CAP_CHARS - self._spill_chars
-            if budget <= 0 or len(text) > budget:
-                self._spill_fh.write(text[:max(0, budget)])
-                self._spill_fh.write("\n... [spill capped at 5,000,000 chars] ...\n")
-                self._spill_capped = True
-            else:
-                self._spill_fh.write(text)
-            self._spill_chars += len(text)
+            if self._spill_journal is None:
+                from tools.environments.spill_journal import RollingSpillJournal
+                # Backfill what is retained so the journal record starts at byte 0.
+                self._spill_journal = RollingSpillJournal(self._spill_path.parent)
+                self._spill_journal.append("".join(self._head) + "".join(self._tail))
+            self._spill_journal.append(text)
         except OSError:
             # Disk trouble must never break command execution.
-            self._spill_capped = True
+            self._spill_path = None
 
-    def close_spill(self) -> "str | None":
-        """Close the spill file and return its path if it was used."""
+    def close_spill(self) -> str | None:
+        """Atomically append one completed spill record and return its shard path."""
         with self._lock:
-            if self._spill_fh is None:
+            if self._spill_journal is None:
                 return None
             try:
-                self._spill_fh.close()
+                closed = self._spill_journal.close()
             except OSError:
-                pass
-            self._spill_fh = None
-            return str(self._spill_path)
+                closed = None
+            self._spill_journal = None
+            if closed is None:
+                return None
+            path, self._spill_record_id = closed
+            return path
+
+    @property
+    def spill_record_id(self) -> str | None:
+        return self._spill_record_id
 
     @property
     def buffered_chars(self) -> int:
@@ -105,7 +99,7 @@ class _BoundedOutputCollector:
             text_len = len(text)
             # Spill tee activates at the first overflow, then mirrors every chunk.
             if self._spill_path is not None and (
-                self._spill_fh is not None or self._total_chars + text_len > self.max_chars):
+                self._spill_journal is not None or self._total_chars + text_len > self.max_chars):
                 self._maybe_spill(text)
             self._total_chars += text_len
             start = 0
@@ -203,6 +197,7 @@ def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, ret
     if spill:
         result["output_total_chars"] = collector.total_chars
         result["full_output_path"] = spill
+        result["full_output_record_id"] = collector.spill_record_id
     return result
 
 
