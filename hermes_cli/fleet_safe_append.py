@@ -11,7 +11,8 @@ from __future__ import annotations
 import errno
 import os
 import re
-import tempfile
+import secrets
+import stat
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -58,7 +59,7 @@ def _inside(root: Path, candidate: Path) -> bool:
         return False
 
 
-def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path]:
+def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path, tuple[int, int]]:
     root_path = Path(root)
     if not root_path.exists() or root_path.is_symlink() or not root_path.is_dir():
         raise SafeAppendError("vault root must be an existing non-symlink directory")
@@ -79,7 +80,67 @@ def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path]:
         raise SafeAppendError("fleet-safe append accepts Markdown notes only")
     if candidate.exists() and (candidate.is_symlink() or not candidate.is_file()):
         raise SafeAppendError("target must be a regular non-symlink file")
-    return real_root, normalized
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_stat = parent.stat()
+    return real_root, normalized, (parent_stat.st_dev, parent_stat.st_ino)
+
+
+@contextmanager
+def _target_parent(target: Path, expected_identity: tuple[int, int]) -> Iterator[int]:
+    """Pin the verified directory before any target mutation.
+
+    Every target-file operation below is relative to this descriptor.  A later
+    pathname swap (including replacing the parent with a symlink) therefore
+    cannot redirect the temp file or publication outside the verified parent.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
+    try:
+        fd = os.open(target.parent, flags)
+    except OSError as exc:
+        raise SafeAppendError("target parent changed after validation") from exc
+    try:
+        actual = os.fstat(fd)
+        if (actual.st_dev, actual.st_ino) != expected_identity:
+            raise SafeAppendError("target parent changed after validation")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _read_target(parent_fd: int, name: str) -> tuple[str, os.stat_result | None]:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return "", None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise SafeAppendError("target must be a regular non-symlink file")
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    with os.fdopen(fd, "r", encoding="utf-8-sig", newline="") as handle:
+        return handle.read(), metadata
+
+
+def _publish(parent_fd: int, name: str, text: str, mode: int, before_replace: Callable[[], None] | None) -> None:
+    temporary = f".{name}.{secrets.token_hex(12)}.tmp"
+    fd = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        mode,
+        dir_fd=parent_fd,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if before_replace:
+            before_replace()
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
 
 
 def _safe_lock_path(target: Path) -> Path:
@@ -147,7 +208,7 @@ def append_markdown(
     when a caller crashes after rename but before recording its own receipt.
     ``before_replace`` is a test seam; exceptions leave the original untouched.
     """
-    _, safe_target = _validate_target(root, target)
+    _, safe_target, parent_identity = _validate_target(root, target)
     if not _DEDUPE_KEY.fullmatch(dedupe_key):
         raise SafeAppendError("dedupe key must be 1-160 safe identifier characters")
     if not isinstance(entry, str) or not entry.strip():
@@ -158,44 +219,20 @@ def append_markdown(
         )
     marker = f"{_MARKER_PREFIX}{dedupe_key} -->"
     with _locked(safe_target, timeout_seconds):
-        current = ""
-        if safe_target.exists():
-            current = safe_target.read_text(encoding="utf-8-sig")
-        if marker in current:
-            return AppendResult(False, safe_target, dedupe_key)
-        document = _normalize_markdown(current) if current else ""
-        payload = _normalize_markdown(entry)
-        next_text = (
-            (document.rstrip("\n") + "\n\n" if document else "")
-            + marker
-            + "\n"
-            + payload
-        )
-        next_text = _normalize_markdown(next_text)
-        safe_target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        mode = (safe_target.stat().st_mode & 0o777) if safe_target.exists() else 0o600
-        fd, temporary = tempfile.mkstemp(
-            prefix=f".{safe_target.name}.", dir=safe_target.parent
-        )
-        try:
-            os.fchmod(fd, mode)
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(next_text)
-                handle.flush()
-                os.fsync(handle.fileno())
-            if before_replace:
-                before_replace()
-            os.replace(temporary, safe_target)
-            directory_fd = os.open(
-                safe_target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        with _target_parent(safe_target, parent_identity) as parent_fd:
+            current, previous = _read_target(parent_fd, safe_target.name)
+            if marker in current:
+                return AppendResult(False, safe_target, dedupe_key)
+            document = _normalize_markdown(current) if current else ""
+            payload = _normalize_markdown(entry)
+            next_text = _normalize_markdown(
+                (document.rstrip("\n") + "\n\n" if document else "") + marker + "\n" + payload
             )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+            _publish(
+                parent_fd,
+                safe_target.name,
+                next_text,
+                (previous.st_mode & 0o777) if previous else 0o600,
+                before_replace,
+            )
     return AppendResult(True, safe_target, dedupe_key)

@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli.fleet_safe_append import SafeAppendError, append_markdown
+from hermes_cli.fleet_safe_append import (
+    SafeAppendError,
+    _target_parent,
+    _validate_target,
+    append_markdown,
+)
 
 
 def _append_worker(root: str, target: str, index: int) -> None:
@@ -31,7 +36,7 @@ def test_concurrent_processes_keep_every_entry_and_valid_markdown(
     for process in processes:
         process.join(15)
         assert process.exitcode == 0
-    body = target.read_text(encoding="utf-8")
+    body = target.read_text(encoding="utf-8-sig")
     assert body.endswith("\n")
     assert "\r" not in body
     for n in range(24):
@@ -45,7 +50,7 @@ def test_duplicate_retry_is_a_noop_and_normalizes_newlines(tmp_path: Path) -> No
     target = root / "jarvis" / "working-memory.md"
     first = append_markdown(root, target, "## hello\r\nline\r\n", dedupe_key="turn-1")
     second = append_markdown(root, target, "## changed", dedupe_key="turn-1")
-    body = target.read_text(encoding="utf-8")
+    body = target.read_text(encoding="utf-8-sig")
     assert first.appended is True
     assert second.appended is False
     assert body.count("fleet-safe-append:turn-1") == 1
@@ -67,7 +72,7 @@ def test_crash_before_rename_preserves_prior_file(tmp_path: Path) -> None:
         append_markdown(
             root, target, "## new", dedupe_key="crash-case", before_replace=crash
         )
-    assert target.read_text(encoding="utf-8") == "# existing\n"
+    assert target.read_text(encoding="utf-8-sig") == "# existing\n"
     assert not [
         path
         for path in target.parent.glob(f".{target.name}.*")
@@ -89,7 +94,23 @@ def test_symlink_attack_and_root_escape_are_rejected(tmp_path: Path) -> None:
         append_markdown(
             root, root / ".." / "escape.md", "## attack", dedupe_key="escape"
         )
-    assert outside.read_text(encoding="utf-8") == "outside\n"
+    assert outside.read_text(encoding="utf-8-sig") == "outside\n"
+
+
+def test_parent_swap_after_validation_is_refused(tmp_path: Path) -> None:
+    root = tmp_path / "vault"
+    parent = root / "jarvis"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    parent.mkdir()
+    outside.mkdir()
+    _, target, identity = _validate_target(root, parent / "working-memory.md")
+    moved = root / "moved"
+    parent.rename(moved)
+    parent.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(SafeAppendError, match="changed after validation"):
+        with _target_parent(target, identity):
+            pass
 
 
 def test_secret_payload_and_stale_dead_owner_lock_are_handled(tmp_path: Path) -> None:
@@ -104,4 +125,4 @@ def test_secret_payload_and_stale_dead_owner_lock_are_handled(tmp_path: Path) ->
     result = append_markdown(root, target, "## recovered", dedupe_key="dead-owner")
     assert result.appended is True
     assert "pid=" in lock.read_text(encoding="ascii")
-    assert "dead-owner" in target.read_text(encoding="utf-8")
+    assert "dead-owner" in target.read_text(encoding="utf-8-sig")
