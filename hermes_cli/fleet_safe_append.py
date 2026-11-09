@@ -51,57 +51,54 @@ def _normalize_markdown(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
 
 
-def _inside(root: Path, candidate: Path) -> bool:
-    try:
-        candidate.relative_to(root)
-        return True
-    except ValueError:
-        return False
-
-
-def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path, tuple[int, int]]:
-    root_path = Path(root)
+def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path, tuple[str, ...]]:
+    root_path = Path(os.path.abspath(root))
     if not root_path.exists() or root_path.is_symlink() or not root_path.is_dir():
         raise SafeAppendError("vault root must be an existing non-symlink directory")
-    real_root = root_path.resolve(strict=True)
     candidate = Path(target)
     if not candidate.is_absolute():
         candidate = root_path / candidate
-    # Resolve only the parent: the target can be newly created, but no parent
-    # symlink may point the write out of the declared vault root.
-    parent = candidate.parent.resolve(strict=False)
-    normalized = parent / candidate.name
-    if not _inside(real_root, parent) or not _inside(real_root, normalized):
+    normalized = Path(os.path.abspath(candidate))
+    try:
+        relative = normalized.relative_to(root_path)
+    except ValueError:
         raise SafeAppendError("target escapes the declared vault root")
     if (
         candidate.suffix.lower() != ".md"
         or candidate.suffix.lower() in _SECRET_DESTINATION_SUFFIXES
     ):
         raise SafeAppendError("fleet-safe append accepts Markdown notes only")
-    if candidate.exists() and (candidate.is_symlink() or not candidate.is_file()):
+    if normalized.exists() and (normalized.is_symlink() or not normalized.is_file()):
         raise SafeAppendError("target must be a regular non-symlink file")
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    parent_stat = parent.stat()
-    return real_root, normalized, (parent_stat.st_dev, parent_stat.st_ino)
+    return root_path, normalized, relative.parent.parts
 
 
 @contextmanager
-def _target_parent(target: Path, expected_identity: tuple[int, int]) -> Iterator[int]:
-    """Pin the verified directory before any target mutation.
+def _target_parent(root: Path, components: tuple[str, ...]) -> Iterator[int]:
+    """Traverse and pin every parent component without following symlinks.
 
-    Every target-file operation below is relative to this descriptor.  A later
-    pathname swap (including replacing the parent with a symlink) therefore
-    cannot redirect the temp file or publication outside the verified parent.
+    Every component is opened relative to the preceding descriptor with
+    ``O_NOFOLLOW``.  Creation uses ``mkdirat`` semantics, so no absolute or
+    post-validation pathname is ever followed during the write.
     """
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW
     try:
-        fd = os.open(target.parent, flags)
+        fd = os.open(root, flags)
     except OSError as exc:
         raise SafeAppendError("target parent changed after validation") from exc
     try:
-        actual = os.fstat(fd)
-        if (actual.st_dev, actual.st_ino) != expected_identity:
-            raise SafeAppendError("target parent changed after validation")
+        for component in components:
+            if component in ("", ".", ".."):
+                raise SafeAppendError("target escapes the declared vault root")
+            try:
+                next_fd = os.open(component, flags, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(component, mode=0o700, dir_fd=fd)
+                next_fd = os.open(component, flags, dir_fd=fd)
+            except OSError as exc:
+                raise SafeAppendError("target parent changed after validation") from exc
+            os.close(fd)
+            fd = next_fd
         yield fd
     finally:
         os.close(fd)
@@ -208,7 +205,7 @@ def append_markdown(
     when a caller crashes after rename but before recording its own receipt.
     ``before_replace`` is a test seam; exceptions leave the original untouched.
     """
-    _, safe_target, parent_identity = _validate_target(root, target)
+    safe_root, safe_target, parent_components = _validate_target(root, target)
     if not _DEDUPE_KEY.fullmatch(dedupe_key):
         raise SafeAppendError("dedupe key must be 1-160 safe identifier characters")
     if not isinstance(entry, str) or not entry.strip():
@@ -219,7 +216,7 @@ def append_markdown(
         )
     marker = f"{_MARKER_PREFIX}{dedupe_key} -->"
     with _locked(safe_target, timeout_seconds):
-        with _target_parent(safe_target, parent_identity) as parent_fd:
+        with _target_parent(safe_root, parent_components) as parent_fd:
             current, previous = _read_target(parent_fd, safe_target.name)
             if marker in current:
                 return AppendResult(False, safe_target, dedupe_key)

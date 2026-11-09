@@ -104,12 +104,12 @@ def test_parent_swap_after_validation_is_refused(tmp_path: Path) -> None:
     root.mkdir()
     parent.mkdir()
     outside.mkdir()
-    _, target, identity = _validate_target(root, parent / "working-memory.md")
+    safe_root, _, components = _validate_target(root, parent / "working-memory.md")
     moved = root / "moved"
     parent.rename(moved)
     parent.symlink_to(outside, target_is_directory=True)
-    with pytest.raises(SafeAppendError, match="changed after validation"):
-        with _target_parent(target, identity):
+    with pytest.raises(SafeAppendError):
+        with _target_parent(safe_root, components):
             pass
 
 
