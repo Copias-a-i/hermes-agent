@@ -9,7 +9,6 @@ sidecar ``flock`` while it reads, deduplicates, writes, fsyncs and renames.
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 import re
 import tempfile
@@ -83,18 +82,6 @@ def _validate_target(root: str | Path, target: str | Path) -> tuple[Path, Path]:
     return real_root, normalized
 
 
-def _is_live_pid(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
 def _safe_lock_path(target: Path) -> Path:
     lock = target.with_name(f".{target.name}.fleet-safe.lock")
     if lock.exists() and (lock.is_symlink() or not lock.is_file()):
@@ -110,6 +97,10 @@ def _locked(target: Path, timeout_seconds: float) -> Iterator[None]:
     harmless.  Its PID metadata is retained solely for inspection; after taking
     the kernel lock we replace stale/dead-owner metadata, never a live owner.
     """
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise SafeAppendError("fleet-safe append requires POSIX file locking") from exc
     lock = _safe_lock_path(target)
     lock.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -123,19 +114,9 @@ def _locked(target: Path, timeout_seconds: float) -> Iterator[None]:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for fleet-safe lock: {lock}")
                 time.sleep(0.01)
-        os.lseek(fd, 0, os.SEEK_SET)
-        old = os.read(fd, 256).decode("ascii", "ignore").strip()
-        try:
-            old_pid = (
-                int(old.split("\n", 1)[0].split("=", 1)[1])
-                if old.startswith("pid=")
-                else 0
-            )
-        except ValueError:
-            old_pid = 0
-        # A live PID can only be metadata from a prior holder: we own flock now.
-        # Do not unlink that path; overwrite atomically while the descriptor is locked.
-        _ = _is_live_pid(old_pid)
+        # Kernel flock ownership is authoritative.  Once acquired, any existing
+        # metadata is from a prior holder; overwrite it without unlinking the
+        # locked inode.
         payload = f"pid={os.getpid()}\nacquired_unix={time.time():.6f}\n".encode(
             "ascii"
         )
@@ -179,7 +160,7 @@ def append_markdown(
     with _locked(safe_target, timeout_seconds):
         current = ""
         if safe_target.exists():
-            current = safe_target.read_text(encoding="utf-8")
+            current = safe_target.read_text(encoding="utf-8-sig")
         if marker in current:
             return AppendResult(False, safe_target, dedupe_key)
         document = _normalize_markdown(current) if current else ""
