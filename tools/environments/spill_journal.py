@@ -175,7 +175,7 @@ def _append_daily(directory: Path, day: str, payload: bytes) -> Path:
 
 def reconstruct_record(path: Path, record_id: str) -> str | None:
     """Read one framed record deterministically; reject incomplete/corrupt frames."""
-    frames = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    frames = [json.loads(line) for line in path.read_text(encoding="utf-8-sig").splitlines()]
     selected = [frame for frame in frames if frame.get("id") == record_id]
     if not selected:
         return None
@@ -260,7 +260,7 @@ def migrate_legacy_spills(directory: Path, redact: Callable[[str], str] = lambda
         from tools.ansi_strip import strip_ansi
         contents = [
             (path, redact(redact_terminal_output(
-                strip_ansi(path.read_text(encoding="utf-8", errors="replace")), "env")))
+                strip_ansi(path.read_text(encoding="utf-8-sig", errors="replace")), "env")))
             for path in legacy
         ]
         if not all(isinstance(content, str) for _, content in contents):
