@@ -167,30 +167,37 @@ def _failure_hint(command: str, returncode: int, output: str, exit_note) -> Opti
     return None
 
 
-def _redact_spill_file(path, total_chars, command) -> list[tuple[str, Any]]:
-    """Spill handle so the model can read the omitted middle instead of
-    re-running. The collector wrote it raw; redact it with the same pass so no
-    secret persists unmasked on disk. On failure drop the handle (and file)."""
-    if not path:
+def _redact_spill_file(path, total_chars, command, record_id=None) -> list[tuple[str, Any]]:
+    """Return a redacted handle for exactly one completed spill record.
+
+    Daily journals are shared by concurrent terminal calls, so replacing the
+    whole file would expose or lose unrelated records. A record id is mandatory
+    for journal-backed spills and redaction occurs under the journal lock.
+    """
+    if not path or not record_id:
         return []
     try:
         from agent.redact import redact_terminal_output
         from tools.ansi_strip import strip_ansi
-        from tools.spill_safety import write_text_exclusive
-        raw_spill = Path(path).read_text(encoding="utf-8-sig", errors="replace")
-        # lstat-checked unlink + exclusive create: the redacted copy can't
-        # be diverted through a symlink planted since the collector's write.
-        write_text_exclusive(Path(path), redact_terminal_output(strip_ansi(raw_spill), command),
-                             private=True, overwrite=True, errors="replace")
+        from tools.environments.spill_journal import redact_record
+
+        if not redact_record(
+            Path(path), record_id,
+            lambda raw: redact_terminal_output(strip_ansi(raw), command),
+        ):
+            return []
     except Exception:
-        logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
-        with _quiet("spill unlink"):
-            Path(path).unlink()
+        logger.debug("spill redaction failed; dropping shared-journal handle", exc_info=True)
         return []
     note = ("Output exceeded the capture window (head+tail shown). "
-            f"Full output ({total_chars:,} chars) saved to {path} — search it with "
-            "search_files or page it with read_file instead of re-running the command.")
-    return [("output_total_chars", total_chars), ("full_output_path", path), ("truncation_note", note)]
+            f"Full output ({total_chars:,} chars) is record {record_id} in {path} — search "
+            "for that record id, then page the matching line instead of re-running the command.")
+    return [
+        ("output_total_chars", total_chars),
+        ("full_output_path", path),
+        ("full_output_record_id", record_id),
+        ("truncation_note", note),
+    ]
 
 
 def _verification_evidence(command, cwd, session_id, returncode, output) -> Optional[dict]:
@@ -261,7 +268,10 @@ def finalize_foreground_result(
     optional_fields: list[tuple[str, Any]] = [
         ("cwd", changed_cwd),
         ("environment_recreated", _ENV_RECREATED_NOTE if result.get("environment_recreated") else None),
-        *_redact_spill_file(result.get("full_output_path"), result.get("output_total_chars"), command),
+        *_redact_spill_file(
+            result.get("full_output_path"), result.get("output_total_chars"), command,
+            result.get("full_output_record_id"),
+        ),
         ("verification_evidence", _verification_evidence(
             command, command_cwd, session_id or task_id or effective_task_id or "default",
             returncode, output)),

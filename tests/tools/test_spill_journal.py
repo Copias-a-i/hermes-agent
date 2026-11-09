@@ -3,7 +3,8 @@ import os
 import threading
 from pathlib import Path
 
-from tools.environments.spill_journal import RollingSpillJournal, migrate_legacy_spills
+from tools.environments.spill_journal import RollingSpillJournal, migrate_legacy_spills, redact_record
+from tools.terminal_tool_result import _redact_spill_file
 
 
 def _records(path: Path):
@@ -29,6 +30,39 @@ def test_close_is_idempotent_and_uses_one_daily_shard(tmp_path):
     assert _records(shard) == [_records(shard)[0]]
     assert _records(shard)[0]["id"] == record_id
     assert _records(shard)[0]["output"] == "material change"
+    assert not list(tmp_path.glob(".spill-*.tmp"))
+
+
+def test_redacting_one_record_preserves_other_records(tmp_path):
+    first = RollingSpillJournal(tmp_path, now=1_700_000_000)
+    first.append("first secret")
+    first_closed = first.close()
+    assert first_closed is not None
+    path, first_id = first_closed
+    second = RollingSpillJournal(tmp_path, now=1_700_000_000)
+    second.append("second secret")
+    second_closed = second.close()
+    assert second_closed is not None
+    _, second_id = second_closed
+
+    assert redact_record(Path(path), first_id, lambda value: value.replace("secret", "[redacted]"))
+    records = {record["id"]: record for record in _records(Path(path))}
+    assert records[first_id]["output"] == "first [redacted]"
+    assert records[second_id]["output"] == "second secret"
+    assert not redact_record(Path(path), "missing", lambda value: value)
+
+
+def test_terminal_result_keeps_record_identity_in_shared_journal(tmp_path):
+    journal = RollingSpillJournal(tmp_path, now=1_700_000_000)
+    journal.append("terminal output")
+    closed = journal.close()
+    assert closed is not None
+    path, record_id = closed
+
+    metadata = dict(_redact_spill_file(path, len("terminal output"), "printf terminal", record_id))
+    assert metadata["full_output_path"] == path
+    assert metadata["full_output_record_id"] == record_id
+    assert record_id in metadata["truncation_note"]
 
 
 def test_concurrent_runs_append_complete_records_to_one_shard(tmp_path):
