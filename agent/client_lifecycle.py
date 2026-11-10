@@ -64,6 +64,17 @@ def _valid_credential_pair(api_key: Any, base_url: Any) -> bool:
     return bool(isinstance(api_key, str) and api_key.strip() and isinstance(base_url, str) and base_url.strip())
 
 
+def _same_codex_principal(token_a: Any, token_b: Any) -> bool:
+    """True only when both Codex access tokens carry the same KNOWN ``(chatgpt_account_id, sub)`` principal.
+
+    Same principal proves "same account, rotated token"; a missing claim or an opaque token is unknown
+    identity and fails closed (never treated as the same account).
+    """
+    from agent.credential_pool import _codex_principal_identity
+    identity = _codex_principal_identity(token_a)
+    return identity is not None and identity == _codex_principal_identity(token_b)
+
+
 def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb_base_url: str, fb_api_mode: str) -> None:
     """Install the fallback client(s) in place, honoring request_timeout_seconds (None = SDK default)."""
     timeout = get_provider_request_timeout(fb_provider, fb_model)
@@ -585,6 +596,21 @@ class ClientLifecycleMixin:
         singleton_key = str(singleton_now.get("api_key") or "").strip()
         old_key = str(self.api_key or "").strip()
         if singleton_key and old_key and singleton_key != old_key:
+            # Same account, rotated token: the Codex CLI (or a sibling profile) spent the shared single-use
+            # refresh-token chain and the singleton read above already holds its newer tokens. That is not an
+            # account swap, so adopt them for the retry; a forced refresh here would spend the freshly adopted
+            # single-use refresh token for nothing. Unknown identity (opaque token, missing claim) fails closed.
+            if self.provider == "openai-codex" and _same_codex_principal(old_key, singleton_key):
+                api_key, base_url = singleton_now.get("api_key"), singleton_now.get("base_url")
+                if not _valid_credential_pair(api_key, base_url):
+                    return False
+                logger.info(
+                    "%s tokens were rotated by another process (same account); adopting the stored tokens.",
+                    self.provider,
+                )
+                return self._adopt_openai_credentials(
+                    api_key, base_url, reason="openai-codex_credential_rotation_adopt",
+                )
             logger.debug(
                 "%s singleton tokens differ from the active api_key; skipping singleton force-refresh to avoid "
                 "silent account swap. Reactive credential rotation should go through the pool.", self.provider,
