@@ -23,9 +23,6 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 # never evicts, so bounded and unbounded modes share one code path.
 _UNBOUNDED_CAPTURE_CHARS = 2**63 - 1
 
-_SPILL_MAX_AGE_S = 7 * 86400
-
-
 class _BoundedOutputCollector:
     """Retain a bounded 40/60 head-tail window of streamed text. When ``spill_path`` is set,
     the FULL stream is also teed to that file once eviction begins (up to ``_SPILL_CAP_CHARS``)
@@ -45,48 +42,53 @@ class _BoundedOutputCollector:
         self._total_chars = 0
         self._lock = threading.Lock()
         self._spill_path = spill_path
-        self._spill_fh: IO[str] | None = None
-        self._spill_chars = 0
-        self._spill_capped = False
+        self._spill_journal = None
+        self._spill_record_id: str | None = None
 
     def _maybe_spill(self, text: str) -> None:
-        """Tee ``text`` to the spill file (opened lazily on first overflow)."""
-        if self._spill_path is None or self._spill_capped:
+        """Buffer one overflow then atomically append it to the UTC daily journal."""
+        if self._spill_path is None:
             return
         try:
-            if self._spill_fh is None:
-                from tools.spill_safety import ensure_spill_dir, open_exclusive
-                # Raw pre-redaction output: private perms + symlink-refusing
-                # exclusive create (a planted link must fail, never redirect).
-                ensure_spill_dir(self._spill_path.parent, private=True)
-                self._spill_fh = open_exclusive(self._spill_path, private=True, errors="replace")
-                # Backfill what's retained so the file holds the stream from byte 0.
-                backlog = "".join(self._head) + "".join(self._tail)
-                self._spill_fh.write(backlog)
-                self._spill_chars = len(backlog)
-            budget = self._SPILL_CAP_CHARS - self._spill_chars
-            if budget <= 0 or len(text) > budget:
-                self._spill_fh.write(text[:max(0, budget)])
-                self._spill_fh.write("\n... [spill capped at 5,000,000 chars] ...\n")
-                self._spill_capped = True
-            else:
-                self._spill_fh.write(text)
-            self._spill_chars += len(text)
+            if self._spill_journal is None:
+                from tools.environments.spill_journal import RollingSpillJournal
+                # Backfill what is retained so the journal record starts at byte 0.
+                self._spill_journal = RollingSpillJournal(self._spill_path.parent)
+                self._spill_journal.append("".join(self._head) + "".join(self._tail))
+            self._spill_journal.append(text)
         except OSError:
             # Disk trouble must never break command execution.
-            self._spill_capped = True
+            self._spill_path = None
 
-    def close_spill(self) -> "str | None":
-        """Close the spill file and return its path if it was used."""
+    def close_spill(self, redact: Callable[[str], str]) -> tuple[str, str] | None:
+        """Redact in memory, then atomically append one completed spill record.
+
+        The journal intentionally receives only the redacted value.  In
+        particular, staging raw overflow on disk and redacting it later leaves
+        a secret-bearing crash window.
+        """
         with self._lock:
-            if self._spill_fh is None:
+            if self._spill_journal is None:
                 return None
             try:
-                self._spill_fh.close()
+                closed = self._spill_journal.close(redact)
             except OSError:
-                pass
-            self._spill_fh = None
-            return str(self._spill_path)
+                closed = None
+            self._spill_journal = None
+            if closed is None:
+                return None
+            path, self._spill_record_id = closed
+            return closed
+
+    def discard_spill(self) -> None:
+        """Drop unredacted in-memory overflow when ownership is handed off."""
+        with self._lock:
+            self._spill_journal = None
+            self._spill_record_id = None
+
+    @property
+    def spill_record_id(self) -> str | None:
+        return self._spill_record_id
 
     @property
     def buffered_chars(self) -> int:
@@ -105,7 +107,7 @@ class _BoundedOutputCollector:
             text_len = len(text)
             # Spill tee activates at the first overflow, then mirrors every chunk.
             if self._spill_path is not None and (
-                self._spill_fh is not None or self._total_chars + text_len > self.max_chars):
+                self._spill_journal is not None or self._total_chars + text_len > self.max_chars):
                 self._maybe_spill(text)
             self._total_chars += text_len
             start = 0
@@ -183,26 +185,21 @@ def _new_output_collector(proc, bounded_capture: bool) -> _BoundedOutputCollecto
     try:
         spill_dir = get_hermes_home() / "cache" / "terminal-output"
         spill_path = spill_dir / f"out-{int(time.time())}-{os.getpid()}-{id(proc) & 0xffff:x}.log"
-        if spill_dir.is_dir():
-            cutoff = time.time() - _SPILL_MAX_AGE_S
-            for old in spill_dir.glob("out-*.log"):
-                try:
-                    if old.stat().st_mtime < cutoff:
-                        old.unlink()
-                except OSError:
-                    pass
     except Exception:
         spill_path = None
     return _BoundedOutputCollector(capture_limit, spill_path=spill_path)
 
 
 def _finalize_wait_result(collector: _BoundedOutputCollector, rendered: str, returncode: int | None) -> dict:
-    """Assemble a wait result, attaching spill metadata when overflow occurred."""
+    """Assemble a wait result, retaining an unpersisted spill until redaction.
+
+    Foreground finalization is the first point with the command-aware redactor.
+    Keep overflow solely in this process until then; no raw byte reaches disk.
+    """
     result = {"output": rendered, "returncode": returncode}
-    spill = collector.close_spill()
-    if spill:
+    if collector._spill_journal is not None:
         result["output_total_chars"] = collector.total_chars
-        result["full_output_path"] = spill
+        result["_spill_collector"] = collector
     return result
 
 
