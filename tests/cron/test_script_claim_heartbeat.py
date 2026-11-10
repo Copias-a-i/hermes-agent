@@ -18,6 +18,10 @@ def test_script_termination_reaps_descendants(tmp_path, monkeypatch, trigger, to
     import psutil
     from cron import scheduler, scheduler_script
 
+    # Exercise real process-tree termination with this test interpreter, not
+    # the installed checkout's PM store or sibling payload metadata.
+    monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda repo: None)
+    monkeypatch.setattr("pm.environments._payload_manifest", lambda root: None)
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(scheduler_script, "_get_script_timeout", lambda: 3 if trigger == "timeout" else 60)
     scripts = tmp_path / "scripts"
@@ -51,7 +55,7 @@ def test_script_termination_reaps_descendants(tmp_path, monkeypatch, trigger, to
         deadline = time.monotonic() + 10
         while not ready.exists() and not errors and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert ready.exists() and not errors, errors
+        assert ready.exists() and not errors, (errors, results)
         pid = int(ready.read_text(encoding="utf-8"))
         assert live(pid), "child must acknowledge readiness before termination"
         if trigger == "cancel":
