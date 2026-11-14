@@ -1974,6 +1974,23 @@ def _mark_planned_stop(pid: int | None = None) -> None:
         pass
 
 
+_STOP_TERMINAL_STATE_TIMEOUT = 5.0
+
+
+def _wait_for_terminal_stopped_state(timeout: float = _STOP_TERMINAL_STATE_TIMEOUT) -> bool:
+    """Wait boundedly until a fresh runtime-status read proves a clean stop."""
+    from gateway.status import get_running_pid, read_runtime_status
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        state = read_runtime_status() or {}
+        if state.get("gateway_state") == "stopped" and get_running_pid() is None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
 def stop_profile_gateway() -> bool:
     """Stop only this profile's gateway via its PID file; True if a process was stopped. Without a
     supervisor the pidfile can be stale while a live orphan holds the webhook port, so fall back to
@@ -2027,6 +2044,9 @@ def stop_profile_gateway() -> bool:
 
     if get_running_pid() is None:
         remove_pid_file()
+    else:
+        logger.error("Gateway process %s did not exit before the stop deadline", pid)
+        return False
 
     # Reap orphans from prior restarts whose pidfile entry was overwritten; skip the PID just killed.
     try:
@@ -2035,6 +2055,9 @@ def stop_profile_gateway() -> bool:
         _reap_unsupervised_gateway_orphans(extra_exclude={pid} if pid else None)
     except Exception as exc:
         logger.debug("orphan reap after stop_profile_gateway failed: %s", exc)
+    if not _wait_for_terminal_stopped_state():
+        logger.error("Gateway exited but durable terminal runtime status was not confirmed")
+        return False
     return True
 
 
