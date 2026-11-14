@@ -141,16 +141,19 @@ def _prepare_child_command(command: Sequence[str], environ: Mapping[str, str] | 
 
 
 def _child_returncode_for_supervisor(command: Sequence[str], returncode: int) -> int:
-    """Exit status the launchd wrapper reports for *returncode* from *command*.
+    """Restart ordinary gateway exits while preserving fatal-config parking.
 
-    Signal deaths stay 128+N. Gateway EX_CONFIG (78) becomes 0 so
-    ``KeepAlive.SuccessfulExit=false`` parks the job instead of crash-looping;
-    a non-gateway child that happens to exit 78 is left alone.
+    launchd SuccessfulExit=false parks EX_CONFIG 78 after mapping it to 0.
+    An ordinary gateway exit 0 instead requests restart (75); intentional service
+    stops unload the launchd job. Non-gateway exit statuses remain unchanged.
     """
     if returncode < 0:
         return 128 + abs(returncode)
-    if returncode == _GATEWAY_FATAL_CONFIG_EXIT_CODE and _is_hermes_gateway_run_argv(command):
-        return 0
+    if _is_hermes_gateway_run_argv(command):
+        if returncode == _GATEWAY_FATAL_CONFIG_EXIT_CODE:
+            return 0
+        if returncode == 0:
+            return 75
     return returncode
 
 
