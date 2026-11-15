@@ -15,7 +15,7 @@ import pytest
 
 @pytest.mark.parametrize("failed_probe", ["profile", "multiplexer", "lock"])
 def test_uncertain_ownership_defers_built_in_gate(tmp_path, monkeypatch, failed_probe):
-    from hermes_cli import gateway as gateway_cli, profiles, web_server
+    from hermes_cli import gateway as gateway_cli, profiles, web_server, web_server_cron_ownership
 
     def unavailable(*args):
         raise RuntimeError("ownership unavailable")
@@ -23,7 +23,8 @@ def test_uncertain_ownership_defers_built_in_gate(tmp_path, monkeypatch, failed_
     monkeypatch.setattr(profiles, "_check_gateway_running", unavailable if failed_probe == "profile" else lambda home: False)
     monkeypatch.setattr(gateway_cli, "named_profile_served_by_running_multiplexer", unavailable if failed_probe == "multiplexer" else lambda name: False)
     if failed_probe == "lock":
-        monkeypatch.setattr(web_server, "_desktop_gateway_runtime_lock_owned", unavailable)
+        # The lock probe is read inside the sibling, so the sibling is the seam to patch.
+        monkeypatch.setattr(web_server_cron_ownership, "_desktop_gateway_runtime_lock_owned", unavailable)
     assert web_server._gateway_owns_cron("worker", tmp_path) is True
 
 
@@ -38,7 +39,7 @@ def test_status_probe_error_is_not_gateway_absence(tmp_path, monkeypatch):
     assert web_server._gateway_owns_cron("worker", tmp_path) is True
 
 
-@pytest.mark.skipif(__import__("os").name == "nt", reason="POSIX runtime-lock experiment")
+@pytest.mark.platforms("posix")  # fcntl.flock runtime-lock experiment
 def test_held_runtime_lock_defers_unrecognized_live_gateway(tmp_path, monkeypatch):
     import subprocess
     import sys

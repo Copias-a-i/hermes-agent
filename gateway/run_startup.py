@@ -1012,9 +1012,7 @@ class GatewayStartupMixin:
 
     def _start_check_access_policy(self) -> bool:
         """Warn about missing allowlists; return True when startup must be refused."""
-        from gateway.run import (
-            _OWN_POLICY_OPEN_ENV, _own_policy_open_startup_violation, _write_runtime_status_quiet
-        )
+        from gateway.run import _OWN_POLICY_OPEN_ENV, _own_policy_open_startup_violation
         # Plugin platforms declare their own allowed_users_env / allow_all_env.
         allowed_vars = list(self._BUILTIN_ALLOWED_USERS_VARS)
         allow_all_vars = ["GATEWAY_ALLOW_ALL_USERS", *self._BUILTIN_ALLOW_ALL_VARS]
@@ -1049,8 +1047,9 @@ class GatewayStartupMixin:
                 "but neither GATEWAY_ALLOW_ALL_USERS nor %s is enabled.", platform_value,
                 allow_all_env or "a platform allow-all flag",
             )
-            _write_runtime_status_quiet(gateway_state="startup_failed", exit_reason=reason)
-            self._request_clean_exit(reason)
+            # Exit 78, not 0: a supervisor restarts a gateway that exits 0 (the stderr_timestamp wrapper
+            # reports 0 as 75), and a refused open policy would otherwise crash-loop until edited.
+            self._startup_fail_fatal_config(reason)
             return True
         return False
 

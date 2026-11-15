@@ -13,7 +13,7 @@ INPUT_LINE = 'INPUT="$(cat || true)"'
 
 def install(hook: Path, destination: Path, backup: Path, python: str) -> None:
     source = Path(__file__).with_name("fleet_kill_guard.py")
-    original = hook.read_text()
+    original = hook.read_text(encoding="utf-8-sig")
     if INPUT_LINE not in original:
         raise ValueError("Existing Bash hook does not have the expected stdin capture; left untouched")
     if not backup.exists():
@@ -30,7 +30,7 @@ def install(hook: Path, destination: Path, backup: Path, python: str) -> None:
             "  exit \"$KILL_GUARD_STATUS\"\n"
             "fi\n"
         )
-        hook.write_text(original.replace(INPUT_LINE, INPUT_LINE + guard, 1))
+        hook.write_text(original.replace(INPUT_LINE, INPUT_LINE + guard, 1), encoding="utf-8")
 
 
 def main() -> int:
