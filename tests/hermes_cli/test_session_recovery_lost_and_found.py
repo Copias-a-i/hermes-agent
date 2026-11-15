@@ -224,7 +224,11 @@ def test_unreadable_schema_without_cli_names_the_sqlite3_requirement(
 
     import hermes_cli.session_lost_and_found as laf
 
-    monkeypatch.setattr(laf, "find_sqlite3_cli", lambda: None)
+    # Absence is simulated at the PATH lookup so the real probe records the refusal reason. Stubbing
+    # find_sqlite3_cli instead left the import-time probe's reason in place, and on a runner whose
+    # system sqlite3 sits in the WAL-reset-vulnerable band (Ubuntu CI) that reason, not "missing",
+    # picked the message.
+    monkeypatch.setattr(laf.shutil, "which", lambda *_args, **_kwargs: None)
     with pytest.raises(SessionRecoverySourceError) as excinfo:
         recover_session_database(
             source,
