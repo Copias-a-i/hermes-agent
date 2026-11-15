@@ -81,7 +81,13 @@ def _on_pre_llm_call(**kwargs: Any) -> None:
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
-    """Add final output after it is persisted; keep the pre-turn crash snapshot."""
+    """Add final output after it is persisted; keep the pre-turn crash snapshot.
+
+    This hook records the response but never settles the turn: it carries no completed/failed/interrupted
+    outcome (and also fires for an abnormal-exit explanation). The core fires ``on_session_end`` once per
+    turn with that turn's own ``turn_id`` and real outcome (``agent/turn_finalizer.py``), so that is where
+    each turn is checkpointed, and its snapshot is released.
+    """
     config = _config()
     home_key = _home_key(get_hermes_home())
     session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
@@ -114,18 +120,22 @@ def _on_session_end(**kwargs: Any) -> None:
                 LifecycleController(home, config).cancel_session(session_id=session_id)
             return
         with _pending_lock:
-            if not turn_id and session_id:
-                # Shutdown paths that omit turn_id still need the pre-turn identity.
-                matching = [key for key in _pending if key[0] == home_key and key[1] == session_id]
-                if matching:
-                    turn_id = matching[-1][2]
-            saved = _pending.pop((home_key, session_id, turn_id), {})
+            if turn_id:
+                settling = [(turn_id, _pending.pop((home_key, session_id, turn_id), {}))]
+            elif session_id:
+                # Shutdown paths that omit turn_id end the whole session: settle every snapshot it still
+                # holds (a turn whose own end never arrived included), not only the newest one.
+                settling = [(key[2], _pending.pop(key)) for key in list(_pending)
+                            if key[0] == home_key and key[1] == session_id]
+            else:
+                settling = []
         controller = LifecycleController(home, config)
-        controller.after_turn(
-            session_id=session_id, turn_id=turn_id,
-            completed=bool(kwargs.get("completed")), interrupted=bool(kwargs.get("interrupted")),
-            user_message=saved.get("user_message", ""), assistant_response=saved.get("assistant_response", ""),
-        )
+        for settled_turn_id, saved in settling:
+            controller.after_turn(
+                session_id=session_id, turn_id=settled_turn_id,
+                completed=bool(kwargs.get("completed")), interrupted=bool(kwargs.get("interrupted")),
+                user_message=saved.get("user_message", ""), assistant_response=saved.get("assistant_response", ""),
+            )
     except Exception:
         logger.exception("fleet-session-lifecycle: turn checkpoint failed; turn stays deliverable")
         return

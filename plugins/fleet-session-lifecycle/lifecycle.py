@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import stat as stat_mode
 import subprocess
 import tempfile
 import threading
@@ -44,6 +45,7 @@ _ATTEMPT_ID = re.compile(r"[0-9a-f]{32}")
 _MAX_TEXT = 600
 
 logger = logging.getLogger(__name__)
+_reported_lock_aliases: set[str] = set()
 
 
 def redact_for_export(value: Any) -> str:
@@ -123,6 +125,7 @@ _STATE_ARTIFACTS = (
     "fleet-session-lifecycle.json",
     "fleet-session-lifecycle.lock",
     "fleet-session-lifecycle-outbox.jsonl",
+    "fleet-session-lifecycle-admissions",
     "fleet-session-lifecycle-completions",
     "fleet-session-lifecycle-cancellations",
     "fleet-session-lifecycle-finalizations",
@@ -178,6 +181,8 @@ class LifecycleController:
         self.lock_path = self.home / "state" / "fleet-session-lifecycle.lock"
         self._uses_default_runner = runner is None
         self.runner = runner or self._run
+        # Set when the lock path holds something that is not this plugin's lock file: no retry can change that.
+        self._lease_refused = False
 
     def _state(self) -> dict[str, Any]:
         try:
@@ -185,6 +190,79 @@ class LifecycleController:
             return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    def _admission_event(self, event_id: str, session_id: str, turn_id: str, user_message: Any) -> dict[str, Any]:
+        """Durable row of one admitted turn; identical whether it lands in state or in an intent."""
+        return {
+            "event_id": event_id,
+            "session_hash": session_identity_hash(session_id),
+            "session_id": redact_for_export(session_id),
+            "turn_id": redact_for_export(turn_id),
+            "completed": False,
+            "interrupted": True,
+            "active": True,
+            "owner_pid": os.getpid(),
+            "owner_birth": self._owner_birth(),
+            "user": redact_for_export(user_message),
+            "response": "",
+            "checkpoint_partition": self._checkpoint_path().name,
+        }
+
+    def _admission_intent_path(self, event_id: str) -> Path:
+        return self.home / "state" / "fleet-session-lifecycle-admissions" / f"{event_id}.json"
+
+    def _persist_admission_intent(self, event: dict[str, Any]) -> None:
+        """Keep a lease-starved admission recoverable without touching another owner's state file."""
+        event_id = str(event.get("event_id") or "")
+        if event_id:
+            _atomic_json(self._admission_intent_path(event_id), event)
+
+    def _merge_admission_intents(
+        self, state: dict[str, Any], *, cancelled_sessions: set[str] | None = None,
+    ) -> list[Path]:
+        """Adopt lease-starved admissions as active turns; the adopted file is always safe to clear.
+
+        An admission carries no outcome, so it may never replace a row that has one: an event that is
+        already processed, already pending, or owned by a cancelled session is dropped instead.
+        """
+        directory = self.home / "state" / "fleet-session-lifecycle-admissions"
+        try:
+            intents = tuple(directory.glob("*.json"))
+        except OSError:
+            return []
+        processed = {str(item) for item in (state.get("processed_turns") or ())}
+        pending = state.setdefault("pending_turns", {})
+        adopted: list[Path] = []
+        cancelled_sessions = cancelled_sessions or set()
+        for path in intents:
+            try:
+                event = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            event_id = str(event.get("event_id") or "")
+            if not event_id or path.name != f"{event_id}.json":
+                continue
+            adopted.append(path)
+            if (
+                self._event_session_hash(event) in cancelled_sessions
+                or event_id in processed
+                or isinstance(pending.get(event_id), dict)
+            ):
+                continue
+            event["active"] = True
+            pending[event_id] = event
+        return adopted
+
+    def _merge_event_intents(
+        self, state: dict[str, Any], *, cancelled_sessions: set[str] | None = None,
+    ) -> list[Path]:
+        """Adopt every lease-starved per-event intent; admissions first so a completion can settle them."""
+        return [
+            *self._merge_admission_intents(state, cancelled_sessions=cancelled_sessions),
+            *self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions),
+        ]
 
     def _completion_intent_path(self, event_id: str) -> Path:
         return self.home / "state" / "fleet-session-lifecycle-completions" / f"{event_id}.json"
@@ -422,11 +500,16 @@ class LifecycleController:
             return None
 
     def _reclaim_stale_windows_lease(self) -> bool:
-        """Reclaim only an aged lock whose recorded owner is no longer alive."""
+        """Reclaim only an aged lock whose recorded owner is no longer alive.
+
+        Validating the lock and then deleting it by its shared pathname cannot tell the stale file that
+        was validated from a newer lock a rival reclaimer created there in between.  The lock is instead
+        claimed by renaming it to a private name, one atomic step that takes whichever file stands at the
+        path, and only the claimed file's own contents decide whether it was the stale lock.
+        """
         try:
             stale_seconds = max(0.0, float(self.config.get("lock_stale_seconds", 300)))
-            stat = self.lock_path.stat()
-            if time.time() - stat.st_mtime < stale_seconds:
+            if time.time() - self.lock_path.stat().st_mtime < stale_seconds:
                 return False
             owner = self.lock_path.read_text(encoding="ascii")
             pid_text, separator, remainder = owner.partition(":")
@@ -438,12 +521,87 @@ class LifecycleController:
             token = token if has_birth else remainder
             if not separator or not token or self._owner_is_alive(int(pid_text), birth):
                 return False
-            if self.lock_path.read_text(encoding="ascii") != owner:
-                return False
-            self.lock_path.unlink()
-            return True
         except (OSError, ValueError):
             return False
+        claim = self.lock_path.with_name(f"{self.lock_path.name}.claim-{uuid.uuid4().hex}")
+        try:
+            os.rename(self.lock_path, claim)
+        except OSError:
+            return False  # Already taken by a rival, or still open under a live owner on Windows.
+        try:
+            claimed = claim.read_text(encoding="ascii")
+        except (OSError, ValueError):
+            claimed = None
+        if claimed == owner:
+            try:
+                os.unlink(claim)
+            except OSError:
+                pass
+            return True
+        self._return_claimed_lock(claim)
+        return False
+
+    def _return_claimed_lock(self, claim: Path) -> None:
+        """Put back a claimed file that was not the stale lock, never over a lock acquired since.
+
+        Hard-linking back fails if the path is occupied again, so a newer lock always wins.  A live Windows
+        owner keeps its handle open, which blocks the claim itself; this only repairs the instant between
+        an owner closing its lock and removing it.
+        """
+        try:
+            os.link(claim, self.lock_path)
+        except FileExistsError:
+            pass
+        except OSError:
+            # No hard links on this volume: rename back only into a free path.
+            if not self.lock_path.exists():
+                try:
+                    os.rename(claim, self.lock_path)
+                    return
+                except OSError:
+                    logger.warning("fleet-session-lifecycle: could not return a claimed lock to %s", self.lock_path)
+        try:
+            os.unlink(claim)
+        except OSError:
+            pass
+
+    def _open_posix_lock(self) -> int | None:
+        """Open the profile lock file, or None when the lock path holds something else.
+
+        The state directory is writable by candidate-executed tools, so a symlink or a hard link can stand
+        where the lock file belongs; following it would truncate and then write its target.  The path is
+        opened without following links and only a private regular file is accepted, so an alias is
+        refused rather than followed (the caller then takes its lease-independent intent path).
+        """
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.lock_path, flags, 0o600)
+        except OSError:
+            if not os.path.islink(self.lock_path):
+                raise
+            fd = None
+        if fd is not None:
+            try:
+                opened = os.fstat(fd)
+                standing = os.lstat(self.lock_path)
+                if (
+                    stat_mode.S_ISREG(opened.st_mode) and opened.st_nlink == 1
+                    and opened.st_uid == os.geteuid()  # windows-footgun: ok — only reached under the fcntl (POSIX) lease branch
+                    and (opened.st_dev, opened.st_ino) == (standing.st_dev, standing.st_ino)
+                ):
+                    return fd
+            except OSError:
+                pass
+            os.close(fd)
+        self._lease_refused = True
+        if str(self.lock_path) not in _reported_lock_aliases:  # every hook builds a controller: report once
+            _reported_lock_aliases.add(str(self.lock_path))
+            logger.error(
+                "fleet-session-lifecycle: refusing %s: it is not this plugin's private lock file (symlink, hard "
+                "link or foreign file); remove it so lifecycle checkpoints can take their lease again",
+                self.lock_path,
+            )
+        return None
 
     @contextmanager
     def _lease(self) -> Iterator[bool]:
@@ -463,7 +621,10 @@ class LifecycleController:
             locked = False
             try:
                 if fcntl is not None:
-                    fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                    fd = self._open_posix_lock()
+                    if fd is None:
+                        yield False
+                        return
                     try:
                         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
@@ -502,12 +663,14 @@ class LifecycleController:
     def _lease_with_retry(self) -> Iterator[bool]:
         """Acquire the profile lease within the configured bounded contention window."""
         deadline = time.monotonic() + max(0.0, float(self.config.get("finalize_lease_wait_seconds", 2)))
+        self._lease_refused = False
         while True:
             with self._lease() as acquired:
                 if acquired:
                     yield True
                     return
-            if time.monotonic() >= deadline:
+            # A refused lock path cannot free up by waiting; do not stall the turn on it.
+            if self._lease_refused or time.monotonic() >= deadline:
                 yield False
                 return
             time.sleep(0.05)
@@ -571,26 +734,17 @@ class LifecycleController:
         try:
             with self._lease_with_retry() as acquired:
                 if not acquired:
-                    logger.warning("fleet-session-lifecycle: turn admission lease remained busy")
+                    # Another process may hold the lease for seconds (an outbox adapter runs under it). The
+                    # admission must not live only in this process, so it gets its own per-event intent and
+                    # the next lease holder adopts it; a crash before ``after_turn`` then still replays it.
+                    self._persist_admission_intent(self._admission_event(event_id, session_id, turn_id, user_message))
+                    logger.warning("fleet-session-lifecycle: turn admission lease remained busy; intent retained")
                     return
                 state = self._state()
                 processed = {str(item) for item in (state.get("processed_turns") or ())}
                 pending = state.setdefault("pending_turns", {})
                 if event_id not in processed and not isinstance(pending.get(event_id), dict):
-                    pending[event_id] = {
-                        "event_id": event_id,
-                        "session_hash": session_identity_hash(session_id),
-                        "session_id": redact_for_export(session_id),
-                        "turn_id": redact_for_export(turn_id),
-                        "completed": False,
-                        "interrupted": True,
-                        "active": True,
-                        "owner_pid": os.getpid(),
-                        "owner_birth": self._owner_birth(),
-                        "user": redact_for_export(user_message),
-                        "response": "",
-                        "checkpoint_partition": self._checkpoint_path().name,
-                    }
+                    pending[event_id] = self._admission_event(event_id, session_id, turn_id, user_message)
                     _atomic_json(self.state_path, state)
         except Exception:
             logger.exception("fleet-session-lifecycle: turn admission failed for %s", redact_for_export(session_id))
@@ -672,7 +826,7 @@ class LifecycleController:
                     return
                 state = self._state()
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
-                completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
+                completion_intents = self._merge_event_intents(state, cancelled_sessions=cancelled_sessions)
                 finalization_intents = self._merge_finalization_intents(state)
                 if cancellation_intents or completion_intents or finalization_intents:
                     _atomic_json(self.state_path, state)
@@ -714,7 +868,7 @@ class LifecycleController:
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
                 identities = self._session_identity_candidates(session_id)
                 cancelled_sessions |= identities
-                completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
+                completion_intents = self._merge_event_intents(state, cancelled_sessions=cancelled_sessions)
                 pending = state.setdefault("pending_turns", {})
                 removed = [
                     event_id for event_id, event in pending.items()
@@ -839,7 +993,7 @@ class LifecycleController:
                     return
                 state = self._state()
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
-                completion_intents = self._merge_completion_intents(state, cancelled_sessions=cancelled_sessions)
+                completion_intents = self._merge_event_intents(state, cancelled_sessions=cancelled_sessions)
                 finalization_intents = self._merge_finalization_intents(state)
                 if cancellation_intents or completion_intents or finalization_intents:
                     _atomic_json(self.state_path, state)

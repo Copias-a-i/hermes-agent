@@ -1382,3 +1382,256 @@ def test_full_wrapup_persists_busy_lease_intent_for_next_process(tmp_path):
     finally:
         release.set()
         holder.join(3)
+
+
+# --- Admission durability under lease starvation ------------------------------------------------
+
+
+def _next_holder_checkpoint(mod, home, vault) -> str:
+    """Run a later lease holder, as the next hook in any process would, and return the day's checkpoint."""
+    mod.LifecycleController(home, {"vault_root": str(vault)}, runner=lambda *_a, **_k: 0).after_turn(
+        session_id="other", turn_id="next", completed=True, interrupted=False,
+        user_message="u", assistant_response="a", conversation_history=[], cwd="",
+    )
+    return _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+
+
+def test_lease_starved_admission_is_replayed_after_its_process_dies(tmp_path, monkeypatch):
+    """An admission that found the lease busy must still be recoverable, or a crash loses the turn."""
+    mod = _load_lifecycle()
+    first, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    first.config["finalize_lease_wait_seconds"] = 0
+    monkeypatch.setattr(first, "_lease", _busy_lease)
+
+    first.admit_turn(session_id="doomed", turn_id="turn", user_message="question before the crash")
+
+    intent_dir = home / "state" / "fleet-session-lifecycle-admissions"
+    intents = sorted(intent_dir.glob("*.json"))
+    assert len(intents) == 1
+    row = json.loads(intents[0].read_text(encoding="utf-8"))
+    row.update(owner_pid=999999, owner_birth=None)  # the admitting process died before ``after_turn``
+    intents[0].write_text(json.dumps(row), encoding="utf-8")
+
+    checkpoint = _next_holder_checkpoint(mod, home, vault)
+
+    assert "user: question before the crash" in checkpoint
+    assert "- interrupted: true" in checkpoint
+    assert not list(intent_dir.glob("*.json"))
+
+
+def test_lease_starved_admission_of_a_live_owner_is_adopted_but_not_replayed(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    first, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    first.config["finalize_lease_wait_seconds"] = 0
+    monkeypatch.setattr(first, "_lease", _busy_lease)
+    first.admit_turn(session_id="running", turn_id="turn", user_message="question in flight")
+
+    checkpoint = _next_holder_checkpoint(mod, home, vault)
+
+    event_id = __import__("hashlib").sha256(b"running\x00turn").hexdigest()
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"][event_id]["active"] is True
+    assert "question in flight" not in checkpoint
+    assert not list((home / "state" / "fleet-session-lifecycle-admissions").glob("*.json"))
+
+
+def test_cancelling_a_session_drops_its_lease_starved_admission(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    first, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    first.config["finalize_lease_wait_seconds"] = 0
+    monkeypatch.setattr(first, "_lease", _busy_lease)
+    first.admit_turn(session_id="disabled", turn_id="turn", user_message="question")
+    intent_dir = home / "state" / "fleet-session-lifecycle-admissions"
+    (intent_path,) = intent_dir.glob("*.json")
+    row = json.loads(intent_path.read_text(encoding="utf-8"))
+    row.update(owner_pid=999999, owner_birth=None)  # even a dead owner's admission must stay cancelled
+    intent_path.write_text(json.dumps(row), encoding="utf-8")
+
+    mod.LifecycleController(home, {"vault_root": str(vault)}).cancel_session(session_id="disabled")
+    checkpoint = _next_holder_checkpoint(mod, home, vault)
+
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"] == {}
+    assert "question" not in checkpoint
+    assert not list(intent_dir.glob("*.json"))
+
+
+def test_lease_starved_admission_and_completion_settle_to_one_complete_checkpoint(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    first, home, vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    first.config["finalize_lease_wait_seconds"] = 0
+    monkeypatch.setattr(first, "_lease", _busy_lease)
+    first.admit_turn(session_id="busy", turn_id="turn", user_message="question")
+    first.after_turn(session_id="busy", turn_id="turn", completed=True, interrupted=False,
+                     user_message="question", assistant_response="answer", conversation_history=[], cwd="")
+
+    checkpoint = _next_holder_checkpoint(mod, home, vault)
+
+    assert checkpoint.count("- turn_id: turn\n") == 1
+    assert "- completed: true" in checkpoint and "- response: answer" in checkpoint
+    state = json.loads((home / "state" / "fleet-session-lifecycle.json").read_text(encoding="utf-8"))
+    assert state["pending_turns"] == {}
+
+
+# --- Windows stale-lock reclamation ------------------------------------------------------------
+
+
+def test_stale_reclaim_never_deletes_a_lock_acquired_after_its_validation(tmp_path, monkeypatch):
+    """A rival that reclaims and re-acquires between validation and removal must keep its lock."""
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["lock_stale_seconds"] = 0
+    lock = controller.lock_path
+    lock.parent.mkdir(parents=True)
+    lock.write_text("999999:1.0:stale", encoding="ascii")  # aged lock of a dead owner
+    rival_token = f"{os.getpid()}:{controller._owner_birth()}:rival"
+    originals = {name: getattr(os, name) for name in ("unlink", "rename", "replace")}
+    raced = []
+
+    def rival_takes_the_lock_first(path):
+        if raced or Path(os.fspath(path)) != lock:
+            return
+        raced.append(True)
+        originals["unlink"](lock)
+        fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.write(fd, rival_token.encode("ascii"))
+        os.close(fd)
+
+    def racing(name):
+        def removal(path, *args, **kwargs):
+            rival_takes_the_lock_first(path)  # the instant the reclaimer acts on the shared pathname
+            return originals[name](path, *args, **kwargs)
+        return removal
+
+    for name in originals:
+        monkeypatch.setattr(os, name, racing(name))
+
+    assert controller._reclaim_stale_windows_lease() is False
+
+    assert raced
+    assert lock.read_text(encoding="ascii") == rival_token
+    assert not list(lock.parent.glob("*.claim-*"))
+
+
+def test_stale_lock_of_a_dead_owner_is_reclaimed_without_residue(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["lock_stale_seconds"] = 0
+    controller.lock_path.parent.mkdir(parents=True)
+    controller.lock_path.write_text("999999:1.0:stale", encoding="ascii")
+
+    assert controller._reclaim_stale_windows_lease() is True
+
+    assert list(controller.lock_path.parent.iterdir()) == []
+
+
+def test_stale_reclaim_leaves_a_live_owners_lock_alone(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    controller.config["lock_stale_seconds"] = 0
+    controller.lock_path.parent.mkdir(parents=True)
+    live = f"{os.getpid()}:{controller._owner_birth()}:live"
+    controller.lock_path.write_text(live, encoding="ascii")
+
+    assert controller._reclaim_stale_windows_lease() is False
+
+    assert controller.lock_path.read_text(encoding="ascii") == live
+    assert [path.name for path in controller.lock_path.parent.iterdir()] == [controller.lock_path.name]
+
+
+# --- POSIX lock file aliases -------------------------------------------------------------------
+
+
+@pytest.mark.platforms("posix")
+def test_lease_never_follows_a_symlink_planted_at_the_lock_path(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious contents", encoding="utf-8")
+    controller.lock_path.parent.mkdir(parents=True)
+    controller.lock_path.symlink_to(victim)
+
+    with controller._lease() as acquired:
+        assert acquired is False
+
+    assert victim.read_text(encoding="utf-8") == "precious contents"
+    assert controller.lock_path.is_symlink()
+
+
+@pytest.mark.platforms("posix")
+def test_lease_never_writes_through_a_hard_link_at_the_lock_path(tmp_path):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious contents", encoding="utf-8")
+    controller.lock_path.parent.mkdir(parents=True)
+    os.link(victim, controller.lock_path)
+
+    with controller._lease() as acquired:
+        assert acquired is False
+
+    assert victim.read_text(encoding="utf-8") == "precious contents"
+
+
+@pytest.mark.platforms("posix")
+def test_a_refused_lock_path_neither_stalls_admission_nor_loses_it(tmp_path, monkeypatch):
+    mod = _load_lifecycle()
+    controller, home, _vault = _controller(mod, tmp_path)
+    controller.config["finalize_lease_wait_seconds"] = 30  # a refusal must not wait this out
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious contents", encoding="utf-8")
+    controller.lock_path.parent.mkdir(parents=True)
+    controller.lock_path.symlink_to(victim)
+    monkeypatch.setattr(mod.time, "sleep", lambda _seconds: pytest.fail("backed off on a lock that cannot free up"))
+
+    controller.admit_turn(session_id="aliased", turn_id="turn", user_message="question")
+
+    assert len(list((home / "state" / "fleet-session-lifecycle-admissions").glob("*.json"))) == 1
+    assert victim.read_text(encoding="utf-8") == "precious contents"
+
+
+# --- Per-turn settlement ---------------------------------------------------------------------
+
+
+def _enabled_plugin(monkeypatch, tmp_path):
+    plugin = _load_plugin()
+    home = tmp_path / ".hermes" / "profiles" / "jarvis"
+    vault = tmp_path / "vault"
+    home.mkdir(parents=True)
+    plugin._pending.clear()
+    monkeypatch.setattr(plugin, "_config", lambda: {"enabled": True, "vault_root": str(vault)})
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: home)
+    return plugin, vault
+
+
+def test_turnless_session_end_settles_every_snapshot_the_session_still_holds(monkeypatch, tmp_path):
+    plugin, vault = _enabled_plugin(monkeypatch, tmp_path)
+    plugin._on_pre_llm_call(session_id="s", turn_id="t1", user_message="first question")
+    plugin._on_post_llm_call(session_id="s", turn_id="t1", user_message="first question",
+                             assistant_response="first answer")
+    # t1's own end never arrived (its turn raised past the finalizer); t2 is in flight at shutdown.
+    plugin._on_pre_llm_call(session_id="s", turn_id="t2", user_message="second question")
+
+    plugin._on_session_end(session_id="s", completed=False, interrupted=True)
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    assert "user: first question" in checkpoint and "response: first answer" in checkpoint
+    assert "user: second question" in checkpoint
+    assert not [key for key in plugin._pending if key[1] == "s"]
+
+
+def test_each_turn_is_checkpointed_by_its_own_end_hook_and_none_stays_memory_only(monkeypatch, tmp_path):
+    """The core fires ``on_session_end`` once per turn, so successful turns never pile up in memory."""
+    plugin, vault = _enabled_plugin(monkeypatch, tmp_path)
+
+    for number in range(3):
+        turn = f"t{number}"
+        plugin._on_pre_llm_call(session_id="s", turn_id=turn, user_message=f"question {number}")
+        plugin._on_post_llm_call(session_id="s", turn_id=turn, user_message=f"question {number}",
+                                 assistant_response=f"answer {number}")
+        plugin._on_session_end(session_id="s", turn_id=turn, completed=True, interrupted=False)
+        assert not [key for key in plugin._pending if key[1] == "s"]
+
+    checkpoint = _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
+    for number in range(3):
+        assert f"- turn_id: t{number}\n" in checkpoint and f"- response: answer {number}" in checkpoint

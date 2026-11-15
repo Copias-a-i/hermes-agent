@@ -368,6 +368,11 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     with lifecycle_guard as other_runtime_owns_lifecycle:
         if other_runtime_owns_lifecycle:
             logger.info("Preserving session %s during %s: another backend owns an active lease", session_id, end_reason)
+            # ``_teardown_session`` still closes this agent, and ``agent.close()`` ends the durable row as
+            # ``agent_close`` unless told not to: that row now belongs to the replacement runtime, so spare it
+            # the way ``_finalize_session_owned`` does for every other automatic Desktop reap (#105588).
+            if agent is not None:
+                agent._end_session_on_close = False
             return
         _finalize_session_owned(session, end_reason=end_reason, lifecycle_guard_held=automatic_desktop_cleanup)
 
