@@ -788,8 +788,12 @@ class TestImageApiSurface:
         from plugins.image_gen.openrouter import _IMAGE_API_MODELS, _build_providers
 
         by_name = {p.name: p for p in _build_providers()}
-        openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
-        nous_ids = {m["id"] for m in by_name["nous"].list_models()}
+        # Offline on purpose. The live catalog is whatever OpenRouter serves today and it drops or
+        # renames curated ids, so reading it here made a surface-ownership contract fail on upstream
+        # catalog drift (x-ai/grok-imagine-image-quality is gone from the live /images/models).
+        with patch(_RUNTIME, side_effect=RuntimeError("no creds")):
+            openrouter_ids = {m["id"] for m in by_name["openrouter"].list_models()}
+            nous_ids = {m["id"] for m in by_name["nous"].list_models()}
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
 

@@ -5,7 +5,7 @@ from unittest.mock import ANY, MagicMock
 
 import pytest
 
-from agent.turn_finalizer import finalize_turn
+from agent.turn_finalizer import _record_kanban_budget_exhausted, finalize_turn
 
 
 class _LimitAgent:
@@ -165,23 +165,16 @@ def test_pending_response_does_not_mask_later_terminal_exit(
     assert agent._handle_max_iterations_called is False
 
 
-def test_pending_response_records_kanban_timeout(monkeypatch):
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+def test_budget_timeout_is_fenced_to_the_originating_kanban_run(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     record = MagicMock(name="record_task_failure")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db_connect.connect", lambda: conn)
     monkeypatch.setattr("hermes_cli.kanban_db_dispatch._record_task_failure", record)
-    agent = _LimitAgent()
 
-    result = _finalize(
-        agent,
-        final_response=None,
-        exit_reason="unknown",
-        pending_verification_response="composed report",
-    )
+    _record_kanban_budget_exhausted("task-123", 60, 60, MagicMock())
 
-    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
     record.assert_called_once_with(
         conn,
         "task-123",
@@ -189,6 +182,7 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
         outcome="timed_out",
         release_claim=True,
         end_run=True,
+        expected_run_id=42,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
 
