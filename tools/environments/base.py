@@ -504,7 +504,9 @@ class BaseEnvironment(ABC):
                         logger.warning("yield-to-background handoff failed; continuing to wait", exc_info=True)
                         handed = None
                     if handed is not None:
-                        output.close_spill()
+                        # Overflow is still raw and in memory here. The yielded
+                        # background owner must not inherit a foreground spill.
+                        output.discard_spill()
                         return handed
                     drain_stop.clear()
                     drain_thread = _start_drain_thread(proc, output, drain_stop)

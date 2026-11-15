@@ -273,6 +273,9 @@ def test_dashboard_run_now_isolates_a_sibling_profile_fire_like_the_ticker(tmp_p
     monkeypatch.setattr(profiles, "_get_default_hermes_home", lambda: launch)
     monkeypatch.setattr(profiles, "_get_profiles_root", lambda: launch / "profiles")
     monkeypatch.setattr(scheduler, "_hermes_home", None)
+    # This routing test uses an ordinary checkout, not a sealed installation payload.
+    # Do not inspect a manifest outside the isolated profile homes.
+    monkeypatch.setattr("pm.environments._payload_manifest", lambda root: None)
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: InProcessCronScheduler())
     secret_scope.set_multiplex_active(False)  # the desktop backend never sets the process flag
 
