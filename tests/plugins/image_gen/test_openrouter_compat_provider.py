@@ -793,6 +793,18 @@ class TestImageApiSurface:
         assert set(_IMAGE_API_MODELS) <= openrouter_ids
         assert not (set(_IMAGE_API_MODELS) & nous_ids)
 
+    def test_offline_picker_keeps_the_default_chain_beside_the_image_api_models(self):
+        """With no live catalog the picker is the offline snapshot (default chain plus the
+        curated Image API models), not the Image API models alone."""
+        from plugins.image_gen.openrouter import (
+            _FALLBACK_MODEL, _IMAGE_API_MODELS, DEFAULT_MODEL, _build_providers,
+        )
+
+        openrouter = {p.name: p for p in _build_providers()}["openrouter"]
+        with patch(_RUNTIME, side_effect=RuntimeError("no creds")):
+            ids = {m["id"] for m in openrouter.list_models()}
+        assert {DEFAULT_MODEL, _FALLBACK_MODEL} | set(_IMAGE_API_MODELS) <= ids
+
 
 
 class TestRegistration:

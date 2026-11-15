@@ -558,14 +558,15 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
             merged = {entry["id"]: entry for entry in self._image_api_live_models()}
         for entry in self._live_models():
             merged.setdefault(entry["id"], entry)
-        # A nonempty live catalog is additive, not authority to hide the curated
-        # Image API choices. Providers can roll a model out late or omit it from
-        # a transient catalog response while the endpoint still accepts it.
-        if self._supports_image_api:
-            for model_id, meta in _IMAGE_API_MODELS.items():
-                merged.setdefault(model_id, {"id": model_id, "display": meta["display"],
-                                              "strengths": f"{meta['strengths']} (Image API)"})
         if merged:
+            # A nonempty live catalog is additive, not authority to hide the curated
+            # Image API choices. Providers can roll a model out late or omit it from
+            # a transient catalog response while the endpoint still accepts it. An
+            # empty one falls through to the offline snapshot below, which has both.
+            if self._supports_image_api:
+                for model_id, meta in _IMAGE_API_MODELS.items():
+                    merged.setdefault(model_id, {"id": model_id, "display": meta["display"],
+                                                  "strengths": f"{meta['strengths']} (Image API)"})
             return sorted(merged.values(), key=lambda m: (_MODEL_PRIORITY.get(m["id"], 2), m["id"]))
         models = [{"id": model_id, **meta} for model_id, meta in _KNOWN_MODEL_META.items()]
         if self._supports_image_api:
