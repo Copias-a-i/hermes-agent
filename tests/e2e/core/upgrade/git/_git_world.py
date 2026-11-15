@@ -11,9 +11,10 @@ synthetic (``build_upgrade_history``) but made of HEAD's own: one commit per fir
 the last ``N1_COMMITS_BEHIND`` commits, each carrying that commit's real tree. The tagged ``base`` is the N-1
 snapshot, with its own installer and updater; ``target`` is HEAD's tree; ``base..target`` is
 ``N1_COMMITS_BEHIND`` commits wide, so a cell can stop upstream on distinct commits in between. No
-installer in that window clones ``--depth 1``, so ``preclone`` seeds the checkout shapes users have
-and the installer then adopts: ``N1_CLONE`` for the depth-1 clone a stale install keeps, and a
-manual full clone or a ``blob:none`` fallback clone.
+installer in that window clones ``--depth 1``, and each finishes by unshallowing its checkout, so the
+shapes users have come from two places: ``preclone`` seeds a manual full clone or a ``blob:none``
+fallback clone that the installer then adopts, and ``depth1`` rebuilds the finished install into the
+depth-1 clone a stale one keeps (``World.make_depth1``).
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes
@@ -43,11 +44,6 @@ from tests.e2e.core.upgrade.git._smart_http import GitHTTPServer, serve_bare
 REPO = "hermes-agent.git"
 SUCCESS = "Update complete"
 TRACEBACK = I.TRACEBACK
-
-# The depth-1 checkout a stale install keeps: an installer cloned ``--depth 1 --single-branch``, and no
-# installer in N-1's window does, so a cell that needs this shape seeds it with ``preclone=N1_CLONE``
-# instead of expecting the installer to make it.
-N1_CLONE = ["--depth", "1", "--single-branch"]
 
 # How far behind HEAD the N-1 snapshot sits, in first-parent commits. It is also the width of the
 # ``base..target`` range, which the cells that stop upstream on commits in between rely on.
@@ -242,6 +238,38 @@ class World:
     def bytes_since(self, mark: int) -> int:
         return sum(r.body_bytes for r in self.srv.since(mark) if r.method == "POST")
 
+    def make_depth1(self) -> None:
+        """Turn the finished install into the stale one an old installer left: ``git clone --depth 1
+        --single-branch`` of origin ``main``, under the same working tree.
+
+        The installers this fixture runs (N-1's and HEAD's) end by unshallowing the checkout into a
+        ``blob:none`` clone: the completion tail's release-history refresh, ``fetch_full_commit_graph``
+        in ``_run_post_update_maintenance``. A depth-1 clone seeded before the install does not survive
+        it, and unsetting the partial-clone flags afterwards would keep the history objects a real
+        depth-1 clone never had. The install's ``.git`` is therefore replaced by the one a fresh depth-1
+        clone writes and the index is rebuilt from HEAD; the files on disk are not touched, and ``git
+        status`` must read the same before and after.
+
+        ``install_bytes`` becomes what that clone downloaded, the "depth-1 install itself" the shallow
+        cells bound an update's fetch by, and ``install_shape`` the new shape."""
+        head, status = self.head(), self.status()
+        fresh = self.root / "depth1-clone"
+        mark = self.srv.mark()
+        cp = subprocess.run(["git", "clone", "-q", "--no-checkout", "--depth", "1", "--single-branch", "--branch",
+                             "main", I.OFFICIAL_HTTPS, str(fresh)],
+                            capture_output=True, text=True, env=self.git_env(), timeout=900)
+        assert cp.returncode == 0, f"depth-1 clone of origin main failed: {cp.stderr[-2000:]}"
+        self.install_bytes = self.bytes_since(mark)
+        cloned = I.git("rev-parse", "HEAD", cwd=fresh)
+        assert cloned == head, f"origin main is at {cloned[:12]}, the install is at {head[:12]}: not the same tree"
+        shutil.rmtree(self.checkout / ".git")
+        shutil.move(str(fresh / ".git"), str(self.checkout / ".git"))
+        shutil.rmtree(fresh)
+        self.git("reset", "-q")
+        assert self.status() == status, (
+            f"swapping in the depth-1 .git changed the working tree's status:\nbefore: {status!r}\nafter: {self.status()!r}")
+        self.install_shape = self.shape()
+
     def update(self, *extra: str, timeout: float = 1200) -> subprocess.CompletedProcess:
         cp = self.sb.cli("update", "--yes", "--branch", "main", *extra, timeout=timeout)
         self.transcripts.append(f"$ hermes update --yes --branch main {' '.join(extra)} -> rc={cp.returncode}\n"
@@ -291,10 +319,9 @@ def _preclone(sb: I.Sandbox, args: list[str], env: dict[str, str]) -> None:
 
 
 @contextlib.contextmanager
-def world(root: Path, *, base: str, installer_ref: str | None = None,
-          preclone: list[str] | None = None, source: Path = H.WORKTREE) -> Iterator[World]:
-    """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
-    of ``installer_ref`` (None: HEAD's). Yields the live ``World``; the server stops on exit."""
+def served(root: Path, *, base: str, source: Path = H.WORKTREE) -> Iterator[World]:
+    """Origin ``main`` at ``base`` served over smart HTTP, and an empty sandbox whose git reaches it as
+    the official GitHub URL. Nothing is installed yet; the server stops on exit."""
     root.mkdir(parents=True, exist_ok=True)
     srv_root = root / "srv"
     srv_root.mkdir(exist_ok=True)
@@ -305,7 +332,18 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
         (sb.home / ".gitconfig").write_text(
             f'[url "{url}"]\n  insteadOf = {I.OFFICIAL_HTTPS}\n  insteadOf = {I.OFFICIAL_SSH}\n'
             '[user]\n  name = user\n  email = user@example.invalid\n', encoding="utf-8")
-        w = World(root=root, srv=srv, bare=bare, sb=sb)
+        yield World(root=root, srv=srv, bare=bare, sb=sb)
+
+
+@contextlib.contextmanager
+def world(root: Path, *, base: str, installer_ref: str | None = None, preclone: list[str] | None = None,
+          depth1: bool = False, source: Path = H.WORKTREE) -> Iterator[World]:
+    """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
+    of ``installer_ref`` (None: HEAD's). ``preclone`` seeds the checkout the installer adopts;
+    ``depth1`` rebuilds the finished install into a stale depth-1 one (``World.make_depth1``).
+    Yields the live ``World``; the server stops on exit."""
+    with served(root, base=base, source=source) as w:
+        sb = w.sb
         if preclone is not None:
             _preclone(sb, preclone, w.git_env())
         script = sb.root / "install.sh"
@@ -316,6 +354,8 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
         assert head == base, f"installer left HEAD at {head}, expected {base}\n{w.diag(cp)}"
         w.install_bytes = w.bytes_since(0)
         w.install_shape = w.shape()
+        if depth1:
+            w.make_depth1()
         yield w
 
 
