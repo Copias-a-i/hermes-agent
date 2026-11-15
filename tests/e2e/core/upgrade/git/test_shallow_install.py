@@ -1,8 +1,9 @@
 """Shallow and stale installs through the real ``hermes update``.
 
-N-1's ``scripts/install.sh`` cloned ``--depth 1 --single-branch``: that is the checkout every
-N-1 user has. The fixture's N-1 installer is HEAD's own, so ``depth1`` and ``checked`` seed that clone
-(``G.N1_CLONE``) and let the installer adopt it. Three installs run concurrently over smart HTTP:
+A stale install keeps the checkout an old ``scripts/install.sh`` made: ``--depth 1 --single-branch``.
+No installer in N-1's window clones that way, so ``depth1`` and ``checked`` seed it (``G.N1_CLONE``) at
+the N-1 snapshot and let N-1's installer adopt it; the update then crosses the real N-1 -> HEAD code
+(``G.build_upgrade_history``). Three installs run concurrently over smart HTTP:
 
 * ``depth1``: the depth-1 N-1 install, updated to HEAD and then to one more release. The first
   update must not download the whole project history to move one release (#123254: on a real
@@ -48,12 +49,12 @@ def _depth1(root, history: G.UpgradeHistory) -> dict:
 
 
 def _checked(root, history: G.UpgradeHistory) -> dict:
+    stops = G.mid_range_stops(history)
     cm, w = G.start_world(root / "checked", base=history.base, installer_ref=history.tag, preclone=G.N1_CLONE,
                           source=history.source)
     run = {"cm": cm, "w": w, "shape0": w.install_shape, "target1": history.target, "checks": []}
-    between = I.git("rev-list", "--first-parent", f"{history.base}..{history.target}", cwd=history.source).split()
-    for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4):
-        w.set_main(between[k])
+    for stop in stops:
+        w.set_main(stop)
         run["checks"].append(w.sb.cli("update", "--check", timeout=600))
     shallow = w.checkout / ".git" / "shallow"
     run["grafts"] = len(shallow.read_text(encoding="utf-8").split()) if shallow.is_file() else 0
