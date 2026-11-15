@@ -85,5 +85,9 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
+      - name: Select workspace-check capacity
+        id: capacity
+        run: python scripts/ci/runner_capacity.py workspace-checks --github-output
+
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs --concurrency 2
+        run: node .github/scripts/run-workspace-checks.mjs --concurrency ${{ steps.capacity.outputs.workspace_checks }}

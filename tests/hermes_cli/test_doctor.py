@@ -1632,3 +1632,41 @@ def test_cron_store_check_reports_writability_and_low_space(
     finding = doctor_state._check_cron_store(False)
     assert expected in capsys.readouterr().out
     assert len(finding.issues) == len(issues) and all(any(s in i for i in finding.issues) for s in issues)
+
+
+@pytest.mark.parametrize(
+    ("commandcode_key", "legacy_key", "expected_calls", "expected_status"),
+    [
+        ("canonical", "legacy", 0, "fail"),
+        ("canonical", "", 1, "ok"),
+        ("", "legacy", 1, "ok"),
+        ("same", "same", 1, "ok"),
+    ],
+    ids=("conflict-fails-closed", "canonical-only", "legacy-only", "equal-aliases"),
+)
+def test_commandcode_doctor_probe_resolves_aliases_before_http(
+        monkeypatch, commandcode_key, legacy_key, expected_calls, expected_status):
+    """Doctor must reuse the runtime alias resolver and never probe ambiguous credentials."""
+    from hermes_cli import doctor_connectivity as connectivity
+    import httpx
+
+    monkeypatch.setenv("COMMANDCODE_API_KEY", commandcode_key)
+    monkeypatch.setenv("CMD_API_KEY", legacy_key)
+    calls = []
+
+    def fake_get(*args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(httpx, "get", fake_get)
+    result = connectivity._probe_apikey_provider(
+        "CommandCode", ("COMMANDCODE_API_KEY", "CMD_API_KEY"),
+        "https://api.commandcode.ai/provider/v1/models", "COMMANDCODE_BASE_URL", True,
+    )
+
+    assert len(calls) == expected_calls
+    assert result.lines[0][0] == connectivity._GLYPH[expected_status][0]
+    if expected_status == "fail":
+        rendered = " ".join(str(part) for part in (*result.lines[0], *result.issues))
+        assert commandcode_key not in rendered
+        assert legacy_key not in rendered

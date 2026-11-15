@@ -64,20 +64,59 @@ if [ -z "$REPO" ]; then
   REPO="$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || printf '%s' "$script_dir")"
 fi
 
-# sort -V orders v2026.4.8 before v2026.4.13 (numeric), which a plain
-# lexicographic sort gets wrong.
-mapfile -t tags < <(
-  git -C "$REPO" tag --list 'v*' \
-    | grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' \
-    | sort -V
-)
+# Sort numeric version components without GNU sort -V so this remains usable by
+# the Bash 3.2 shipped with macOS as well as Linux and Git Bash. Keep the git
+# command outside process substitution: Bash otherwise exposes the consumer's
+# status, not a failed producer's. Exit 3 is reserved for a successful listing
+# with no eligible tags; failures to list or process tags keep their genuine
+# non-3 status.
+tag_list=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
+eligible_tags=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
+sorted_tags=$(mktemp "${TMPDIR:-/tmp}/pick-release-tags.XXXXXX") || exit 1
+cleanup() {
+  rm -f "$tag_list" "$eligible_tags" "$sorted_tags"
+}
+trap cleanup EXIT HUP INT TERM
+
+if git -C "$REPO" tag --list 'v*' > "$tag_list"; then
+  :
+else
+  git_status=$?
+  echo "error: failed to list release tags in $REPO" >&2
+  exit "$git_status"
+fi
+
+# grep status 1 means no matching lines, which is the typed no-candidates
+# condition after the successful git listing above. Any other grep error is
+# genuine and must not be converted to exit 3.
+if grep -E '^v[0-9]{4}\.[0-9]+\.[0-9]+(\.[0-9]+)?$' "$tag_list" > "$eligible_tags"; then
+  :
+else
+  grep_status=$?
+  if [ "$grep_status" -ne 1 ]; then
+    echo "error: failed to filter release tags in $REPO" >&2
+    exit "$grep_status"
+  fi
+fi
+LC_ALL=C sort -t. -k1.2n -k2,2n -k3,3n -k4,4n "$eligible_tags" > "$sorted_tags"
+
+# Read with Bash 3-compatible primitives: macOS still ships Bash 3.2, which
+# lacks `mapfile`, while Git for Windows and Ubuntu also support this loop.
+tags=()
+while IFS= read -r tag; do
+  [ -n "$tag" ] && tags+=("$tag")
+done < "$sorted_tags"
 
 total="${#tags[@]}"
 if [ "$total" -eq 0 ]; then
   echo "error: no release tags found in $REPO" >&2
   echo '       A shallow clone has no tags: fetch with tags (actions/checkout' >&2
   echo '       with fetch-depth: 0, or fetch-tags: true).' >&2
-  exit 1
+  # Exit 3 is a typed, recoverable answer for callers that deliberately
+  # support a repository bootstrap state with no eligible release tags.
+  # Keep all other picker failures non-zero-but-not-3 so CI never mistakes a
+  # broken git invocation or invalid input for an honest coverage gap.
+  exit 3
 fi
 
 if [ "$total" -le "$COUNT" ]; then

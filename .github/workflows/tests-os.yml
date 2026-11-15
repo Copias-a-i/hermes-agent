@@ -123,6 +123,14 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Select bounded OS-runner capacity
+        # Every matrix row consumes these outputs. runner_capacity.py rejects an
+        # unknown runner before tests launch, so a newly added OS cannot fall
+        # back to os.cpu_count() or an empty workflow expression.
+        id: capacity
+        shell: bash
+        run: python scripts/ci/runner_capacity.py os-tests --runner '${{ matrix.runner }}' --github-output
+
       - name: Run ${{ matrix.marker }} tests
         # scripts/run_tests.sh — the canonical runner, same as every other
         # lane: per-file subprocess isolation (run_tests_parallel.py). It
@@ -148,6 +156,19 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+
+          # Do not silently let an empty Actions output reach the test runner:
+          # its default would otherwise derive parallelism from os.cpu_count().
+          if [ "${HERMES_TEST_CAPACITY_VALIDATED:-false}" != "true" ]; then
+            echo "::error::capacity policy did not emit required bounded outputs"
+            exit 1
+          fi
+          case "${HERMES_TEST_WORKERS:-}" in
+            ''|*[!0-9]*) echo "::error::invalid bounded worker count"; exit 1 ;;
+          esac
+          case "${HERMES_TEST_FILE_TIMEOUT:-}" in
+            ''|*[!0-9]*) echo "::error::invalid bounded file timeout"; exit 1 ;;
+          esac
 
           LIST="${RUNNER_TEMP:-.}/selected-tests.txt"
 
@@ -200,8 +221,9 @@ jobs:
           # the 300-second default by seconds in run 39701325791, so give only
           # that lane a bounded 600-second per-file deadline. ARM remains its
           # separately measured two-worker budget.
-          HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || matrix.runner == 'windows-latest' && '3' || '' }}
-          HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || matrix.runner == 'windows-latest' && '600' || '' }}
+          HERMES_TEST_WORKERS: ${{ steps.capacity.outputs.workers }}
+          HERMES_TEST_FILE_TIMEOUT: ${{ steps.capacity.outputs.file_timeout }}
+          HERMES_TEST_CAPACITY_VALIDATED: ${{ steps.capacity.outputs.workers != '' && steps.capacity.outputs.file_timeout != '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.

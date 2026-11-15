@@ -1,37 +1,69 @@
-"""Capacity contracts for the native Windows OS-test matrix."""
+"""Executable capacity-policy contracts for every OS-test runner."""
 
+from __future__ import annotations
+
+import os
 from pathlib import Path
+import subprocess
+import sys
+
+import pytest
 
 
-WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/tests-os.yml"
-INSTALL_UPDATE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-install-update-e2e.yml"
-TEST_RUNNER = Path(__file__).resolve().parents[2] / "scripts/run_tests.sh"
+REPOSITORY = Path(__file__).resolve().parents[2]
+POLICY = REPOSITORY / "scripts/ci/runner_capacity.py"
 
 
-def test_windows_install_update_e2e_has_bounded_worker_and_disk_budgets():
-    """Three workers meet the deadline while at most two clean toolchains consume disk."""
-    workflow = INSTALL_UPDATE_WORKFLOW.read_text(encoding="utf-8")
-    runner = TEST_RUNNER.read_text(encoding="utf-8")
+@pytest.mark.parametrize(
+    ("runner", "expected"),
+    [
+        ("windows-latest", {"workers": "3", "file_timeout": "600", "job_timeout": "30"}),
+        ("windows-11-arm", {"workers": "2", "file_timeout": "600", "job_timeout": "75"}),
+        ("macos-13", {"workers": "2", "file_timeout": "600"}),
+        ("macos-14", {"workers": "2", "file_timeout": "600"}),
+        ("macos-latest", {"workers": "2", "file_timeout": "600"}),
+    ],
+)
+def test_os_capacity_cli_emits_bounded_github_outputs(
+    tmp_path: Path, runner: str, expected: dict[str, str]
+) -> None:
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        [sys.executable, str(POLICY), "os-tests", "--runner", runner, "--github-output"],
+        cwd=REPOSITORY,
+        env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        text=True,
+        capture_output=True,
+    )
 
-    assert "runs-on: windows-latest" in workflow
-    assert "timeout-minutes: 75" in workflow
-    assert "HERMES_TEST_WORKERS: '3'" in workflow
-    assert "HERMES_E2E_INSTALL_SLOTS: '2'" in workflow
-    assert "HERMES_TEST_FILE_RETRIES: '0'" in workflow
-    assert "HERMES_E2E_INSTALL_SLOTS" in runner
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+    assert values == expected
+    assert int(values["workers"]) > 0
+    assert int(values["file_timeout"]) > 0
 
 
-def test_windows_lanes_use_separate_bounded_capacity_budgets():
-    """x64 and ARM preserve their individually measured process-tree budgets."""
-    source = WORKFLOW.read_text(encoding="utf-8")
+def test_os_capacity_cli_rejects_unknown_runner_before_test_launch(tmp_path: Path) -> None:
+    output = tmp_path / "github-output"
+    result = subprocess.run(
+        [sys.executable, str(POLICY), "os-tests", "--runner", "macos-future", "--github-output"],
+        cwd=REPOSITORY,
+        env={**os.environ, "GITHUB_OUTPUT": str(output)},
+        text=True,
+        capture_output=True,
+    )
 
-    arm_lane = source.index("runner: windows-11-arm")
-    assert "timeout: 75" in source[arm_lane:source.index("steps:", arm_lane)]
-    assert (
-        "HERMES_TEST_WORKERS: ${{ matrix.runner == 'windows-11-arm' && '2' || "
-        "matrix.runner == 'windows-latest' && '3' || '' }}"
-    ) in source
-    assert (
-        "HERMES_TEST_FILE_TIMEOUT: ${{ matrix.runner == 'windows-11-arm' && '600' || "
-        "matrix.runner == 'windows-latest' && '600' || '' }}"
-    ) in source
+    assert result.returncode != 0
+    assert "unsupported OS-test runner: macos-future" in result.stderr
+    assert not output.exists()
+
+
+def test_windows_install_capacity_bounds_disk_heavy_journeys() -> None:
+    result = subprocess.run(
+        [sys.executable, str(POLICY), "windows-install-update"],
+        cwd=REPOSITORY,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.strip() == '{"file_timeout": 3600, "install_slots": 2, "job_timeout": 165, "workers": 2}'
