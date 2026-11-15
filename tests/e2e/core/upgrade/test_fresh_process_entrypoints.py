@@ -654,6 +654,8 @@ _ENTRIES = {
     "hermes-acp-version": Entry("hermes-acp", ("--version",), frozenset({0}), prints_version=True),
     "hermes-acp-help": Entry("hermes-acp", ("--help",), frozenset({0})),
     "hermes-agent-help": Entry("hermes-agent", ("--help",), frozenset({0})),
+    # Fail-open by contract: with no arguments it prints its "unavailable" pack and exits 0.
+    "fleet-session-bootstrap-fail-open": Entry("fleet-session-bootstrap", (), frozenset({0})),
 }
 def _run_on_tty(argv: list[str], *, env: dict[str, str], cwd: Path, writable: list[Path],
                 timeout: float) -> subprocess.CompletedProcess:
