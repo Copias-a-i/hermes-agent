@@ -67,6 +67,7 @@ from hermes_cli.setup import (  # noqa: F401 — resolved lazily by siblings thr
     prompt_yes_no,
 )
 from hermes_cli.colors import Colors, color
+from hermes_cli.gateway_stop import _mark_planned_stop, _wait_for_terminal_stopped_state
 logger = logging.getLogger(__name__)
 
 # Shared ``subprocess.run`` kwargs for text-mode probes (stdout/stderr captured, decode-tolerant).
@@ -1960,35 +1961,6 @@ def _force_kill_survivors(survivors, *, kill=None) -> None:
         )
         with contextlib.suppress((ProcessLookupError, PermissionError, OSError)):
             kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
-
-
-def _mark_planned_stop(pid: int | None = None) -> None:
-    """Best-effort planned-stop marker for ``pid`` (default: the recorded gateway PID)."""
-    try:
-        from gateway.status import get_running_pid, write_planned_stop_marker
-        if pid is None:
-            pid = get_running_pid(cleanup_stale=False)
-        if pid is not None:
-            write_planned_stop_marker(pid)
-    except Exception:
-        pass
-
-
-_STOP_TERMINAL_STATE_TIMEOUT = 5.0
-
-
-def _wait_for_terminal_stopped_state(timeout: float = _STOP_TERMINAL_STATE_TIMEOUT) -> bool:
-    """Wait boundedly until a fresh runtime-status read proves a clean stop."""
-    from gateway.status import get_running_pid, read_runtime_status
-
-    deadline = time.monotonic() + max(0.0, timeout)
-    while True:
-        state = read_runtime_status() or {}
-        if state.get("gateway_state") == "stopped" and get_running_pid() is None:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.1)
 
 
 def stop_profile_gateway() -> bool:

@@ -584,22 +584,27 @@ class TestStopProfileGateway:
 
         pid = 12345
         calls = []
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid)
+        alive = {"value": True}
+
+        def _drain(target, timeout):
+            calls.append(("drain", target, timeout))
+            alive["value"] = False  # the marker watcher drove a graceful exit
+            return True
+
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid if alive["value"] else None)
         monkeypatch.setattr(gateway_windows, "_windows_stop_drain_timeout", lambda: 7.0)
-        monkeypatch.setattr(
-            gateway_windows,
-            "_drain_gateway_pid",
-            lambda target, timeout: calls.append(("drain", target, timeout)) or True,
-        )
+        monkeypatch.setattr(gateway_windows, "_drain_gateway_pid", _drain)
         monkeypatch.setattr(
             gateway_windows,
             "_force_terminate_known_gateway_pids",
             lambda pids: calls.append(("force", pids)),
         )
         monkeypatch.setattr(gateway.os, "kill", lambda *_: calls.append(("kill",)))
-        monkeypatch.setattr("gateway.status._pid_exists", lambda target: False)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda target: alive["value"])
         monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
         monkeypatch.setattr(gateway, "_reap_unsupervised_gateway_orphans", lambda **_: False)
+        # Success needs the exit AND a durable ``stopped`` snapshot; that readback has its own tests.
+        monkeypatch.setattr(gateway, "_wait_for_terminal_stopped_state", lambda: True)
 
         assert gateway.stop_profile_gateway() is True
         assert calls == [("drain", pid, 7.0)]
@@ -611,7 +616,13 @@ class TestStopProfileGateway:
 
         pid = 12345
         calls = []
-        monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid)
+        alive = {"value": True}
+
+        def _force(pids):
+            calls.append(("force", pids))
+            alive["value"] = False  # taskkill /F ended the wedged gateway
+
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid if alive["value"] else None)
         monkeypatch.setattr(gateway_windows, "_windows_stop_drain_timeout", lambda: 7.0)
         monkeypatch.setattr("gateway.status.get_process_start_time", lambda target: 100)
         monkeypatch.setattr(
@@ -619,15 +630,12 @@ class TestStopProfileGateway:
             "_drain_gateway_pid",
             lambda target, timeout: calls.append(("drain", target, timeout)) or False,
         )
-        monkeypatch.setattr(
-            gateway_windows,
-            "_force_terminate_known_gateway_pids",
-            lambda pids: calls.append(("force", pids)),
-        )
+        monkeypatch.setattr(gateway_windows, "_force_terminate_known_gateway_pids", _force)
         monkeypatch.setattr(gateway.os, "kill", lambda *_: calls.append(("kill",)))
-        monkeypatch.setattr("gateway.status._pid_exists", lambda target: False)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda target: alive["value"])
         monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
         monkeypatch.setattr(gateway, "_reap_unsupervised_gateway_orphans", lambda **_: False)
+        monkeypatch.setattr(gateway, "_wait_for_terminal_stopped_state", lambda: True)
 
         assert gateway.stop_profile_gateway() is True
         assert calls == [("drain", pid, 7.0), ("force", {pid: 100})]
@@ -666,6 +674,7 @@ class TestStopProfileGateway:
         monkeypatch.setattr(status, "terminate_pid", _terminate)
         monkeypatch.setattr(status, "remove_pid_file", lambda: None)
         monkeypatch.setattr(gateway, "_reap_unsupervised_gateway_orphans", lambda **_: False)
+        monkeypatch.setattr(gateway, "_wait_for_terminal_stopped_state", lambda: True)
 
         assert gateway.stop_profile_gateway() is True
         assert calls == [(pid, True, 100)]

@@ -131,6 +131,91 @@ async def test_gateway_stop_does_not_signal_exit_before_terminal_state_persists(
     await asyncio.wait_for(waiting_for_exit, timeout=1.0)
 
 
+def _patch_stop_phases_with_a_raising_adapter_teardown(monkeypatch, runner):
+    """Every ``stop()`` phase is a no-op except the adapter teardown, which raises.
+
+    Returns the list of ``_shutdown_event.is_set()`` samples taken each time the terminal status
+    writer is flushed, so a test can prove the flush came BEFORE the process could exit.
+    """
+    event_set_at_flush = []
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    async def exploding_teardown(*_args, **_kwargs):
+        raise RuntimeError("adapter teardown exploded")
+
+    async def flush(timeout=2.0):
+        event_set_at_flush.append(runner._shutdown_event.is_set())
+        return True
+
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_begin_teardown", no_op)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_drain_active_work", no_op)
+    monkeypatch.setattr(gateway_run.GatewayRunner, "_stop_finalize_agents_and_adapters", exploding_teardown)
+    monkeypatch.setattr("gateway.status.flush_runtime_status_async", flush)
+    monkeypatch.setattr("gateway.status.read_runtime_status", lambda *_a, **_k: {"gateway_state": "stopped"})
+    return event_set_at_flush
+
+
+@pytest.mark.asyncio
+async def test_gateway_stop_persists_terminal_state_before_release_when_a_phase_raises(monkeypatch):
+    """A teardown phase that raises must not let the process exit over a non-terminal status.
+
+    ``_stop_impl`` releases ``wait_for_shutdown`` from a ``finally`` so a failed teardown cannot strand
+    callers. That release used to run with the terminal persist never attempted: ``start_gateway``
+    returned and the process exited 0 while ``gateway_state.json`` still held the pre-stop snapshot.
+    """
+    runner, _adapter = make_restart_runner()
+    event_set_at_flush = _patch_stop_phases_with_a_raising_adapter_teardown(monkeypatch, runner)
+
+    with pytest.raises(RuntimeError, match="adapter teardown exploded"):
+        await runner.stop()
+
+    assert event_set_at_flush == [False], "terminal status must be flushed before the exit is released"
+    runner._update_runtime_status.assert_called_once()
+    assert runner._update_runtime_status.call_args.args[0] == "stopped"
+    assert runner._shutdown_event.is_set() is True, "a failed teardown must not strand wait_for_shutdown()"
+    assert runner.exit_code == 1, "a failed teardown must not exit 0"
+
+
+@pytest.mark.asyncio
+async def test_failed_teardown_keeps_the_service_restart_exit_code(monkeypatch):
+    """A restart-via-service that fails mid-teardown still exits 75, not a generic 1."""
+    runner, _adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._restart_via_service = True
+    _patch_stop_phases_with_a_raising_adapter_teardown(monkeypatch, runner)
+
+    with pytest.raises(RuntimeError, match="adapter teardown exploded"):
+        await runner.stop()
+
+    assert runner.exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE
+    assert runner._shutdown_event.is_set() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("visible_state", "confirmed", "exit_code"),
+    [("stopped", True, None), ("draining", False, 1)],
+)
+async def test_terminal_state_must_be_visible_to_a_fresh_reader_after_the_flush(
+    monkeypatch, visible_state, confirmed, exit_code
+):
+    """A flushed queue is not the contract: the terminal snapshot must read back, or the exit fails."""
+    from gateway.run_shutdown_terminal_state import persist_terminal_runtime_status
+
+    runner, _adapter = make_restart_runner()
+
+    async def flush(timeout=2.0):
+        return True
+
+    monkeypatch.setattr("gateway.status.flush_runtime_status_async", flush)
+    monkeypatch.setattr("gateway.status.read_runtime_status", lambda *_a, **_k: {"gateway_state": visible_state})
+
+    assert await persist_terminal_runtime_status(runner, MagicMock()) is confirmed
+    assert runner.exit_code == exit_code
+
+
 @pytest.mark.asyncio
 async def test_gateway_stop_settles_completion_batch_before_adapter_disconnect():
     runner, adapter = make_restart_runner()
