@@ -3,10 +3,17 @@
 ``World`` is one sandboxed machine (``_install_helpers.new_sandbox``: bwrap, empty fake HOME, the
 git wrapper that reports the official remote URL) whose ``~/.gitconfig`` rewrites the official
 GitHub URL to a loopback ``git http-backend`` origin (``_smart_http``). The install itself comes
-from a real ``scripts/install.sh``: N-1's own copy for an N-1 install (it makes the depth-1
-single-branch clone N-1 users have), HEAD's for a HEAD install (a ``--filter=blob:none`` clone).
-``preclone`` seeds a checkout the installer then adopts, for the clone shapes users got another
-way (a manual full clone, a ``blob:none`` fallback clone).
+from a real ``scripts/install.sh``: the one at ``installer_ref`` for an N-1 install, HEAD's for a
+HEAD install (a ``--filter=blob:none`` clone).
+
+The fork carries no release tags, so N-1 is not "the newest tag before HEAD". The upgrade history is
+synthetic (``build_upgrade_history``) but made of HEAD's own: one commit per first-parent commit of
+the last ``N1_COMMITS_BEHIND`` commits, each carrying that commit's real tree. The tagged ``base`` is the N-1
+snapshot, with its own installer and updater; ``target`` is HEAD's tree; ``base..target`` is
+``N1_COMMITS_BEHIND`` commits wide, so a cell can stop upstream on distinct commits in between. No
+installer in that window clones ``--depth 1``, so ``preclone`` seeds the checkout shapes users have
+and the installer then adopts: ``N1_CLONE`` for the depth-1 clone a stale install keeps, and a
+manual full clone or a ``blob:none`` fallback clone.
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes
@@ -17,6 +24,7 @@ message that explains itself.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import shutil
@@ -35,6 +43,15 @@ from tests.e2e.core.upgrade.git._smart_http import GitHTTPServer, serve_bare
 REPO = "hermes-agent.git"
 SUCCESS = "Update complete"
 TRACEBACK = I.TRACEBACK
+
+# The depth-1 checkout a stale install keeps: an installer cloned ``--depth 1 --single-branch``, and no
+# installer in N-1's window does, so a cell that needs this shape seeds it with ``preclone=N1_CLONE``
+# instead of expecting the installer to make it.
+N1_CLONE = ["--depth", "1", "--single-branch"]
+
+# How far behind HEAD the N-1 snapshot sits, in first-parent commits. It is also the width of the
+# ``base..target`` range, which the cells that stop upstream on commits in between rely on.
+N1_COMMITS_BEHIND = 12
 
 PYTESTMARK = [
     pytest.mark.platforms("linux"),
@@ -79,8 +96,24 @@ def _commit(source: Path, tree: str, message: str, date: str, parent: str | None
     return cp.stdout.strip()
 
 
-def build_upgrade_history(root: Path) -> UpgradeHistory:
-    """Build a dated release -> upgrade ancestry without checkout tags or global git config."""
+def _first_parent_snapshots(count: int) -> list[tuple[str, str]]:
+    """``(tree, commit)`` of HEAD and its ``count - 1`` first-parent ancestors, oldest first."""
+    rows = I.git("log", "--first-parent", f"--max-count={count}", "--format=%T %H", "HEAD",
+                 cwd=H.WORKTREE).splitlines()
+    assert len(rows) == count, (
+        f"the upgrade fixture reads the last {count} first-parent commits of HEAD's history and found "
+        f"{len(rows)}: check out with the full history (actions/checkout fetch-depth: 0)")
+    return [(row.split()[0], row.split()[1]) for row in reversed(rows)]
+
+
+def build_upgrade_history(root: Path, *, behind: int = N1_COMMITS_BEHIND) -> UpgradeHistory:
+    """A dated release -> upgrade ancestry made of HEAD's own recent history, with no checkout tags
+    or global git config.
+
+    One synthetic commit per first-parent commit of HEAD from ``behind + 1`` back to HEAD, each
+    carrying that commit's real tree: ``untagged`` is the snapshot before N-1, ``base`` (tagged) is
+    N-1 with its own installer and updater, ``target`` is HEAD, and ``base..target`` is ``behind``
+    commits wide. Identities and dates are fixed, so the same history is built wherever it runs."""
     source = root / "history.git"
     root.mkdir(parents=True, exist_ok=True)
     cp = subprocess.run(["git", "init", "-q", "--bare", str(source)], capture_output=True, text=True,
@@ -88,19 +121,40 @@ def build_upgrade_history(root: Path) -> UpgradeHistory:
     assert cp.returncode == 0, f"creating upgrade fixture repository failed: {cp.stderr}"
     objects = I.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=H.WORKTREE)
     (source / "objects" / "info" / "alternates").write_text(f"{Path(objects) / 'objects'}\n", encoding="utf-8")
-    tree = I.git("rev-parse", "HEAD^{tree}", cwd=H.WORKTREE)
-    untagged = _commit(source, tree, "e2e: untagged fixture root", "2026-01-01T00:00:00+0000")
-    base = _commit(source, tree, "e2e: release fixture", "2026-01-02T00:00:00+0000", untagged)
-    target = _commit(source, tree, "e2e: post-release upgrade", "2026-01-03T00:00:00+0000", base)
+    snapshots = _first_parent_snapshots(behind + 2)
+    assert snapshots[1][0] != snapshots[-1][0], (
+        f"the N-1 snapshot {snapshots[1][1][:12]} (HEAD~{behind}) and HEAD carry the same tree: the upgrade "
+        f"would cross no code")
+
+    def day(index: int) -> str:
+        return (dt.date(2026, 1, 1) + dt.timedelta(days=index)).isoformat()
+
+    commits: list[str] = []
+    for index, (tree, real) in enumerate(snapshots):
+        role = "untagged fixture root" if index == 0 else "release fixture" if index == 1 else "post-release upgrade"
+        commits.append(_commit(source, tree, f"e2e: {role} ({real[:12]})", f"{day(index)}T00:00:00+0000",
+                               commits[-1] if commits else None))
+    untagged, base, target = commits[0], commits[1], commits[-1]
     tag = "v2099.1.1"
-    for name, ref, date in (("e2e-not-a-release", untagged, "2026-01-01T00:00:01+0000"),
-                            (tag, base, "2026-01-02T00:00:01+0000")):
+    for name, ref, stamp in (("e2e-not-a-release", untagged, f"{day(0)}T00:00:01+0000"),
+                             (tag, base, f"{day(1)}T00:00:01+0000")):
         cp = subprocess.run(["git", "tag", "-a", name, ref, "-m", name], cwd=str(source), capture_output=True,
-                            text=True, env=_fixture_git_env(date))
+                            text=True, env=_fixture_git_env(stamp))
         assert cp.returncode == 0, f"creating upgrade fixture tag {name} failed: {cp.stderr}"
     I.git("update-ref", "refs/heads/main", target, cwd=source)
     I.git("symbolic-ref", "HEAD", "refs/heads/main", cwd=source)
     return UpgradeHistory(source=source, untagged=untagged, base=base, target=target, tag=tag)
+
+
+def mid_range_stops(history: UpgradeHistory) -> list[str]:
+    """Where a cell stops upstream between N-1 and HEAD, oldest first: the commits a quarter, half and
+    three quarters of the way from N-1 to HEAD, so each stop is a later move than the last and a
+    passive check at each one grafts a different tip. A range too short for three distinct commits
+    fails here rather than repeating one."""
+    between = I.git("rev-list", "--first-parent", f"{history.base}..{history.target}", cwd=history.source).split()
+    assert len(between) >= 3, (
+        f"{len(between)} commit(s) between N-1 and HEAD cannot hold three distinct mid-range stops")
+    return [between[k] for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4)]
 
 
 def installer_script(ref: str | None, source: Path) -> str:
