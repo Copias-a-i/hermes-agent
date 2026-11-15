@@ -1,8 +1,9 @@
 """Shallow and stale installs through the real ``hermes update``.
 
 A stale install keeps the checkout an old ``scripts/install.sh`` made: ``--depth 1 --single-branch``.
-No installer in N-1's window clones that way, so ``depth1`` and ``checked`` seed it (``G.N1_CLONE``) at
-the N-1 snapshot and let N-1's installer adopt it; the update then crosses the real N-1 -> HEAD code
+No installer in N-1's window clones that way and every one finishes by unshallowing its checkout, so
+``depth1`` and ``checked`` install N-1 with N-1's installer and then rebuild the checkout into the depth-1
+clone (``World.make_depth1``); the update then crosses the real N-1 -> HEAD code
 (``G.build_upgrade_history``). Three installs run concurrently over smart HTTP:
 
 * ``depth1``: the depth-1 N-1 install, updated to HEAD and then to one more release. The first
@@ -31,10 +32,12 @@ from tests.e2e.core.upgrade.git import _git_world as G
 pytestmark = G.PYTESTMARK
 
 ORPHAN = "orphan divergence"
+# What `git clone --depth 1 --single-branch` leaves: shallow, and neither a promisor nor a filtered remote.
+DEPTH1_SHAPE = {"promisor": "-", "filter": "-", "shallow": "true"}
 
 
 def _depth1(root, history: G.UpgradeHistory) -> dict:
-    cm, w = G.start_world(root / "depth1", base=history.base, installer_ref=history.tag, preclone=G.N1_CLONE,
+    cm, w = G.start_world(root / "depth1", base=history.base, installer_ref=history.tag, depth1=True,
                           source=history.source)
     run = {"cm": cm, "w": w, "shape0": w.install_shape, "target1": history.target}
     w.set_main(history.target)
@@ -50,7 +53,7 @@ def _depth1(root, history: G.UpgradeHistory) -> dict:
 
 def _checked(root, history: G.UpgradeHistory) -> dict:
     stops = G.mid_range_stops(history)
-    cm, w = G.start_world(root / "checked", base=history.base, installer_ref=history.tag, preclone=G.N1_CLONE,
+    cm, w = G.start_world(root / "checked", base=history.base, installer_ref=history.tag, depth1=True,
                           source=history.source)
     run = {"cm": cm, "w": w, "shape0": w.install_shape, "target1": history.target, "checks": []}
     for stop in stops:
@@ -100,7 +103,7 @@ def test_stale_depth1_install_updates_without_fetching_the_whole_history(runs):
     run = _run(runs, "depth1")
     w: G.World = run["w"]
     cp1 = run["cp1"]
-    assert run["shape0"]["shallow"] == "true", f"the seeded depth-1 N-1 clone did not stay shallow: {run['shape0']}"
+    assert run["shape0"] == DEPTH1_SHAPE, f"the stale N-1 install is not a depth-1 clone: {run['shape0']}"
     assert cp1.returncode == 0 and run["head1"] == run["target1"], f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
     main_fetch = run["fetches1"][0].body_bytes if run["fetches1"] else 0
     bound = 2 * w.install_bytes
@@ -129,6 +132,7 @@ def test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(runs)
     run = _run(runs, "checked")
     w: G.World = run["w"]
     cp1 = run["cp1"]
+    assert run["shape0"] == DEPTH1_SHAPE, f"the stale N-1 install is not a depth-1 clone: {run['shape0']}"
     for cp in run["checks"]:
         assert cp.returncode == 0 and G.TRACEBACK not in G.output(cp), f"`hermes update --check` failed:\n{w.diag(cp)}"
     assert cp1.returncode == 0 and run["head1"] == run["target1"], f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
