@@ -23,7 +23,7 @@ def test_cache_reuses_safe_partition_without_storing_session_id(tmp_path: Path) 
     assert cache.get(key, **metadata) == {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
     entry = cache.path_for(key)
     assert stat.S_IMODE(entry.stat().st_mode) == 0o600
-    assert "session" not in entry.read_text(encoding="utf-8")
+    assert "session" not in entry.read_text(encoding="utf-8-sig")
 
 
 def test_cache_lock_is_private_and_available_to_later_readers(tmp_path: Path) -> None:
@@ -54,7 +54,7 @@ def test_receipt_is_atomic_private_and_redacted(tmp_path: Path) -> None:
     )
 
     assert stat.S_IMODE(receipt.stat().st_mode) == 0o600
-    data = json.loads(receipt.read_text(encoding="utf-8"))
+    data = json.loads(receipt.read_text(encoding="utf-8-sig"))
     assert data["availability"] == "unavailable"
     assert data["count"] == 0
     assert data["elapsed_ms"] == 4
@@ -76,6 +76,80 @@ def test_state_stores_reject_git_roots_and_intermediate_symlinks(tmp_path: Path)
     (tmp_path / "link").symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="symlink"):
         ReceiptStore(tmp_path / "link" / "state")
+
+
+def test_state_root_below_a_git_worktree_is_rejected_before_it_is_created(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.cache import ReceiptStore
+
+    repository = tmp_path / "repository"
+    (repository / ".git").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="Git"):
+        ReceiptStore(repository / "state")
+
+    assert not (repository / "state").exists()
+
+
+@pytest.mark.platforms("posix")
+def test_state_root_that_is_itself_a_symlink_is_rejected(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.cache import CacheStore
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "link").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink"):
+        CacheStore(tmp_path / "link")
+    assert not (outside / "fleet-session-bootstrap").exists()
+
+
+@pytest.mark.platforms("posix")
+def test_state_root_is_admitted_when_resolve_only_respells_it(tmp_path: Path) -> None:
+    """Spelling is not redirection: resolve() re-spells a root that goes nowhere else (Windows short
+    names and case; here a POSIX ``//`` prefix) and such a root must not be mistaken for an escape."""
+    from fleet_session_bootstrap.cache import CacheStore
+
+    root = tmp_path / "state"
+    respelled = Path("/" + str(root))
+    assert respelled.resolve() != respelled
+
+    store = CacheStore(respelled)
+
+    assert os.path.samefile(store.root, root / "fleet-session-bootstrap" / "cache")
+
+
+@pytest.mark.platforms("posix")
+def test_state_root_cannot_reach_outside_through_a_symlink_followed_by_dotdot(tmp_path: Path) -> None:
+    """``link/..`` is the parent of the link's *target*; the root is refused before anything is created."""
+    from fleet_session_bootstrap.cache import ReceiptStore
+
+    inner = tmp_path / "outside" / "inner"
+    inner.mkdir(parents=True)
+    (tmp_path / "link").symlink_to(inner, target_is_directory=True)
+
+    with pytest.raises(ValueError):
+        ReceiptStore(tmp_path / "link" / ".." / "state")
+
+    assert not (tmp_path / "outside" / "state").exists()
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.platforms("windows")
+def test_state_root_through_a_junction_is_rejected(tmp_path: Path) -> None:
+    from fleet_session_bootstrap.cache import CacheStore
+
+    target = tmp_path / "target"
+    target.mkdir()
+    junction = tmp_path / "junction"
+    command = str(Path(os.environ["SystemRoot"]) / "System32" / "cmd.exe")
+    made = subprocess.run([command, "/d", "/c", "mklink", "/J", str(junction), str(target)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+    assert made.returncode == 0, made.stdout + made.stderr
+    try:
+        with pytest.raises(ValueError, match="junction"):
+            CacheStore(junction / "state")
+    finally:
+        junction.rmdir()
+    assert not (target / "state").exists()
 
 
 def test_git_probe_uses_platform_resolution_and_rejects_missing_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,7 +189,7 @@ def test_receipts_use_session_digest_for_idempotency_and_separation(tmp_path: Pa
     assert first == store.write("session-a", payload)
     second = store.write("session-b", payload)
     assert first != second
-    first_data = json.loads(first.read_text(encoding="utf-8"))
+    first_data = json.loads(first.read_text(encoding="utf-8-sig"))
     assert first_data["attempt_digest"] != "session-a"
     assert first_data["cache_state"] == "miss"
 
@@ -129,8 +203,8 @@ def test_receipts_scope_same_session_to_the_trusted_partition(tmp_path: Path) ->
     second = store.write("shared-session", {**base, "namespace_digest": "b" * 64})
 
     assert first != second
-    assert json.loads(first.read_text(encoding="utf-8"))["namespace_digest"] == "a" * 64
-    assert json.loads(second.read_text(encoding="utf-8"))["namespace_digest"] == "b" * 64
+    assert json.loads(first.read_text(encoding="utf-8-sig"))["namespace_digest"] == "a" * 64
+    assert json.loads(second.read_text(encoding="utf-8-sig"))["namespace_digest"] == "b" * 64
 
 
 def test_concurrent_same_session_receipts_do_not_cross_partition(tmp_path: Path) -> None:
@@ -151,7 +225,7 @@ ReceiptStore(Path(sys.argv[1])).write('shared-session', {
 
     receipts = list((state / "fleet-session-bootstrap" / "receipts").glob("*.json"))
     assert len(receipts) == 2
-    assert {json.loads(receipt.read_text(encoding="utf-8"))["namespace_digest"] for receipt in receipts} == {"a" * 64, "b" * 64}
+    assert {json.loads(receipt.read_text(encoding="utf-8-sig"))["namespace_digest"] for receipt in receipts} == {"a" * 64, "b" * 64}
 
 
 def test_cache_never_reads_or_writes_an_unscoped_payload(tmp_path: Path) -> None:
@@ -178,7 +252,7 @@ def test_cache_quarantines_boolean_schema_envelopes(tmp_path: Path, invalid_sche
     payload = {"availability": "available", "count": 1, "items": ["SOUL:pointer"]}
     metadata = {"partition_identity": "c" * 64, "manifest": manifest, "source_version": "v1", "now": 100}
     entry = cache.put(key, payload, **metadata)
-    envelope = json.loads(entry.read_text(encoding="utf-8"))
+    envelope = json.loads(entry.read_text(encoding="utf-8-sig"))
     envelope["schema"] = invalid_schema
     entry.write_text(json.dumps(envelope), encoding="utf-8")
 
@@ -196,7 +270,7 @@ def test_cache_rejects_partial_metadata_and_payload_digest_mismatch(tmp_path: Pa
     with pytest.raises(ValueError, match="metadata"):
         cache.put(key, payload, partition_identity="c" * 64, manifest=manifest)
     cache.put(key, payload, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=100, ttl_seconds=5)
-    envelope = json.loads(cache.path_for(key).read_text(encoding="utf-8"))
+    envelope = json.loads(cache.path_for(key).read_text(encoding="utf-8-sig"))
     envelope["payload_digest"] = "0" * 64
     cache.path_for(key).write_text(json.dumps(envelope), encoding="utf-8")
     assert cache.get(key, partition_identity="c" * 64, manifest=manifest, source_version="v1", now=101, ttl_seconds=5) is None

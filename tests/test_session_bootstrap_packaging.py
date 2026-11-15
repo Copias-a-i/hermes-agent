@@ -7,7 +7,7 @@ from pathlib import Path
 
 def test_session_bootstrap_is_a_normal_package_and_console_entrypoint() -> None:
     root = Path(__file__).parents[1]
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8-sig"))
     include = project["tool"]["setuptools"]["packages"]["find"]["include"]
 
     assert "fleet_session_bootstrap" in include

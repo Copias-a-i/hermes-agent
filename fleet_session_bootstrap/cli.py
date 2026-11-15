@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import stat
 import sys
@@ -15,6 +16,7 @@ from .contract import BootstrapRequest, TrustedIdentity, objective_digest, valid
 from .render import render_pack
 
 _MAX_INPUT_BYTES = 16_384
+logger = logging.getLogger(__name__)
 
 
 class _FailOpenParser(argparse.ArgumentParser):
@@ -32,7 +34,7 @@ def _load_identity(path: Path) -> TrustedIdentity:
         raise ValueError("trusted identity file is invalid")
     if os.name == "posix" and stat.S_IMODE(path.stat().st_mode) != 0o600:
         raise ValueError("trusted identity file must be mode 0600")
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(raw, dict) or set(raw) != {"tenant", "profile", "runtime", "host_or_project", "salt"}:
         raise ValueError("trusted identity schema is invalid")
     return TrustedIdentity(**raw)
@@ -66,5 +68,9 @@ def main() -> int:
         pack = render_pack(sha256(partition.namespace.encode()).hexdigest(), "unavailable", ())
         print(json.dumps({"availability": "unavailable", "pack": pack}, separators=(",", ":")))
     except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        _unavailable()
+    except Exception:
+        # Fail-open contract: a failure nobody anticipated still answers "unavailable" and exits 0.
+        logger.exception("fleet session bootstrap failed unexpectedly; failing open")
         _unavailable()
     return 0

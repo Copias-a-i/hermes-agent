@@ -14,6 +14,7 @@ from time import time
 from typing import Any
 
 from hermes_platform.resolver import locate_command
+from pm.filesystem import is_junction
 
 _SAFE_KEY = re.compile(r"[a-f0-9]{64}\Z")
 _RECEIPT_FIELDS = frozenset({"cache_state", "manifest_version", "availability", "count", "elapsed_ms", "timestamp", "error", "namespace_digest"})
@@ -98,20 +99,30 @@ def _is_in_git_tree(path: Path) -> bool:
     return completed.returncode == 0
 
 
+def _reject_redirects(path: Path) -> None:
+    """Refuse a symlink or junction in any existing prefix of ``path``."""
+    if any(component.is_symlink() or is_junction(component) for component in _existing_components(path)):
+        raise ValueError("trusted state root contains a symlink or junction")
+
+
 def _trusted_state_root(path: Path) -> Path:
-    """Admit only a direct, non-Git directory; never follow lexical symlinks."""
-    if not path.is_absolute():
-        raise ValueError("trusted state root must be absolute")
+    """Admit only a direct, non-Git directory; never follow a symlink or junction.
+
+    Redirection is judged component by component, never by comparing ``path`` with
+    ``path.resolve()``: resolve re-spells a root that goes nowhere else (Windows short names
+    and case, a ``//`` prefix), and a spelling difference is not an escape. ``..`` is refused
+    up front because ``abspath`` would collapse it before a link in front of it was inspected.
+    """
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("trusted state root must be absolute and free of '..'")
+    _reject_redirects(path)
     for component in _existing_components(path):
-        if component.is_symlink():
-            raise ValueError("trusted state root contains a symlink")
         if _is_in_git_tree(component):
             raise ValueError("trusted state root is inside a Git worktree or repository")
     path.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink() or any(component.is_symlink() for component in _existing_components(path)):
-        raise ValueError("trusted state root contains a symlink")
+    _reject_redirects(path)
     resolved = path.resolve(strict=True)
-    if resolved != path or _is_in_git_tree(resolved):
+    if _is_in_git_tree(resolved):
         raise ValueError("trusted state root is inside a Git worktree or repository")
     os.chmod(resolved, 0o700)
     return resolved
@@ -261,7 +272,7 @@ class CacheStore(_StateStore):
             return None
         with self.lock_for(key):
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(path.read_text(encoding="utf-8-sig"))
             except (FileNotFoundError, OSError, json.JSONDecodeError):
                 return None
             if now is not None and type(now) is not int:
