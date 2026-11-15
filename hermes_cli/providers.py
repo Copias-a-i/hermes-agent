@@ -141,6 +141,17 @@ def resolve_commandcode_api_key_env(read_env) -> tuple[str, str]:
     return "", ""
 
 
+def commandcode_alias_secret(provider_id: str, read_env) -> tuple[str, str] | None:
+    """``resolve_commandcode_api_key_env`` for the CommandCode provider ids, ``None`` for any other.
+
+    Credential resolvers call this before any other source can return (``model.key_env``), so a
+    conflicting alias pair raises ``ProviderCredentialConflictError`` instead of being masked.
+    """
+    if provider_id in {"commandcode", "commandcode-anthropic"}:
+        return resolve_commandcode_api_key_env(read_env)
+    return None
+
+
 # -- Aliases: human-friendly / legacy names grouped by canonical (models.dev where possible) id;
 # ``ALIASES`` is the inverted lookup table. ---------------------------------------------------
 _ALIAS_GROUPS: Dict[str, Tuple[str, ...]] = {
