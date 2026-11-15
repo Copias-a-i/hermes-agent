@@ -3,10 +3,13 @@
 ``World`` is one sandboxed machine (``_install_helpers.new_sandbox``: bwrap, empty fake HOME, the
 git wrapper that reports the official remote URL) whose ``~/.gitconfig`` rewrites the official
 GitHub URL to a loopback ``git http-backend`` origin (``_smart_http``). The install itself comes
-from a real ``scripts/install.sh``: N-1's own copy for an N-1 install (it makes the depth-1
-single-branch clone N-1 users have), HEAD's for a HEAD install (a ``--filter=blob:none`` clone).
-``preclone`` seeds a checkout the installer then adopts, for the clone shapes users got another
-way (a manual full clone, a ``blob:none`` fallback clone).
+from a real ``scripts/install.sh``: the one at ``installer_ref`` for an N-1 install, HEAD's for a
+HEAD install (a ``--filter=blob:none`` clone). The upgrade history is synthetic and every commit in
+it carries HEAD's tree (``build_upgrade_history``), so ``installer_ref`` yields HEAD's installer and
+the clone it makes is HEAD's blobless one, not the depth-1 single-branch clone a real N-1 installer
+made. ``preclone`` seeds a checkout the installer then adopts, for every other clone shape users
+have: ``N1_CLONE`` for the depth-1 clone N-1 users got from the installer, and a manual full clone
+or a ``blob:none`` fallback clone.
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes
@@ -35,6 +38,11 @@ from tests.e2e.core.upgrade.git._smart_http import GitHTTPServer, serve_bare
 REPO = "hermes-agent.git"
 SUCCESS = "Update complete"
 TRACEBACK = I.TRACEBACK
+
+# The checkout every N-1 user has: N-1's scripts/install.sh cloned ``--depth 1 --single-branch``.
+# The fixture's N-1 installer is HEAD's own (see the module docstring), so a cell that needs this
+# shape seeds it with ``preclone=N1_CLONE`` instead of expecting the installer to make it.
+N1_CLONE = ["--depth", "1", "--single-branch"]
 
 PYTESTMARK = [
     pytest.mark.platforms("linux"),
