@@ -197,6 +197,10 @@ def _selected_test_files(node: dict, name: str, *, windows_only: bool = False) -
     if windows_only:
         cells = [cell for cell in cells if cell.get("marker") == "windows"]
     assert cells, f"{name}: empty matrix"
+    capacity_steps = [step for step in body["steps"] if step.get("id") == "capacity"]
+    if capacity_steps:
+        assert len(capacity_steps) == 1, f"{name}: ambiguous capacity step"
+
     selected = set()
     for cell in cells:
         runner = gha.render(body["runs-on"], {**ctx, "matrix": cell})
@@ -204,6 +208,13 @@ def _selected_test_files(node: dict, name: str, *, windows_only: bool = False) -
             "os": "Windows" if "windows" in runner else "Linux",
             "arch": "ARM64" if "arm" in runner else "X64",
         }}
+        if capacity_steps:
+            # The test command consumes step outputs. Replay the preceding capacity
+            # policy first so its fail-closed output gate sees the same bounded
+            # values as the hosted workflow rather than empty synthetic outputs.
+            context["steps"] = {
+                "capacity": {"outputs": workflow_steps.outputs(capacity_steps[0], context, _REPO)}
+            }
         workflow_steps.required(body, context)
         selected |= workflow_steps.selected_files(steps[0], context, _REPO)
     return selected

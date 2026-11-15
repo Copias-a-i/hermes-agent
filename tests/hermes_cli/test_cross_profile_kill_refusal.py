@@ -23,8 +23,15 @@ import pytest
 from gateway.status import recorded_gateway_home_conflicts
 
 
-def _spawn_gateway_lookalike(bin_dir: Path, lock_path: Path) -> subprocess.Popen:
-    """Real child process whose argv matches the gateway runtime matcher."""
+def _spawn_gateway_lookalike(
+    bin_dir: Path, lock_path: Path, terminal_status_path: Path | None = None
+) -> subprocess.Popen:
+    """Real child process whose argv matches the gateway runtime matcher.
+
+    With ``terminal_status_path`` it behaves like a gateway at a planned stop: SIGTERM records
+    ``gateway_state=stopped`` there before it exits. ``stop_profile_gateway`` only reports success
+    once a fresh reader sees that state, so a stand-in that just dies has not stopped.
+    """
     bin_dir.mkdir(parents=True, exist_ok=True)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     script = bin_dir / "hermes"
@@ -32,11 +39,19 @@ def _spawn_gateway_lookalike(bin_dir: Path, lock_path: Path) -> subprocess.Popen
         body = "import time\ntime.sleep(120)\n"
     else:
         body = (
-            "import fcntl, time\n"
+            "import fcntl, json, signal, sys, time\n"
             f"fh = open({str(lock_path)!r}, 'a+')\n"
             "fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-            "time.sleep(120)\n"
         )
+        if terminal_status_path is not None:
+            body += (
+                "def _planned_stop(*_):\n"
+                f"    with open({str(terminal_status_path)!r}, 'w') as out:\n"
+                "        json.dump({'gateway_state': 'stopped'}, out)\n"
+                "    sys.exit(0)\n"
+                "signal.signal(signal.SIGTERM, _planned_stop)\n"
+            )
+        body += "time.sleep(120)\n"
     script.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     if sys.platform != "win32":
         script.chmod(0o755)
@@ -147,7 +162,9 @@ class TestCrossProfileStopRefusal:
         monkeypatch.setenv("HERMES_HOME", str(tim_home))
 
         proc = _spawn_gateway_lookalike(
-            tmp_path / "bin", tim_home / "gateway.lock"
+            tmp_path / "bin",
+            tim_home / "gateway.lock",
+            terminal_status_path=tim_home / "gateway_state.json",
         )
         try:
             record = _pid_record(proc, tmp_path / "bin" / "hermes", tim_home)
@@ -160,6 +177,38 @@ class TestCrossProfileStopRefusal:
             while time.monotonic() < deadline and proc.poll() is None:
                 time.sleep(0.1)
             assert proc.poll() is not None, "own gateway was not stopped"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+
+    def test_stop_profile_gateway_fails_when_gateway_exits_without_terminal_state(
+        self, tmp_path, monkeypatch
+    ):
+        """A process that merely dies is not a stop: no durable ``stopped`` snapshot, no success."""
+        tim_home = tmp_path / "profiles" / "tim"
+        tim_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(tim_home))
+
+        proc = _spawn_gateway_lookalike(
+            tmp_path / "bin", tim_home / "gateway.lock"
+        )
+        try:
+            record = _pid_record(proc, tmp_path / "bin" / "hermes", tim_home)
+            (tim_home / "gateway.pid").write_text(json.dumps(record))
+
+            from hermes_cli import gateway as gateway_cli
+
+            wait_for_terminal_state = gateway_cli._wait_for_terminal_stopped_state
+            monkeypatch.setattr(
+                gateway_cli,
+                "_wait_for_terminal_stopped_state",
+                lambda: wait_for_terminal_state(timeout=0.5),
+            )
+
+            assert gateway_cli.stop_profile_gateway() is False
+            assert proc.poll() is not None, "the SIGTERM should still have stopped the process"
+            assert not (tim_home / "gateway_state.json").exists()
         finally:
             if proc.poll() is None:
                 proc.kill()
