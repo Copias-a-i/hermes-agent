@@ -1376,11 +1376,10 @@ def _record_task_failure(
             return False
         if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
             return False
-        # Completion is the terminal winner for its run. Dispatcher reapers may
-        # observe a process exit after the worker committed kanban_complete;
-        # that stale observation must not manufacture a retry, circuit-breaker
-        # update, or second terminal event.
-        if row["status"] == "done":
+        # A worker handoff (complete / request-review / request-changes / block)
+        # is terminal for its run: a late exit, timeout or budget observation
+        # must not book a retry, breaker update or second terminal event.
+        if _kfg.late_failure_loses_to_handoff(conn, task_id, row):
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -3035,4 +3034,5 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
+from hermes_cli import kanban_db_failure_guard as _kfg  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
