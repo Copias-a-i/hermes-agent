@@ -158,6 +158,15 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
     """A launcher exiting on SIGTERM must not let an ignoring server child escape cleanup."""
     import psutil
 
+    def alive(proc: psutil.Process) -> bool:
+        # A killed descendant stays a zombie until its new parent reaps it, and psutil keeps calling it
+        # running meanwhile. It was reparented outside the test's subtree, so signalling it trips the
+        # live-system guard.
+        try:
+            return proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+
     child_pid_file = tmp_path / "child.pid"
     client = _client(tmp_path, "slow_tree")
     assert client._env is not None
@@ -176,7 +185,7 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
             await asyncio.wait_for(start, timeout=0.05)
 
         deadline = asyncio.get_running_loop().time() + 15.0
-        while child.is_running() and child.status() != psutil.STATUS_ZOMBIE:
+        while alive(child):
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.01)
         assert client.state == "error"
@@ -185,7 +194,7 @@ async def test_cancelled_start_hard_kills_sigterm_ignoring_descendant(tmp_path: 
         if not start.done():
             start.cancel()
             await asyncio.gather(start, return_exceptions=True)
-        if child is not None and child.is_running():
+        if child is not None and alive(child):
             child.kill()
 
 
