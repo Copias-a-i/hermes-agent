@@ -147,6 +147,12 @@ recycled PID gets killed on reclaim.
   (`agent/delegation_context.py::DELEGATED_CHILD_ENV_MARKER`) carries the fenced board ROOT;
   `kanban_path_is_fenced(path)` denies mutations only on the dispatcher-pinned `HERMES_KANBAN_DB`
   or under that root, so a child working against a scratch `HERMES_HOME` keeps a writable board.
+- **A worker handoff beats a late failure.** `kanban_complete` / `request_review` / `request_changes` / `block`
+  end their run with a terminal outcome. `_record_task_failure` books nothing for a card with no open run whose
+  newest run ended in one of those outcomes and which still sits where it left it
+  (`kanban_db_failure_guard.late_failure_loses_to_handoff`). Status alone cannot decide: `review` is also where a
+  crashed reviewer is restored, and that failure must count. Callers that can name their run also pass
+  `expected_run_id`, which fences a successor's open run.
 
 ## Tests
 

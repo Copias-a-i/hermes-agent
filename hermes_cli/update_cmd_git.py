@@ -562,18 +562,43 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     return _probe_fork_bomb(git_cmd) is True
 
 
-def _locate_real_git() -> Optional[Path]:
-    """Find the platform-resolved Git executable when it is not a trampoline.
+# Parents of Git for Windows' standard install: each holds ``Git\<arch>\libexec\git-core\git.exe``.
+_GIT_FOR_WINDOWS_ROOTS = (r"C:\Program Files", r"C:\Program Files (x86)")
 
-    Runner images and managed Git installs need not use Git-for-Windows'
-    ``git-core`` layout. ``locate_command`` is the shared command-discovery
-    boundary; the fork-bomb probe remains the validation boundary.
+
+def _portable_git_candidates() -> list:
+    """PortableGit candidates: shared root first (where the managed tree actually lives, not the
+    profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
+
+    The Hermes-managed PortableGit tree lives under the SHARED root (``<root>/git/...``), not the
+    profile-scoped HERMES_HOME (``<root>/profiles/<name>``), so a profile-scoped ``hermes update`` must look
+    there (monerostar review, #87876).
     """
-    command = locate_command("git").command
-    if not command:
-        return None
-    candidate = Path(command[0])
-    return candidate if candidate.exists() and _probe_fork_bomb([str(candidate)]) is False else None
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+    candidates = []
+    with suppress(Exception):
+        candidates += [root / "git" / "mingw64" / "libexec" / "git-core" / "git.exe" for root in (get_default_hermes_root(), Path(get_hermes_home()))]
+    return candidates
+
+
+def _locate_real_git() -> Optional[Path]:
+    """Find a Git executable that runs without the trampoline guard. None when nothing suits — callers keep
+    the broken command and let the fetch-failure ZIP fallback handle it.
+
+    The platform resolver's PATH hit goes first (runner images and managed Git installs need not use
+    Git-for-Windows' ``git-core`` layout). When the PATH Git IS the broken trampoline that hit is the very shim
+    ``_ensure_non_trampoline_git`` just rejected, so the probe disqualifies it and the search falls through to
+    the real ``mingw64\\libexec\\git-core\\git.exe`` (standard Git for Windows locations + managed PortableGit)
+    that works when invoked directly (#87876). A failed probe (None) disqualifies a candidate like a guard hit.
+    """
+    resolved = locate_command("git").command
+    candidates = [Path(resolved[0])] if resolved else []
+    candidates += [
+        Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
+        for base in _GIT_FOR_WINDOWS_ROOTS
+        for arch in ("clangarm64", "mingw64", "mingw32")
+    ] + _portable_git_candidates()
+    return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)
 
 
 def _ensure_non_trampoline_git(git_cmd: list) -> list:

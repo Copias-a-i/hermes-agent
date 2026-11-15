@@ -340,58 +340,6 @@ def _staged_machine(machine_mod, tmp_path):
     return m, root, profile
 
 
-def test_machine_reclaim_disk_deletes_profile_and_root(tmp_path):
-    """Unit: reclaim_disk removes both trees."""
-    machine_mod = _windows_machine_module()
-    m, root, profile = _staged_machine(machine_mod, tmp_path)
-    m.reclaim_disk()
-    assert not root.exists()
-    assert not profile.exists()
-
-
-def test_reclaim_tree_fails_closed_when_deletion_cannot_finish(tmp_path, monkeypatch):
-    """A stuck tree must surface as an error, not a silent leftover for the next journey."""
-    machine_mod = _windows_machine_module()
-    stuck = tmp_path / "stuck-profile"
-    stuck.mkdir()
-    (stuck / "held.bin").write_bytes(b"x")
-
-    def _noop_rmtree(path, *args, **kwargs):
-        return None
-
-    monkeypatch.setattr(machine_mod.shutil, "rmtree", _noop_rmtree)
-    monkeypatch.setattr(machine_mod.time, "sleep", lambda _s: None)
-    # utils.rmtree_readonly import path also collapses to the same no-op via Exception path
-    # when import succeeds; force both deletion attempts to leave the tree.
-    import utils as _utils
-
-    monkeypatch.setattr(_utils, "rmtree_readonly", lambda path, **kwargs: None)
-    with pytest.raises(RuntimeError, match="failed to reclaim"):
-        machine_mod.reclaim_tree(stuck)
-    assert stuck.exists()
-
-
-def test_teardown_reclaims_disk_even_when_artifact_diagnostics_raise(tmp_path, monkeypatch):
-    """Any diagnostics failure must still delete the multi-GB profile and work root."""
-    machine_mod = _windows_machine_module()
-    m, root, profile = _staged_machine(machine_mod, tmp_path)
-    arts = tmp_path / "arts"
-    monkeypatch.setenv("HERMES_E2E_ARTIFACTS", str(arts))
-    monkeypatch.setattr(m, "kill_owned", lambda: None)
-    monkeypatch.setattr(machine_mod, "_restore_hkcu_path", lambda _saved: None)
-
-    def _boom_evidence() -> str:
-        raise RuntimeError("diagnostics boom")
-
-    monkeypatch.setattr(m, "evidence", _boom_evidence)
-    m.teardown()
-    assert not root.exists(), "work root survived a diagnostics failure"
-    assert not profile.exists(), "profile survived a diagnostics failure"
-    # Failure is recorded when possible, but reclaim is the contract.
-    failed = arts / root.name / "artifact-copy-failed.txt"
-    assert failed.is_file() and "RuntimeError" in failed.read_text(encoding="utf-8")
-
-
 def test_install_refuses_when_free_space_is_below_budget(tmp_path, monkeypatch):
     """install.ps1 must not start when the volume cannot host another clean journey."""
     machine_mod = _windows_machine_module()

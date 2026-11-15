@@ -33,13 +33,6 @@ Machines run in parallel. Updates and gateway lifetimes take a job-wide lock
 everything else stay parallel. One install's update sparing another's gateway (#124659) is
 its own journey (test_update_spares_other_installs.py).
 
-Each finished journey must reclaim its profile and work root. A clean ``install.ps1`` leaves
-a multi-gigabyte toolchain under ``%LOCALAPPDATA%\\hermes`` (pinned Git, managed Python, venv,
-filtered checkout). Leaving those trees on disk after the module fixture ends is what filled
-stock ``windows-latest`` late in the suite (ENOSPC while installing git) even after the
-worker count was already cut to two. Teardown therefore snapshots only bounded transcripts
-and then deletes the profile and machine root before the next wave starts.
-
 The suite mutates HKCU and downloads a toolchain per machine, so it only runs where
 ``HERMES_E2E_WINDOWS_INSTALL=1`` (the CI job sets it).
 """
@@ -93,6 +86,8 @@ CANONICAL_URLS = (
 NEXT_MARKER = ".hermes-e2e-next"
 # Captured before any machine strips PATH: harness plumbing (serve.git, rev-parse) only.
 REAL_GIT = shutil.which("git")
+
+
 def free_bytes_for(path: Path) -> int:
     """Free bytes on the volume that holds ``path`` (creating parents is the caller's job)."""
     probe = path if path.exists() else path.parent
@@ -117,34 +112,6 @@ def require_install_space(path: Path, *, live_machines: int = 1) -> None:
             f"not enough free disk for {live_machines} clean install journey(s): "
             f"need {need // (1024 ** 2)} MiB, have {free // (1024 ** 2)} MiB on {path}"
         )
-
-
-def reclaim_tree(path: Path) -> None:
-    """Delete a machine profile or work root, including read-only git objects on Windows.
-
-    Fail closed if the tree is still present after retries: a silent leftover is how the
-    suite filled stock windows-latest mid-run.
-    """
-    if not path.exists():
-        return
-
-    def _wipe(target: Path) -> None:
-        try:
-            from utils import rmtree_readonly
-
-            rmtree_readonly(target, ignore_errors=True)
-        except Exception:
-            shutil.rmtree(target, ignore_errors=True)
-
-    _wipe(path)
-    # AV / handle races: brief waits beat leaving multi-GB trees for the next journey.
-    for delay in (0.5, 1.0, 2.0):
-        if not path.exists():
-            return
-        time.sleep(delay)
-        _wipe(path)
-    if path.exists():
-        raise RuntimeError(f"failed to reclaim machine tree after retries: {path}")
 
 
 # Every module here also carries platforms("windows") + integration + live_system_guard_bypass
@@ -593,50 +560,52 @@ class Machine:
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=60)
 
     def teardown(self) -> None:
-        """Stop processes, snapshot bounded diagnostics, then always reclaim multi-GB trees."""
+        self.kill_owned()
         try:
-            self.kill_owned()
-            try:
-                _restore_hkcu_path(self._hkcu)
-            except OSError:
-                pass
-            artifacts = os.environ.get("HERMES_E2E_ARTIFACTS")
+            _restore_hkcu_path(self._hkcu)
+        except OSError:
+            pass
+        artifacts = os.environ.get("HERMES_E2E_ARTIFACTS")
+        try:
             if artifacts:
                 dest = Path(artifacts) / self.root.name
-                # Bounded diagnostics only: never archive the installed toolchain/venv/checkout.
-                try:
-                    if self.logs.is_dir():
-                        shutil.copytree(self.logs, dest / "transcripts", dirs_exist_ok=True)
-                    hermes_logs = self.hermes_home / "logs"
-                    if hermes_logs.is_dir():
-                        shutil.copytree(
-                            hermes_logs, dest / "logs", dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("*.db", "*.db-*", "*.zip", "*.msi", "*.exe"),
-                        )
-                    (dest / "evidence.txt").write_text(self.evidence(), encoding="utf-8", errors="replace")
-                    (dest / "timings.json").write_text(json.dumps(self.timings, indent=1), encoding="utf-8")
-                except Exception as exc:
-                    # A full disk or any diagnostics failure must not skip reclaim: the next
-                    # journey needs the space more than CI needs a perfect transcript tree.
-                    with contextlib.suppress(OSError):
-                        dest.mkdir(parents=True, exist_ok=True)
-                        (dest / "artifact-copy-failed.txt").write_text(
-                            f"{type(exc).__name__}: {exc}", encoding="utf-8")
+                shutil.copytree(self.logs, dest / "transcripts", dirs_exist_ok=True)
+                for sub in ("logs",):
+                    src = self.hermes_home / sub
+                    if src.is_dir():
+                        shutil.copytree(src, dest / sub, dirs_exist_ok=True,
+                                        ignore=shutil.ignore_patterns("*.db", "*.db-*"))
+                (dest / "evidence.txt").write_text(self.evidence(), encoding="utf-8", errors="replace")
+                (dest / "timings.json").write_text(json.dumps(self.timings, indent=1), encoding="utf-8")
         finally:
-            # Causal disk fix: drop the multi-GB profile and work root so later journey files
-            # (and a concurrent peer after this module ends) do not inherit residual installs.
-            self.reclaim_disk()
+            # Every machine is a full install (checkout, venv with every extra, PM tools, caches) on
+            # the runner's only drive; kept, they add up past its free space before the last file
+            # runs. A failed artifact copy (a full disk) must not keep the install. The transcripts
+            # stay (small, and the only record when no artifacts dir is set).
+            leftovers = [note for tree in (self.profile, self.serve) if (note := _remove_tree(tree))]
+            if leftovers:  # the job's "No machine install left behind" step names these
+                dest = Path(artifacts) / self.root.name if artifacts else self.logs
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "teardown-leftovers.txt").write_text("\n".join(leftovers) + "\n", encoding="utf-8")
 
-    def reclaim_disk(self) -> None:
-        """Delete this machine's user profile and work root after diagnostics are snapshotted."""
-        errors: list[BaseException] = []
-        for path in (self.profile, self.root):
-            try:
-                reclaim_tree(path)
-            except BaseException as exc:  # keep going so both trees are attempted
-                errors.append(exc)
-        if errors:
-            raise errors[-1]
+
+def _remove_tree(path: Path) -> str | None:
+    """Delete ``path``; ``None`` when gone, else what stopped it.
+
+    The ``\\\\?\\`` prefix reaches past MAX_PATH (the checkout carries 159-character paths); a
+    just-killed process can hold a handle for a moment, so a failure is retried."""
+    from utils import rmtree_readonly
+
+    error: OSError | None = None
+    for _ in range(5):
+        if not path.exists():
+            return None
+        try:
+            rmtree_readonly("\\\\?\\" + str(path.resolve()))
+        except OSError as exc:
+            error = exc
+            time.sleep(2)
+    return None if not path.exists() else f"{path}: {error}"
 
 
 def new_machine(tmp_root: Path, base_url: str, *, label: str, person: str = "",
