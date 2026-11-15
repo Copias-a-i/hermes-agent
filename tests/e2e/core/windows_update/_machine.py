@@ -70,6 +70,7 @@ from tests.e2e.core.windows._helpers import (
     kill_tree,
     wait_until,
 )
+from tests.e2e.core.windows_update._install_slots import acquire_install_slot
 from tests.fakes.fake_llm_provider import write_hermes_home
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
@@ -92,66 +93,6 @@ CANONICAL_URLS = (
 NEXT_MARKER = ".hermes-e2e-next"
 # Captured before any machine strips PATH: harness plumbing (serve.git, rev-parse) only.
 REAL_GIT = shutil.which("git")
-# Cap concurrent clean install.ps1 journeys across journey *files* (each file is its own
-# pytest subprocess under run_tests_parallel). A process-local threading.Semaphore cannot
-# do that: workers=2 would otherwise pair test_update_spares_other_installs (two installs)
-# with another file's install = three simultaneous multi-GB toolchains on a stock disk.
-INSTALL_SLOT_LIMIT = max(1, int(os.environ.get("HERMES_E2E_INSTALL_SLOTS", "2")))
-# In-process fallback used only when the host is not Windows (unit tests on macOS/Linux).
-_INSTALL_SLOTS_THREAD = threading.BoundedSemaphore(INSTALL_SLOT_LIMIT)
-
-
-@contextlib.contextmanager
-def _install_slot():
-    """Hold one of ``INSTALL_SLOT_LIMIT`` cross-process install slots until the install ends."""
-    if os.name != "nt":
-        with _INSTALL_SLOTS_THREAD:
-            yield
-        return
-    import msvcrt
-
-    root = Path(os.environ.get("HERMES_E2E_MACHINE_ROOT") or tempfile.gettempdir()) / "hermes-e2e-install-slots"
-    root.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + INSTALL_TIMEOUT + 120.0
-    held = None
-    last_err: BaseException | None = None
-    while held is None and time.monotonic() < deadline:
-        for i in range(INSTALL_SLOT_LIMIT):
-            path = root / f"slot-{i}.lock"
-            fh = None
-            try:
-                fh = open(path, "a+b")
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                fh.seek(0)
-                fh.truncate()
-                fh.write(f"{os.getpid()}\n".encode("ascii"))
-                fh.flush()
-                held = fh
-                break
-            except OSError as exc:
-                last_err = exc
-                if fh is not None:
-                    with contextlib.suppress(OSError):
-                        fh.close()
-        if held is None:
-            time.sleep(0.5)
-    if held is None:
-        raise AssertionError(
-            f"could not acquire one of {INSTALL_SLOT_LIMIT} cross-process install slots "
-            f"under {root} within the install budget"
-            + (f": {last_err}" if last_err else "")
-        )
-    try:
-        yield
-    finally:
-        with contextlib.suppress(OSError):
-            held.seek(0)
-            msvcrt.locking(held.fileno(), msvcrt.LK_UNLCK, 1)
-        with contextlib.suppress(OSError):
-            held.close()
-
-
 def free_bytes_for(path: Path) -> int:
     """Free bytes on the volume that holds ``path`` (creating parents is the caller's job)."""
     probe = path if path.exists() else path.parent
@@ -489,16 +430,19 @@ class Machine:
 
     def install(self) -> Run:
         """``powershell -File install.ps1 -NonInteractive`` from a directory that is no project."""
-        # Cross-process install slots so workers=2 cannot stack the dual-install spares
-        # journey on top of another clean install (each journey file is its own subprocess).
-        with _install_slot():
+        script = self.root / "install.ps1"
+        shutil.copyfile(REPO_ROOT / "scripts" / "install.ps1", script)
+        cwd = self.root / "install-cwd"
+        cwd.mkdir(parents=True, exist_ok=True)
+        # A slot is a Windows kernel semaphore, shared by the isolated pytest
+        # file workers.  It releases on normal exceptions and is reclaimed by
+        # Windows if a worker dies while its installer child is still running.
+        with acquire_install_slot() as slot:
+            if slot is not None:
+                self.timings.append((slot.diagnostic, 0.0))
             # Refuse to start another toolchain when the volume is already tight: the
             # previous residual ENOSPC was "installing git" with a full disk, not a product gate.
             require_install_space(self.profile if self.profile.exists() else self.root)
-            script = self.root / "install.ps1"
-            shutil.copyfile(REPO_ROOT / "scripts" / "install.ps1", script)
-            cwd = self.root / "install-cwd"
-            cwd.mkdir(parents=True, exist_ok=True)
             return self._run_logged(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-NonInteractive"],
                 "install", timeout=INSTALL_TIMEOUT, cwd=cwd)
