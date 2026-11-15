@@ -668,7 +668,14 @@ def _profile_name_for_home(profile_home: Path) -> Optional[str]:
 def profile_flag_value(command: str) -> Optional[str]:
     """The ``-p``/``--profile`` argument of a command line, or None. Token equality is the only safe
     profile match: a substring test lets ``-p ops`` claim (and ``gateway stop`` SIGTERM) ``-p ops-2``."""
-    tokens = command.split()
+    # Only recognized in-process bootstraps own the argv carried by inline source.
+    # Preserve source case: parser literals such as alter_sys=True are case-sensitive.
+    try:
+        tokens = [token.strip("\"' ") for token in shlex.split(command, posix=False)]
+    except ValueError:
+        tokens = command.split()
+    if command_line_runs_inline_source(tokens):
+        tokens = inline_bootstrap_argv(tokens) or []
     for i, tok in enumerate(tokens):
         if tok.startswith("--profile="):
             return tok.partition("=")[2]
@@ -713,7 +720,7 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     profile_name = _profile_name_for_home(profile_home)
     home_lc = str(profile_home).lower().replace("\\", "/").rstrip("/")
     if profile_name is not None and profile_name != "default":
-        if profile_flag_value(command_lc) == profile_name.lower():
+        if (profile_flag_value(command) or "").lower() == profile_name.lower():
             return True
         return command_line_names_hermes_home(command_lc, home_lc)
     # Default profile: accept unless argv names ANOTHER profile (any spelling the CLI pre-parser
@@ -722,7 +729,7 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     # arrives via the env). ``--profile default`` names this profile: a hand-written launchd plist
     # mirrors the named-profile service shape, and rejecting it reported a live default gateway
     # as stopped (#100817).
-    if profile_flag_value(command_lc) not in (None, "default"):
+    if (profile_flag_value(command) or "default").lower() != "default":
         return False
     return not hermes_home_assignments(command_lc) or command_line_names_hermes_home(command_lc, home_lc)
 
