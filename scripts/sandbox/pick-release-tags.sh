@@ -98,7 +98,10 @@ else
     exit "$grep_status"
   fi
 fi
-LC_ALL=C sort -t. -k1.2n -k2,2n -k3,3n -k4,4n "$eligible_tags" > "$sorted_tags"
+# Every key names its end field (`-k1.2,1n`, not `-k1.2n`): without one the key
+# runs to the end of the line and GNU sort reads "2026.10" as the decimal 2026.10,
+# which sorts v2026.10.x before v2026.4.x.
+LC_ALL=C sort -t. -k1.2,1n -k2,2n -k3,3n -k4,4n "$eligible_tags" > "$sorted_tags"
 
 # Read with Bash 3-compatible primitives: macOS still ships Bash 3.2, which
 # lacks `mapfile`, while Git for Windows and Ubuntu also support this loop.

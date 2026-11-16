@@ -75,3 +75,27 @@ def test_picker_selects_latest_valid_release_after_tags_are_fetched_into_shallow
 
     assert picked.returncode == 0, picked.stderr
     assert picked.stdout == '["v2026.6.10"]\n'
+
+
+def test_picker_orders_calendar_versions_by_numeric_month_and_day_components(tmp_path):
+    # GNU sort reads `-k1.2n` (no end field) through the end of the line and
+    # parses "2026.10" as the decimal 2026.10, so v2026.10.1 landed before
+    # v2026.4.1 and "newest" resolved to April. Each component must compare as
+    # its own integer.
+    _git(tmp_path, "init", "-q", "-b", "main")
+    _git(tmp_path, "config", "user.name", "fixture")
+    _git(tmp_path, "config", "user.email", "fixture@example.invalid")
+    tags = ("v2026.4.23.1", "v2026.12.5", "v2025.12.31", "v2026.10.1", "v2026.4.1", "v2026.9.30", "v2026.1.5", "v2026.4.23")
+    for tag in tags:
+        _git(tmp_path, "commit", "--allow-empty", "-qm", tag)
+        _git(tmp_path, "tag", tag)
+
+    every_tag = _pick(tmp_path, count=len(tags))
+    newest_tag = _pick(tmp_path, count=1)
+
+    assert every_tag.returncode == 0, every_tag.stderr
+    assert every_tag.stdout == (
+        '["v2025.12.31","v2026.1.5","v2026.4.1","v2026.4.23","v2026.4.23.1","v2026.9.30","v2026.10.1","v2026.12.5"]\n'
+    )
+    assert newest_tag.returncode == 0, newest_tag.stderr
+    assert newest_tag.stdout == '["v2026.12.5"]\n'
