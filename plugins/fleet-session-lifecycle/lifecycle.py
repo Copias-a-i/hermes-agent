@@ -128,6 +128,27 @@ def _write_fd(fd: int, data: bytes) -> None:
         view = view[os.write(fd, view):]
 
 
+def _append_private(path: Path, text: str) -> None:
+    """Append ``text`` durably through a descriptor validated as this plugin's private file.
+
+    Checkpoint partitions have predictable names in a tree candidate-executed tools can write, so an
+    alias planted there is refused (the event stays pending and durable) instead of being followed.
+    """
+    fd = _open_private_file(path)
+    if fd is None:
+        _report_once("checkpoint:" + str(path),
+                     "fleet-session-lifecycle: refusing %s: it is not this plugin's private checkpoint file "
+                     "(symlink, hard link or foreign file); remove it so checkpoints can resume", path)
+        raise PermissionError(f"refusing aliased checkpoint partition {path}")
+    try:
+        os.lseek(fd, 0, os.SEEK_END)
+        _write_fd(fd, text.encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    _fsync_directory(path.parent)
+
+
 def profile_name_for_home(home: Path) -> str:
     """Return a stable, profile-local vault namespace without ambient-home fallback."""
     if home.parent.name == "profiles":
@@ -537,7 +558,7 @@ class LifecycleController:
 
     @staticmethod
     def _run(argv: list[str], **kwargs: Any) -> int:
-        return subprocess.run(argv, check=False, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        return subprocess.run(argv, check=False, stdin=kwargs.get("stdin", subprocess.DEVNULL), stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, timeout=kwargs.get("timeout", 5),
                               env=kwargs.get("env")).returncode
 
@@ -774,11 +795,7 @@ class LifecycleController:
             f"- user: {event['user']}", f"- response: {event['response']}",
             f"<!-- hermes-lifecycle checkpoint committed: {event['event_id']} -->",
         )) + "\n"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(path.parent)
+        _append_private(path, line)
 
     def _checkpoint_has(self, event_id: str, partition: str | None = None, *, recovery: bool = False) -> bool:
         """Check one recorded partition; scan history only to recover legacy pending state.
@@ -846,11 +863,7 @@ class LifecycleController:
             "- delivery_message: none",
             f"<!-- hermes-lifecycle full-wrapup committed: {attempt_id} -->",
         )) + "\n"
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(line)
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(path.parent)
+        _append_private(path, line)
 
     def _full_wrapup_has(self, attempt_id: str, partition: str) -> bool:
         try:
@@ -998,6 +1011,26 @@ class LifecycleController:
         logger.warning("fleet-session-lifecycle: repaired a torn outbox tail (%d byte(s) dropped)",
                        len(raw) - len(repaired))
 
+    def _deliver_outbox(self, command: list[str], queue: Path, fd: int, outbox: dict[str, Any]) -> int | None:
+        """Hand the adapter the validated queue itself, never a pathname that could be swapped.
+
+        On POSIX the open descriptor is the adapter's stdin and ``--input`` names ``/dev/stdin``, so a
+        link planted at the queue path after validation cannot redirect what the adapter reads. On
+        Windows the held descriptor (opened without delete sharing) keeps the path from being replaced
+        while the adapter reads it. Returns the adapter's exit code, or None after recording a failure.
+        """
+        os.lseek(fd, 0, os.SEEK_SET)
+        source = str(queue) if os.name == "nt" else "/dev/stdin"
+        try:
+            return self._invoke(command + ["--input", source], stdin=fd,
+                                timeout=float(self.config.get("outbox_timeout_seconds", 5)))
+        except FileNotFoundError:
+            outbox.update(last_status="unavailable", write_pending=True)
+        except Exception:
+            logger.exception("fleet-session-lifecycle: external outbox adapter failed; retained locally")
+            outbox.update(last_status="failed", write_pending=True)
+        return None
+
     def _outbox_index(self, event: dict[str, Any], state: dict[str, Any]) -> None:
         """Deliver redacted events through an optional vendor-neutral durable outbox.
 
@@ -1032,17 +1065,11 @@ class LifecycleController:
             os.lseek(fd, 0, os.SEEK_END)
             _write_fd(fd, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
             os.fsync(fd)
+            code = self._deliver_outbox(command, queue, fd, state.setdefault("outbox", {}))
         finally:
             os.close(fd)
-        outbox = state.setdefault("outbox", {})
-        try:
-            code = self._invoke(command + ["--input", str(queue)], timeout=float(self.config.get("outbox_timeout_seconds", 5)))
-        except FileNotFoundError:
-            outbox.update(last_status="unavailable", write_pending=True)
-            return
-        except Exception:
-            logger.exception("fleet-session-lifecycle: external outbox adapter failed; retained locally")
-            outbox.update(last_status="failed", write_pending=True)
+        outbox = state["outbox"]
+        if code is None:
             return
         if code == 0:
             try:

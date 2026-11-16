@@ -646,10 +646,9 @@ def test_outbox_failure_is_retried_by_a_later_turn(tmp_path):
             user_message="u", assistant_response="a", conversation_history=[], cwd="",
         )
 
-    assert calls == [
-        ["external-outbox-adapter", "--input", str(home / "state" / "fleet-session-lifecycle-outbox.jsonl")],
-        ["external-outbox-adapter", "--input", str(home / "state" / "fleet-session-lifecycle-outbox.jsonl")],
-    ]
+    # POSIX adapters read the validated queue through their stdin descriptor, never the swappable path.
+    source = str(home / "state" / "fleet-session-lifecycle-outbox.jsonl") if os.name == "nt" else "/dev/stdin"
+    assert calls == [["external-outbox-adapter", "--input", source]] * 2
     assert json.loads((home / "state" / "fleet-session-lifecycle.json").read_text())["outbox"]["last_status"] == "ok"
 
 

@@ -106,3 +106,50 @@ def test_absent_ledger_still_starts_empty(tmp_path):
     assert json.loads(controller.state_path.read_text(encoding="utf-8"))["processed_turns"]
     assert "turn_id: t1" in _checkpoint_file(vault, "jarvis").read_text(encoding="utf-8")
     assert Path(controller.state_path).is_file()
+
+
+@pytest.mark.platforms("posix")
+def test_adapter_reads_the_validated_queue_even_if_its_path_is_swapped(tmp_path):
+    mod = _load_lifecycle()
+    secret = tmp_path / "auth.json"
+    secret.write_text('{"api_key": "must-not-export"}', encoding="utf-8")
+    seen = {}
+
+    def adapter(argv, **kwargs):
+        queue = Path(controller.home) / "state" / "fleet-session-lifecycle-outbox.jsonl"
+        queue.unlink()
+        queue.symlink_to(secret)  # planted between validation and the adapter's read
+        seen["argv"] = argv
+        seen["input"] = os.read(kwargs["stdin"], 1 << 16)
+        return 75
+
+    controller, _home, _vault = _controller(mod, tmp_path, runner=adapter)
+    controller.config["outbox_command"] = ["external-outbox-adapter"]
+
+    _finish_turn(controller, "t1")
+
+    assert seen["argv"][-2:] == ["--input", "/dev/stdin"]
+    assert b"must-not-export" not in seen["input"]
+    assert json.loads(seen["input"].splitlines()[-1])["schema"] == "fleet-lifecycle-outbox.v1"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("alias", ["symlink", "hardlink"])
+def test_checkpoints_never_append_through_an_alias_at_the_partition(tmp_path, alias):
+    mod = _load_lifecycle()
+    controller, _home, _vault = _controller(mod, tmp_path, runner=lambda *_a, **_k: 0)
+    partition = controller._checkpoint_path()
+    partition.parent.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious contents", encoding="utf-8")
+    if alias == "symlink":
+        partition.symlink_to(victim)
+    else:
+        os.link(victim, partition)
+
+    _finish_turn(controller, "t1")
+    controller.full_wrapup(session_id="s", reason="done")
+
+    assert victim.read_text(encoding="utf-8") == "precious contents"
+    state = json.loads(controller.state_path.read_text(encoding="utf-8"))
+    assert state["pending_turns"]  # the turn stays durable for a later, unaliased checkpoint
