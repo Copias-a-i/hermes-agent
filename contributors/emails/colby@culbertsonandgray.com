@@ -1,2 +1,2 @@
 cabo-tropic-horizon
-# PR #6 lifecycle remediation
+# CI prerequisite PR #20
