@@ -64,6 +64,18 @@ def test_unparseable_wrapper_options_fail_closed(command):
 
 
 @pytest.mark.parametrize("command", [
+    # The command string is the first operand after the shell's options, not the word after
+    # `-c`: an option terminator or another option may sit between them (COP-699 review).
+    "bash -c -- 'pkill -9 -f python'", "sh -c -- 'killall node'", "bash -c -e 'pkill -f python'",
+    "bash -c -o errexit 'pkill -f python'", "zsh -c - 'pkill -f python'",
+    "sudo -u root bash -c -- 'pkill -f python'", "su root -c 'pkill -f python'",
+    "su --command='pkill -f python'", "runuser -u root --command 'pkill -f python'",
+])
+def test_command_string_after_shell_options_is_inspected(command):
+    assert _decide(command).returncode == 2
+
+
+@pytest.mark.parametrize("command", [
     "{ pkill -f python; }", "! pkill -f python", "if true; then pkill -f python; fi",
     "for name in a b; do pkill -f $name; done",
     "ls\npkill -f python", "ls # not a comment for the next line\npkill -f python",

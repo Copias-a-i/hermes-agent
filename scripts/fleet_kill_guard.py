@@ -111,11 +111,19 @@ def _command_index(wrapper: _Wrapper, args: list[str]) -> int | None:
 
 
 def _runs_killer_string(args: list[str]) -> bool:
-    """`sh -c STRING`: the string is a command line of its own."""
-    return any(
-        token.startswith("-") and "c" in token and process_name_kill(args[index + 1])
-        for index, token in enumerate(args[:-1])
-    )
+    """`sh -c STRING`: the string is a command line of its own.
+
+    The string is the first operand after the shell's options, which may follow `-c` (`-c -- STR`,
+    `-c -o errexit STR`, `su USER -c STR`). Rather than parse each shell's option grammar, every
+    word after the `-c` option is inspected, so an unparsed option errs toward blocking.
+    """
+    for index, token in enumerate(args):
+        if token.startswith("--command="):
+            if process_name_kill(token.partition("=")[2]):
+                return True
+        elif token.startswith("-") and "c" in token:
+            return any(process_name_kill(word) for word in args[index + 1:])
+    return False
 
 
 def _segment_kills(segment: list[str]) -> bool:
