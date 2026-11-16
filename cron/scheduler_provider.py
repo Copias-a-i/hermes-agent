@@ -120,8 +120,15 @@ def _ownership_checked_dispatch(profile_gate, can_dispatch, name, home):
     took the store after this cycle's gate pass still wins: the tick yields instead of dispatching.
     """
     def dispatch_allowed():
-        if profile_gate is not None and not profile_gate(name, home):
-            raise _ProfileOwnershipChanged(name)
+        if profile_gate is not None:
+            try:
+                owned = profile_gate(name, home)
+            except Exception:
+                # Ownership unknown: yield exactly as for a lost gate, so no store write follows.
+                logger.warning("Cron ownership recheck failed for %s; yielding this tick", name, exc_info=True)
+                owned = False
+            if not owned:
+                raise _ProfileOwnershipChanged(name)
         return can_dispatch is None or can_dispatch()
 
     return dispatch_allowed
