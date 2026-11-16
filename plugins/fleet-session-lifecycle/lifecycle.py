@@ -74,6 +74,60 @@ def _is_outbox_record(line: bytes) -> bool:
         return False
 
 
+class UnreadableLedger(RuntimeError):
+    """The lifecycle ledger exists but cannot be read; it is preserved, never replaced."""
+
+
+def _report_once(key: str, message: str, *args: Any) -> None:
+    """Every hook builds a controller, so a standing problem is logged once per path."""
+    if key not in _reported_lock_aliases:
+        _reported_lock_aliases.add(key)
+        logger.error(message, *args)
+
+
+def _open_private_file(path: Path) -> int | None:
+    """Open ``path`` read-write (created 0600), or None when something else stands at the path.
+
+    The state directory is writable by candidate-executed tools, so a symlink or hard link can stand
+    where a plugin file belongs. The path is opened without following links and only a private
+    regular file whose descriptor matches the path is accepted, so an alias is refused, not followed.
+    """
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        if os.path.islink(path):
+            return None
+        raise
+    try:
+        opened = os.fstat(fd)
+        standing = os.lstat(path)
+        owned = os.name == "nt" or opened.st_uid == os.geteuid()  # windows-footgun: ok — guarded by os.name
+        if (
+            stat_mode.S_ISREG(opened.st_mode) and opened.st_nlink == 1 and owned
+            and (opened.st_dev, opened.st_ino) == (standing.st_dev, standing.st_ino)
+        ):
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def _read_fd(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks = []
+    while chunk := os.read(fd, 1 << 16):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _write_fd(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
 def profile_name_for_home(home: Path) -> str:
     """Return a stable, profile-local vault namespace without ambient-home fallback."""
     if home.parent.name == "profiles":
@@ -185,11 +239,41 @@ class LifecycleController:
         self._lease_refused = False
 
     def _state(self) -> dict[str, Any]:
+        """The ledger, empty only when it does not exist yet.
+
+        An existing ledger that cannot be read or parsed raises ``UnreadableLedger``: replacing it
+        with an empty one would discard every pending turn and intent it records.
+        """
         try:
-            data = json.loads(self.state_path.read_text(encoding="utf-8-sig"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
+            raw = self.state_path.read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
             return {}
+        except (OSError, ValueError) as exc:
+            raise UnreadableLedger(str(self.state_path)) from exc
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            raise UnreadableLedger(str(self.state_path)) from exc
+        if not isinstance(data, dict):
+            raise UnreadableLedger(str(self.state_path))
+        return data
+
+    def _writable_state(self) -> dict[str, Any] | None:
+        """The ledger to update under the lease, or None when it must be preserved untouched.
+
+        Callers then take their lease-independent intent path, so the event stays durable and is
+        adopted by the first holder that finds a readable ledger.
+        """
+        try:
+            return self._state()
+        except UnreadableLedger:
+            _report_once(
+                "ledger:" + str(self.state_path),
+                "fleet-session-lifecycle: %s exists but is not a readable ledger; it is preserved and new "
+                "events are kept as intents until it is repaired or removed",
+                self.state_path,
+            )
+            return None
 
     def _admission_event(self, event_id: str, session_id: str, turn_id: str, user_message: Any) -> dict[str, Any]:
         """Durable row of one admitted turn; identical whether it lands in state or in an intent."""
@@ -733,14 +817,14 @@ class LifecycleController:
         event_id = hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
         try:
             with self._lease_with_retry() as acquired:
-                if not acquired:
+                state = self._writable_state() if acquired else None
+                if state is None:
                     # Another process may hold the lease for seconds (an outbox adapter runs under it). The
                     # admission must not live only in this process, so it gets its own per-event intent and
                     # the next lease holder adopts it; a crash before ``after_turn`` then still replays it.
                     self._persist_admission_intent(self._admission_event(event_id, session_id, turn_id, user_message))
-                    logger.warning("fleet-session-lifecycle: turn admission lease remained busy; intent retained")
+                    logger.warning("fleet-session-lifecycle: turn admission lease or ledger unavailable; intent retained")
                     return
-                state = self._state()
                 processed = {str(item) for item in (state.get("processed_turns") or ())}
                 pending = state.setdefault("pending_turns", {})
                 if event_id not in processed and not isinstance(pending.get(event_id), dict):
@@ -820,11 +904,11 @@ class LifecycleController:
             return
         try:
             with self._lease_with_retry() as acquired:
-                if not acquired:
+                state = self._writable_state() if acquired else None
+                if state is None:
                     self._persist_finalization_intent(session_id, reason)
-                    logger.warning("fleet-session-lifecycle: final wrap-up lease remained busy; intent retained")
+                    logger.warning("fleet-session-lifecycle: final wrap-up lease or ledger unavailable; intent retained")
                     return
-                state = self._state()
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
                 completion_intents = self._merge_event_intents(state, cancelled_sessions=cancelled_sessions)
                 finalization_intents = self._merge_finalization_intents(state)
@@ -860,11 +944,12 @@ class LifecycleController:
             return
         try:
             with self._lease_with_retry() as acquired:
-                if not acquired:
+                state = self._writable_state() if acquired else None
+                if state is None:
                     self._persist_cancellation_intent(session_id)
-                    logger.warning("fleet-session-lifecycle: disabled session cancellation lease remained busy; intent retained")
+                    logger.warning("fleet-session-lifecycle: disabled session cancellation lease or ledger unavailable; "
+                                   "intent retained")
                     return
-                state = self._state()
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
                 identities = self._session_identity_candidates(session_id)
                 cancelled_sessions |= identities
@@ -885,7 +970,8 @@ class LifecycleController:
         except Exception:
             logger.exception("fleet-session-lifecycle: disabled session cancellation failed")
 
-    def _repair_outbox_tail(self, queue: Path) -> None:
+    @staticmethod
+    def _repair_outbox_tail(fd: int) -> None:
         """Drop an unreadable trailing record so the next append cannot fuse onto it.
 
         A crash between the queue write and its fsync can leave the file ending
@@ -893,10 +979,7 @@ class LifecycleController:
         blocks delivery of every record in the file — including the ones that
         were already durable — so the torn tail is repaired before enqueueing.
         """
-        try:
-            raw = queue.read_bytes()
-        except OSError:
-            return
+        raw = _read_fd(fd)
         if not raw:
             return
         records = raw.split(b"\n")
@@ -908,11 +991,10 @@ class LifecycleController:
         repaired = b"".join(line + b"\n" for line in records)
         if repaired == raw:
             return
-        with queue.open("r+b") as handle:
-            handle.write(repaired)
-            handle.truncate(len(repaired))
-            handle.flush()
-            os.fsync(handle.fileno())
+        os.lseek(fd, 0, os.SEEK_SET)
+        _write_fd(fd, repaired)
+        os.ftruncate(fd, len(repaired))
+        os.fsync(fd)
         logger.warning("fleet-session-lifecycle: repaired a torn outbox tail (%d byte(s) dropped)",
                        len(raw) - len(repaired))
 
@@ -922,6 +1004,8 @@ class LifecycleController:
         Deployments install an adapter outside this repository and configure
         ``outbox_command``. Missing or failed adapters leave the locally durable
         record available for a later turn without affecting response delivery.
+        The queue is only read, repaired and appended through a descriptor validated
+        as this plugin's private file, so a planted alias is never written through.
         """
         command = self.config.get("outbox_command")
         if (
@@ -932,15 +1016,24 @@ class LifecycleController:
             return
         queue = self.home / "state" / "fleet-session-lifecycle-outbox.jsonl"
         queue.parent.mkdir(parents=True, exist_ok=True)
-        self._repair_outbox_tail(queue)
         payload = {"schema": "fleet-lifecycle-outbox.v1", "event_id": event["event_id"],
                    "profile": self.profile, "session_id": event["session_id"],
                    "turn_id": event["turn_id"],
                    "summary": f"user: {event['user']}\\nresponse: {event['response']}"}
-        with queue.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        fd = _open_private_file(queue)
+        if fd is None:
+            _report_once("outbox:" + str(queue),
+                         "fleet-session-lifecycle: refusing %s: it is not this plugin's private outbox file "
+                         "(symlink, hard link or foreign file); remove it so outbox delivery can resume", queue)
+            state.setdefault("outbox", {}).update(last_status="refused", write_pending=True)
+            return
+        try:
+            self._repair_outbox_tail(fd)
+            os.lseek(fd, 0, os.SEEK_END)
+            _write_fd(fd, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         outbox = state.setdefault("outbox", {})
         try:
             code = self._invoke(command + ["--input", str(queue)], timeout=float(self.config.get("outbox_timeout_seconds", 5)))
@@ -969,11 +1062,12 @@ class LifecycleController:
         event_id = hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
         try:
             with self._lease_with_retry() as acquired:
-                if not acquired:
+                state = self._writable_state() if acquired else None
+                if state is None:
                     # The admission is already durable. Publish an independent per-event completion
                     # intent so a later holder can safely make it replayable instead of waiting for
-                    # this still-live PID to die.
-                    state = self._state()
+                    # this still-live PID to die (or for an unreadable ledger to be repaired).
+                    state = (self._writable_state() if not acquired else None) or {}
                     pending = state.get("pending_turns") if isinstance(state.get("pending_turns"), dict) else {}
                     event = dict(pending.get(event_id) or {})
                     event.update({
@@ -989,9 +1083,9 @@ class LifecycleController:
                         "checkpoint_partition": event.get("checkpoint_partition") or self._checkpoint_path().name,
                     })
                     self._persist_completion_intent(event)
-                    logger.warning("fleet-session-lifecycle: after-turn lease remained busy; completion intent retained")
+                    logger.warning("fleet-session-lifecycle: after-turn lease or ledger unavailable; completion intent "
+                                   "retained")
                     return
-                state = self._state()
                 cancellation_intents, cancelled_events, cancelled_sessions = self._merge_cancellation_intents(state)
                 completion_intents = self._merge_event_intents(state, cancelled_sessions=cancelled_sessions)
                 finalization_intents = self._merge_finalization_intents(state)

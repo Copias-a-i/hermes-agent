@@ -1278,7 +1278,11 @@ def test_healthy_outbox_queue_is_not_rewritten_by_the_tail_repair(tmp_path):
     intact = json.dumps({"schema": "fleet-lifecycle-outbox.v1", "turn_id": "kept"}) + "\n"
     queue.write_text(intact, encoding="utf-8")
 
-    controller._repair_outbox_tail(queue)
+    fd = mod._open_private_file(queue)
+    try:
+        controller._repair_outbox_tail(fd)
+    finally:
+        os.close(fd)
 
     assert queue.read_text(encoding="utf-8") == intact
 
