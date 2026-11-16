@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from hermes_platform.resolver import locate_command
 from hermes_cli._subprocess_compat import NO_LAZY_FETCH_ENV, noninteractive_git_env, windows_hide_flags
 from hermes_cli.update_cmd_common import _record_stop
 
@@ -561,6 +562,10 @@ def _git_is_trampoline(git_cmd: list) -> bool:
     return _probe_fork_bomb(git_cmd) is True
 
 
+# Parents of Git for Windows' standard install: each holds ``Git\<arch>\libexec\git-core\git.exe``.
+_GIT_FOR_WINDOWS_ROOTS = (r"C:\Program Files", r"C:\Program Files (x86)")
+
+
 def _portable_git_candidates() -> list:
     """PortableGit candidates: shared root first (where the managed tree actually lives, not the
     profile-scoped HERMES_HOME), then profile home as a fallback for custom layouts.
@@ -577,17 +582,20 @@ def _portable_git_candidates() -> list:
 
 
 def _locate_real_git() -> Optional[Path]:
-    """Find a real Git-for-Windows ``git-core/git.exe`` (standard locations + managed PortableGit) that runs
-    without the trampoline guard. None when nothing suits — callers keep the broken command and let the
-    fetch-failure ZIP fallback handle it. A failed probe (None) disqualifies a candidate like a guard hit.
+    """Find a Git executable that runs without the trampoline guard. None when nothing suits — callers keep
+    the broken command and let the fetch-failure ZIP fallback handle it.
 
-    The trampoline symptom is PATH-level: ``bin\\git.exe`` / ``cmd\\git.exe`` (both ~46KB shims) fail to
-    re-exec git-core, while the real binary at ``mingw64\\libexec\\git-core\\git.exe`` (≈4.4MB) works when
-    invoked directly (#87876).
+    The platform resolver's PATH hit goes first (runner images and managed Git installs need not use
+    Git-for-Windows' ``git-core`` layout). When the PATH Git IS the broken trampoline that hit is the very shim
+    ``_ensure_non_trampoline_git`` just rejected, so the probe disqualifies it and the search falls through to
+    the real ``mingw64\\libexec\\git-core\\git.exe`` (standard Git for Windows locations + managed PortableGit)
+    that works when invoked directly (#87876). A failed probe (None) disqualifies a candidate like a guard hit.
     """
-    candidates = [
+    resolved = locate_command("git").command
+    candidates = [Path(resolved[0])] if resolved else []
+    candidates += [
         Path(base) / "Git" / arch / "libexec" / "git-core" / "git.exe"
-        for base in (r"C:\Program Files", r"C:\Program Files (x86)")
+        for base in _GIT_FOR_WINDOWS_ROOTS
         for arch in ("clangarm64", "mingw64", "mingw32")
     ] + _portable_git_candidates()
     return next((c for c in candidates if c.exists() and _probe_fork_bomb([str(c)]) is False), None)

@@ -28,10 +28,23 @@ SHAPES = {
 }
 
 
-def _scenario(root, shape: str) -> dict:
-    cm, w = G.start_world(root / shape, base=G.n1_base(), installer_ref=G.n1_tag(), preclone=SHAPES[shape])
-    run = {"cm": cm, "w": w, "shape0": w.install_shape}
-    w.set_main(I.head_sha())
+def test_fixture_release_tag_is_reachable_from_the_upgrade_target(tmp_path):
+    history = G.build_upgrade_history(tmp_path / "history")
+    assert I.git("describe", "--tags", "--abbrev=0", "--match", "v20[0-9][0-9].*", f"{history.target}~1",
+                 cwd=history.source) == history.tag
+
+
+def test_fixture_history_has_no_matching_tag_when_requested(tmp_path):
+    history = G.build_upgrade_history(tmp_path / "history")
+    with pytest.raises(AssertionError, match=r"(?:No tags can describe|No names found, cannot describe anything)"):
+        I.git("describe", "--tags", "--abbrev=0", "--match", "v20[0-9][0-9].*", history.untagged, cwd=history.source)
+
+
+def _scenario(root, shape: str, history: G.UpgradeHistory) -> dict:
+    cm, w = G.start_world(root / shape, base=history.base, installer_ref=history.tag, preclone=SHAPES[shape],
+                          source=history.source)
+    run = {"cm": cm, "w": w, "shape0": w.install_shape, "target1": history.target}
+    w.set_main(history.target)
     run["cp1"], run["head1"], run["shape1"] = w.update(), w.head(), w.shape()
     run["target2"] = w.publish(f"release: e2e partial {shape}", {f"e2e-partial-{shape}.txt": "release\n"})
     run["cp2"], run["head2"], run["shape2"] = w.update(), w.head(), w.shape()
@@ -42,7 +55,8 @@ def _scenario(root, shape: str) -> dict:
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-partial")
-    results = G.in_parallel({shape: (lambda s=shape: _scenario(root, s)) for shape in SHAPES})
+    history = G.build_upgrade_history(root / "history")
+    results = G.in_parallel({shape: (lambda s=shape: _scenario(root, s, history)) for shape in SHAPES})
     yield results
     for res in results.values():
         if isinstance(res, dict):
@@ -59,7 +73,7 @@ def test_updates_land_and_the_clone_keeps_its_shape(runs, shape):
     expected = {**run["shape0"], "filter": "blob:none"} if shape == "tree0" else run["shape0"]
     assert run["shape0"]["shallow"] == "false" and (shape == "full") == (run["shape0"]["filter"] == "-"), \
         f"seeded the wrong clone shape for {shape}: {run['shape0']}"
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
+    assert cp1.returncode == 0 and run["head1"] == run["target1"], f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
     assert G.TRACEBACK not in G.output(cp1), f"N-1 -> HEAD update printed a traceback:\n{w.diag(cp1)}"
     assert run["shape1"] == expected, (
         f"{'the full clone was converted to a partial clone' if shape == 'full' else 'the clone changed shape'} "

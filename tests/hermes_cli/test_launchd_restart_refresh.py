@@ -28,6 +28,9 @@ import hermes_cli.gateway as gateway_cli
 @pytest.fixture
 def launchd_seam(monkeypatch, tmp_path):
     """Neutralize process-side effects; record every launchctl invocation."""
+    # A failed refresh is explicitly stale; do not inspect this checkout
+    # to classify the temporary plist against a real installation.
+    monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: False)
     calls = []
     plist_path = tmp_path / "ai.hermes.gateway.plist"
     plist_path.write_text("<plist>whatever</plist>", encoding="utf-8")

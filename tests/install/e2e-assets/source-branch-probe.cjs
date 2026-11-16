@@ -29,13 +29,12 @@ function prepareSourceBranchEnvironment(root, expectedSha, realGit, capturedEnv,
     throw new Error('source app-update requires HERMES_E2E_REAL_GIT for staged main')
   }
   const install = path.resolve(root)
-  const staged = childProcess.execFileSync(realGit, ['-C', install, 'remote', 'get-url', 'origin'], {
-    encoding: 'utf8', env: capturedEnv,
+  const execGit = args => childProcess.execFileSync(realGit, args, {
+    encoding: 'utf8', env: capturedEnv, timeout: 3_000, killSignal: 'SIGKILL',
   }).trim()
+  const staged = execGit(['-C', install, 'remote', 'get-url', 'origin'])
   if (!/^file:\/\/[^\s]+$/.test(staged)) throw new Error('source check must use a staged file:// Git origin')
-  const advertised = childProcess.execFileSync(realGit, ['ls-remote', '--heads', staged, 'refs/heads/main'], {
-    encoding: 'utf8', env: capturedEnv,
-  }).trim().split(/\s+/)[0]
+  const advertised = execGit(['ls-remote', '--heads', staged, 'refs/heads/main']).split(/\s+/)[0]
   if (advertised !== expectedSha) {
     throw new Error(`staged Git main ${advertised} does not match expected ${expectedSha}`)
   }

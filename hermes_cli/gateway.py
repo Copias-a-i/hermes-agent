@@ -67,6 +67,7 @@ from hermes_cli.setup import (  # noqa: F401 — resolved lazily by siblings thr
     prompt_yes_no,
 )
 from hermes_cli.colors import Colors, color
+from hermes_cli.gateway_stop import _mark_planned_stop, _wait_for_terminal_stopped_state
 logger = logging.getLogger(__name__)
 
 # Shared ``subprocess.run`` kwargs for text-mode probes (stdout/stderr captured, decode-tolerant).
@@ -597,7 +598,7 @@ def _scan_gateway_pids(
         command_lc = command.lower().replace("\\", "/")
         if current_profile_name:
             # Token equality, not substring: `-p ops` must not claim (or SIGTERM) an `-p ops-2` gateway.
-            if profile_flag_value(command_lc) == current_profile_name_lc:
+            if (profile_flag_value(command) or "").lower() == current_profile_name_lc:
                 return True
             return command_line_names_hermes_home(command_lc, current_home_lc)
 
@@ -605,7 +606,7 @@ def _scan_gateway_pids(
         # accepts (``--profile=ops`` slipped past a substring test, so a default-profile fallback stop
         # could SIGTERM the named gateway) or a HERMES_HOME= naming another home. An explicit
         # ``--profile default`` names this home (#100817).
-        if profile_flag_value(command_lc) not in (None, "default"):
+        if (profile_flag_value(command) or "default").lower() != "default":
             return False
         if hermes_home_assignments(command_lc):
             return command_line_names_hermes_home(command_lc, current_home_lc)
@@ -1962,18 +1963,6 @@ def _force_kill_survivors(survivors, *, kill=None) -> None:
             kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 
 
-def _mark_planned_stop(pid: int | None = None) -> None:
-    """Best-effort planned-stop marker for ``pid`` (default: the recorded gateway PID)."""
-    try:
-        from gateway.status import get_running_pid, write_planned_stop_marker
-        if pid is None:
-            pid = get_running_pid(cleanup_stale=False)
-        if pid is not None:
-            write_planned_stop_marker(pid)
-    except Exception:
-        pass
-
-
 def stop_profile_gateway() -> bool:
     """Stop only this profile's gateway via its PID file; True if a process was stopped. Without a
     supervisor the pidfile can be stale while a live orphan holds the webhook port, so fall back to
@@ -2027,6 +2016,9 @@ def stop_profile_gateway() -> bool:
 
     if get_running_pid() is None:
         remove_pid_file()
+    else:
+        logger.error("Gateway process %s did not exit before the stop deadline", pid)
+        return False
 
     # Reap orphans from prior restarts whose pidfile entry was overwritten; skip the PID just killed.
     try:
@@ -2035,6 +2027,9 @@ def stop_profile_gateway() -> bool:
         _reap_unsupervised_gateway_orphans(extra_exclude={pid} if pid else None)
     except Exception as exc:
         logger.debug("orphan reap after stop_profile_gateway failed: %s", exc)
+    if not _wait_for_terminal_stopped_state():
+        logger.error("Gateway exited but durable terminal runtime status was not confirmed")
+        return False
     return True
 
 

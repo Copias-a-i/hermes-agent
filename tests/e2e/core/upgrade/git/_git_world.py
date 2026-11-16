@@ -3,10 +3,18 @@
 ``World`` is one sandboxed machine (``_install_helpers.new_sandbox``: bwrap, empty fake HOME, the
 git wrapper that reports the official remote URL) whose ``~/.gitconfig`` rewrites the official
 GitHub URL to a loopback ``git http-backend`` origin (``_smart_http``). The install itself comes
-from a real ``scripts/install.sh``: N-1's own copy for an N-1 install (it makes the depth-1
-single-branch clone N-1 users have), HEAD's for a HEAD install (a ``--filter=blob:none`` clone).
-``preclone`` seeds a checkout the installer then adopts, for the clone shapes users got another
-way (a manual full clone, a ``blob:none`` fallback clone).
+from a real ``scripts/install.sh``: the one at ``installer_ref`` for an N-1 install, HEAD's for a
+HEAD install (a ``--filter=blob:none`` clone).
+
+The fork carries no release tags, so N-1 is not "the newest tag before HEAD". The upgrade history is
+synthetic (``build_upgrade_history``) but made of HEAD's own: one commit per first-parent commit of
+the last ``N1_COMMITS_BEHIND`` commits, each carrying that commit's real tree. The tagged ``base`` is the N-1
+snapshot, with its own installer and updater; ``target`` is HEAD's tree; ``base..target`` is
+``N1_COMMITS_BEHIND`` commits wide, so a cell can stop upstream on distinct commits in between. No
+installer in that window clones ``--depth 1``, and each finishes by unshallowing its checkout, so the
+shapes users have come from two places: ``preclone`` seeds a manual full clone or a ``blob:none``
+fallback clone that the installer then adopts, and ``depth1`` rebuilds the finished install into the
+depth-1 clone a stale one keeps (``World.make_depth1``).
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes
@@ -17,6 +25,7 @@ message that explains itself.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import shutil
@@ -36,6 +45,10 @@ REPO = "hermes-agent.git"
 SUCCESS = "Update complete"
 TRACEBACK = I.TRACEBACK
 
+# How far behind HEAD the N-1 snapshot sits, in first-parent commits. It is also the width of the
+# ``base..target`` range, which the cells that stop upstream on commits in between rely on.
+N1_COMMITS_BEHIND = 12
+
 PYTESTMARK = [
     pytest.mark.platforms("linux"),
     # Every `hermes update` runs inside the bwrap sandbox against a throwaway install in tmp_path.
@@ -54,26 +67,97 @@ def reported_success(cp: subprocess.CompletedProcess) -> bool:
     return cp.returncode == 0 or SUCCESS in output(cp)
 
 
-def n1_tag() -> str:
-    """N-1: the newest release tag strictly before HEAD."""
-    return I.git("describe", "--tags", "--abbrev=0", "--match", "v20[0-9][0-9].*", "HEAD~1", cwd=H.WORKTREE)
+@dataclass(frozen=True)
+class UpgradeHistory:
+    """A local release -> upgrade ancestry independent of checkout tags or git config."""
+
+    source: Path
+    untagged: str
+    base: str
+    target: str
+    tag: str
 
 
-def n1_base() -> str:
-    """The commit an N-1 install sits on: N-1's tag, or ``HERMES_E2E_N1_REF`` (a patched commit
-    object, used to prove red a cell whose bug lives in N-1's own updater code)."""
-    return commit_of(os.environ.get("HERMES_E2E_N1_REF") or n1_tag())
+def _fixture_git_env(date: str) -> dict[str, str]:
+    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Hermes E2E", "GIT_AUTHOR_EMAIL": "e2e@hermes.invalid",
+            "GIT_COMMITTER_NAME": "Hermes E2E", "GIT_COMMITTER_EMAIL": "e2e@hermes.invalid",
+            "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
 
 
-def commit_of(ref: str) -> str:
-    return I.git("rev-parse", f"{ref}^{{commit}}", cwd=H.WORKTREE)
+def _commit(source: Path, tree: str, message: str, date: str, parent: str | None = None) -> str:
+    cp = subprocess.run(["git", "commit-tree", tree, *(["-p", parent] if parent else [])], cwd=str(source),
+                        input=message + "\n", text=True, capture_output=True, env=_fixture_git_env(date))
+    assert cp.returncode == 0, f"creating upgrade fixture commit failed: {cp.stderr}"
+    return cp.stdout.strip()
 
 
-def installer_script(ref: str | None) -> str:
+def _first_parent_snapshots(count: int) -> list[tuple[str, str]]:
+    """``(tree, commit)`` of HEAD and its ``count - 1`` first-parent ancestors, oldest first."""
+    rows = I.git("log", "--first-parent", f"--max-count={count}", "--format=%T %H", "HEAD",
+                 cwd=H.WORKTREE).splitlines()
+    assert len(rows) == count, (
+        f"the upgrade fixture reads the last {count} first-parent commits of HEAD's history and found "
+        f"{len(rows)}: check out with the full history (actions/checkout fetch-depth: 0)")
+    return [(row.split()[0], row.split()[1]) for row in reversed(rows)]
+
+
+def build_upgrade_history(root: Path, *, behind: int = N1_COMMITS_BEHIND) -> UpgradeHistory:
+    """A dated release -> upgrade ancestry made of HEAD's own recent history, with no checkout tags
+    or global git config.
+
+    One synthetic commit per first-parent commit of HEAD from ``behind + 1`` back to HEAD, each
+    carrying that commit's real tree: ``untagged`` is the snapshot before N-1, ``base`` (tagged) is
+    N-1 with its own installer and updater, ``target`` is HEAD, and ``base..target`` is ``behind``
+    commits wide. Identities and dates are fixed, so the same history is built wherever it runs."""
+    source = root / "history.git"
+    root.mkdir(parents=True, exist_ok=True)
+    cp = subprocess.run(["git", "init", "-q", "--bare", str(source)], capture_output=True, text=True,
+                        env=_fixture_git_env("2026-01-01T00:00:00+0000"))
+    assert cp.returncode == 0, f"creating upgrade fixture repository failed: {cp.stderr}"
+    objects = I.git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=H.WORKTREE)
+    (source / "objects" / "info" / "alternates").write_text(f"{Path(objects) / 'objects'}\n", encoding="utf-8")
+    snapshots = _first_parent_snapshots(behind + 2)
+    assert snapshots[1][0] != snapshots[-1][0], (
+        f"the N-1 snapshot {snapshots[1][1][:12]} (HEAD~{behind}) and HEAD carry the same tree: the upgrade "
+        f"would cross no code")
+
+    def day(index: int) -> str:
+        return (dt.date(2026, 1, 1) + dt.timedelta(days=index)).isoformat()
+
+    commits: list[str] = []
+    for index, (tree, real) in enumerate(snapshots):
+        role = "untagged fixture root" if index == 0 else "release fixture" if index == 1 else "post-release upgrade"
+        commits.append(_commit(source, tree, f"e2e: {role} ({real[:12]})", f"{day(index)}T00:00:00+0000",
+                               commits[-1] if commits else None))
+    untagged, base, target = commits[0], commits[1], commits[-1]
+    tag = "v2099.1.1"
+    for name, ref, stamp in (("e2e-not-a-release", untagged, f"{day(0)}T00:00:01+0000"),
+                             (tag, base, f"{day(1)}T00:00:01+0000")):
+        cp = subprocess.run(["git", "tag", "-a", name, ref, "-m", name], cwd=str(source), capture_output=True,
+                            text=True, env=_fixture_git_env(stamp))
+        assert cp.returncode == 0, f"creating upgrade fixture tag {name} failed: {cp.stderr}"
+    I.git("update-ref", "refs/heads/main", target, cwd=source)
+    I.git("symbolic-ref", "HEAD", "refs/heads/main", cwd=source)
+    return UpgradeHistory(source=source, untagged=untagged, base=base, target=target, tag=tag)
+
+
+def mid_range_stops(history: UpgradeHistory) -> list[str]:
+    """Where a cell stops upstream between N-1 and HEAD, oldest first: the commits a quarter, half and
+    three quarters of the way from N-1 to HEAD, so each stop is a later move than the last and a
+    passive check at each one grafts a different tip. A range too short for three distinct commits
+    fails here rather than repeating one."""
+    between = I.git("rev-list", "--first-parent", f"{history.base}..{history.target}", cwd=history.source).split()
+    assert len(between) >= 3, (
+        f"{len(between)} commit(s) between N-1 and HEAD cannot hold three distinct mid-range stops")
+    return [between[k] for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4)]
+
+
+def installer_script(ref: str | None, source: Path) -> str:
     """``scripts/install.sh`` as of ``ref`` (None: this worktree's copy)."""
     if ref is None:
         return (H.WORKTREE / "scripts" / "install.sh").read_text(encoding="utf-8")
-    return I.git("show", f"{ref}:scripts/install.sh", cwd=H.WORKTREE) + "\n"
+    return I.git("show", f"{ref}:scripts/install.sh", cwd=source) + "\n"
 
 
 @dataclass
@@ -154,6 +238,38 @@ class World:
     def bytes_since(self, mark: int) -> int:
         return sum(r.body_bytes for r in self.srv.since(mark) if r.method == "POST")
 
+    def make_depth1(self) -> None:
+        """Turn the finished install into the stale one an old installer left: ``git clone --depth 1
+        --single-branch`` of origin ``main``, under the same working tree.
+
+        The installers this fixture runs (N-1's and HEAD's) end by unshallowing the checkout into a
+        ``blob:none`` clone: the completion tail's release-history refresh, ``fetch_full_commit_graph``
+        in ``_run_post_update_maintenance``. A depth-1 clone seeded before the install does not survive
+        it, and unsetting the partial-clone flags afterwards would keep the history objects a real
+        depth-1 clone never had. The install's ``.git`` is therefore replaced by the one a fresh depth-1
+        clone writes and the index is rebuilt from HEAD; the files on disk are not touched, and ``git
+        status`` must read the same before and after.
+
+        ``install_bytes`` becomes what that clone downloaded, the "depth-1 install itself" the shallow
+        cells bound an update's fetch by, and ``install_shape`` the new shape."""
+        head, status = self.head(), self.status()
+        fresh = self.root / "depth1-clone"
+        mark = self.srv.mark()
+        cp = subprocess.run(["git", "clone", "-q", "--no-checkout", "--depth", "1", "--single-branch", "--branch",
+                             "main", I.OFFICIAL_HTTPS, str(fresh)],
+                            capture_output=True, text=True, env=self.git_env(), timeout=900)
+        assert cp.returncode == 0, f"depth-1 clone of origin main failed: {cp.stderr[-2000:]}"
+        self.install_bytes = self.bytes_since(mark)
+        cloned = I.git("rev-parse", "HEAD", cwd=fresh)
+        assert cloned == head, f"origin main is at {cloned[:12]}, the install is at {head[:12]}: not the same tree"
+        shutil.rmtree(self.checkout / ".git")
+        shutil.move(str(fresh / ".git"), str(self.checkout / ".git"))
+        shutil.rmtree(fresh)
+        self.git("reset", "-q")
+        assert self.status() == status, (
+            f"swapping in the depth-1 .git changed the working tree's status:\nbefore: {status!r}\nafter: {self.status()!r}")
+        self.install_shape = self.shape()
+
     def update(self, *extra: str, timeout: float = 1200) -> subprocess.CompletedProcess:
         cp = self.sb.cli("update", "--yes", "--branch", "main", *extra, timeout=timeout)
         self.transcripts.append(f"$ hermes update --yes --branch main {' '.join(extra)} -> rc={cp.returncode}\n"
@@ -203,31 +319,43 @@ def _preclone(sb: I.Sandbox, args: list[str], env: dict[str, str]) -> None:
 
 
 @contextlib.contextmanager
-def world(root: Path, *, base: str, installer_ref: str | None = None,
-          preclone: list[str] | None = None) -> Iterator[World]:
-    """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
-    of ``installer_ref`` (None: HEAD's). Yields the live ``World``; the server stops on exit."""
+def served(root: Path, *, base: str, source: Path = H.WORKTREE) -> Iterator[World]:
+    """Origin ``main`` at ``base`` served over smart HTTP, and an empty sandbox whose git reaches it as
+    the official GitHub URL. Nothing is installed yet; the server stops on exit."""
     root.mkdir(parents=True, exist_ok=True)
     srv_root = root / "srv"
     srv_root.mkdir(exist_ok=True)
-    bare = serve_bare(srv_root, REPO, H.WORKTREE, base)
+    bare = serve_bare(srv_root, REPO, source, base)
     with GitHTTPServer(srv_root) as srv:
         sb = I.new_sandbox(root / "sb")
         url = srv.url(REPO)
         (sb.home / ".gitconfig").write_text(
             f'[url "{url}"]\n  insteadOf = {I.OFFICIAL_HTTPS}\n  insteadOf = {I.OFFICIAL_SSH}\n'
             '[user]\n  name = user\n  email = user@example.invalid\n', encoding="utf-8")
-        w = World(root=root, srv=srv, bare=bare, sb=sb)
+        yield World(root=root, srv=srv, bare=bare, sb=sb)
+
+
+@contextlib.contextmanager
+def world(root: Path, *, base: str, installer_ref: str | None = None, preclone: list[str] | None = None,
+          depth1: bool = False, source: Path = H.WORKTREE) -> Iterator[World]:
+    """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
+    of ``installer_ref`` (None: HEAD's). ``preclone`` seeds the checkout the installer adopts;
+    ``depth1`` rebuilds the finished install into a stale depth-1 one (``World.make_depth1``).
+    Yields the live ``World``; the server stops on exit."""
+    with served(root, base=base, source=source) as w:
+        sb = w.sb
         if preclone is not None:
             _preclone(sb, preclone, w.git_env())
         script = sb.root / "install.sh"
-        script.write_text(installer_script(installer_ref), encoding="utf-8")
+        script.write_text(installer_script(installer_ref, source), encoding="utf-8")
         cp = sb.run(["bash", str(script), "--non-interactive"], timeout=1800, input="")
         assert cp.returncode == 0, f"install ({installer_ref or 'HEAD'} installer, base {base[:12]}) failed:\n{w.diag(cp)}"
         head = w.head()
         assert head == base, f"installer left HEAD at {head}, expected {base}\n{w.diag(cp)}"
         w.install_bytes = w.bytes_since(0)
         w.install_shape = w.shape()
+        if depth1:
+            w.make_depth1()
         yield w
 
 

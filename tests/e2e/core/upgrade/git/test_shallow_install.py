@@ -1,9 +1,12 @@
 """Shallow and stale installs through the real ``hermes update``.
 
-N-1's ``scripts/install.sh`` clones ``--depth 1 --single-branch``: that is the checkout every
-N-1 user has. Three installs run concurrently over smart HTTP:
+A stale install keeps the checkout an old ``scripts/install.sh`` made: ``--depth 1 --single-branch``.
+No installer in N-1's window clones that way and every one finishes by unshallowing its checkout, so
+``depth1`` and ``checked`` install N-1 with N-1's installer and then rebuild the checkout into the depth-1
+clone (``World.make_depth1``); the update then crosses the real N-1 -> HEAD code
+(``G.build_upgrade_history``). Three installs run concurrently over smart HTTP:
 
-* ``depth1``: N-1's own depth-1 install, updated to HEAD and then to one more release. The first
+* ``depth1``: the depth-1 N-1 install, updated to HEAD and then to one more release. The first
   update must not download the whole project history to move one release (#123254: on a real
   network that transfer hits the 300 s fetch cap, so a stale shallow install can never update), and
   the second must succeed after the first one unshallowed the clone (#124272: the unshallow applied
@@ -29,12 +32,15 @@ from tests.e2e.core.upgrade.git import _git_world as G
 pytestmark = G.PYTESTMARK
 
 ORPHAN = "orphan divergence"
+# What `git clone --depth 1 --single-branch` leaves: shallow, and neither a promisor nor a filtered remote.
+DEPTH1_SHAPE = {"promisor": "-", "filter": "-", "shallow": "true"}
 
 
-def _depth1(root) -> dict:
-    cm, w = G.start_world(root / "depth1", base=G.n1_base(), installer_ref=G.n1_tag())
-    run = {"cm": cm, "w": w, "shape0": w.install_shape}
-    w.set_main(I.head_sha())
+def _depth1(root, history: G.UpgradeHistory) -> dict:
+    cm, w = G.start_world(root / "depth1", base=history.base, installer_ref=history.tag, depth1=True,
+                          source=history.source)
+    run = {"cm": cm, "w": w, "shape0": w.install_shape, "target1": history.target}
+    w.set_main(history.target)
     run["mark1"] = w.srv.mark()
     run["cp1"], run["head1"] = w.update(), w.head()
     run["fetches1"] = [r for r in w.srv.since(run["mark1"]) if r.command == "fetch"]
@@ -45,16 +51,17 @@ def _depth1(root) -> dict:
     return run
 
 
-def _checked(root) -> dict:
-    cm, w = G.start_world(root / "checked", base=G.n1_base(), installer_ref=G.n1_tag())
-    run = {"cm": cm, "w": w, "shape0": w.install_shape, "checks": []}
-    between = I.git("rev-list", "--first-parent", f"{G.n1_base()}..{I.head_sha()}", cwd=I.H.WORKTREE).split()
-    for k in (len(between) * 3 // 4, len(between) // 2, len(between) // 4):
-        w.set_main(between[k])
+def _checked(root, history: G.UpgradeHistory) -> dict:
+    stops = G.mid_range_stops(history)
+    cm, w = G.start_world(root / "checked", base=history.base, installer_ref=history.tag, depth1=True,
+                          source=history.source)
+    run = {"cm": cm, "w": w, "shape0": w.install_shape, "target1": history.target, "checks": []}
+    for stop in stops:
+        w.set_main(stop)
         run["checks"].append(w.sb.cli("update", "--check", timeout=600))
     shallow = w.checkout / ".git" / "shallow"
     run["grafts"] = len(shallow.read_text(encoding="utf-8").split()) if shallow.is_file() else 0
-    w.set_main(I.head_sha())
+    w.set_main(history.target)
     run["cp1"], run["head1"] = w.update(), w.head()
     return run
 
@@ -76,7 +83,8 @@ def _prefetched(root) -> dict:
 @pytest.fixture(scope="module")
 def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("git-shallow")
-    results = G.in_parallel({"depth1": lambda: _depth1(root), "checked": lambda: _checked(root),
+    history = G.build_upgrade_history(root / "history")
+    results = G.in_parallel({"depth1": lambda: _depth1(root, history), "checked": lambda: _checked(root, history),
                              "prefetched": lambda: _prefetched(root)})
     yield results
     for res in results.values():
@@ -95,8 +103,8 @@ def test_stale_depth1_install_updates_without_fetching_the_whole_history(runs):
     run = _run(runs, "depth1")
     w: G.World = run["w"]
     cp1 = run["cp1"]
-    assert run["shape0"]["shallow"] == "true", f"N-1's installer did not make a shallow clone: {run['shape0']}"
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
+    assert run["shape0"] == DEPTH1_SHAPE, f"the stale N-1 install is not a depth-1 clone: {run['shape0']}"
+    assert cp1.returncode == 0 and run["head1"] == run["target1"], f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
     main_fetch = run["fetches1"][0].body_bytes if run["fetches1"] else 0
     bound = 2 * w.install_bytes
     with known_failure(r"downloaded .* the depth-1 install itself",
@@ -112,7 +120,7 @@ def test_second_update_after_the_unshallowing_update_succeeds(runs):
     run = _run(runs, "depth1")
     w: G.World = run["w"]
     cp1, cp2 = run["cp1"], run["cp2"]
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
+    assert cp1.returncode == 0 and run["head1"] == run["target1"], f"N-1 -> HEAD update failed:\n{w.diag(cp1, run['mark1'])}"
     assert cp2.returncode == 0 and run["head2"] == run["target2"], (
         f"the update after the unshallowing update failed (rc={cp2.returncode}):\n"
         f"{G.output(cp2)[-1500:]}\n{w.diag(cp2, run['mark2'])}")
@@ -124,9 +132,10 @@ def test_passive_checks_do_not_push_the_next_update_into_orphan_divergence(runs)
     run = _run(runs, "checked")
     w: G.World = run["w"]
     cp1 = run["cp1"]
+    assert run["shape0"] == DEPTH1_SHAPE, f"the stale N-1 install is not a depth-1 clone: {run['shape0']}"
     for cp in run["checks"]:
         assert cp.returncode == 0 and G.TRACEBACK not in G.output(cp), f"`hermes update --check` failed:\n{w.diag(cp)}"
-    assert cp1.returncode == 0 and run["head1"] == I.head_sha(), f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
+    assert cp1.returncode == 0 and run["head1"] == run["target1"], f"N-1 -> HEAD update failed:\n{w.diag(cp1)}"
     with known_failure(r"claims orphan divergence",
                        "#124645: each depth-1 `--check` appends a graft the fetch reflog pins, and N-1's "
                        "update resets as orphan divergence. HEAD's prune expires those reflogs and HEAD "

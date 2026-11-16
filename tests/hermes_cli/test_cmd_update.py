@@ -1,6 +1,7 @@
 """Git trampoline recovery; branch updates use the real target-identity suite."""
 
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -106,6 +107,24 @@ class TestGitTrampolineSelfHeal:
         assert result == git_cmd
         run.assert_not_called()
 
+    def test_locate_real_git_uses_platform_resolver_not_git_core_layout(self, tmp_path, monkeypatch):
+        """The managed runner Git may live outside Git-for-Windows' git-core tree."""
+        from hermes_cli import update_cmd_git
+
+        git = tmp_path / "runner-git.exe"
+        git.touch()
+        calls = []
+
+        def resolve(name):
+            calls.append(name)
+            return SimpleNamespace(command=(str(git),))
+
+        monkeypatch.setattr(update_cmd_git, "locate_command", resolve, raising=False)
+        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: False)
+
+        assert update_cmd_git._locate_real_git() == git
+        assert calls == ["git"]
+
     def test_portable_git_candidates_check_shared_root_first(self, tmp_path, monkeypatch):
         # Profile-scoped layout: HERMES_HOME = <root>/profiles/foo, but the
         # PortableGit tree lives under the SHARED root (monerostar review on
@@ -127,3 +146,45 @@ class TestGitTrampolineSelfHeal:
         assert candidates[1] == (
             profile_home / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
         )
+
+    @staticmethod
+    def _stage_git_search(tmp_path, monkeypatch):
+        """A PATH git (the shim under test) plus a managed PortableGit under the shared root, and no
+        Program Files Git, so the search order is the same on every host."""
+        import hermes_constants
+        from hermes_cli import update_cmd_git
+
+        shim = tmp_path / "bin" / "git.exe"
+        real = tmp_path / "root" / "git" / "mingw64" / "libexec" / "git-core" / "git.exe"
+        for exe in (shim, real):
+            exe.parent.mkdir(parents=True)
+            exe.touch()
+        monkeypatch.setattr(hermes_constants, "get_default_hermes_root", lambda: tmp_path / "root")
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path / "root" / "profiles" / "foo")
+        monkeypatch.setattr(update_cmd_git, "_GIT_FOR_WINDOWS_ROOTS", ())
+        monkeypatch.setattr(
+            update_cmd_git, "locate_command", lambda name: SimpleNamespace(command=(str(shim),)), raising=False
+        )
+        return shim, real
+
+    def test_locate_real_git_recovers_when_the_path_git_is_the_broken_trampoline(self, tmp_path, monkeypatch):
+        """#87876: the resolver's PATH hit is the very shim ``_ensure_non_trampoline_git`` just rejected, so
+        the real ``git-core/git.exe`` (here the managed PortableGit) must still be found."""
+        from hermes_cli import update_cmd_git
+
+        shim, real = self._stage_git_search(tmp_path, monkeypatch)
+        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: argv[0] == str(shim))
+
+        assert update_cmd_git._locate_real_git() == real
+
+    def test_locate_real_git_failed_probe_disqualifies_like_a_guard_hit(self, tmp_path, monkeypatch):
+        from hermes_cli import update_cmd_git
+
+        shim, real = self._stage_git_search(tmp_path, monkeypatch)
+        monkeypatch.setattr(
+            update_cmd_git, "_probe_fork_bomb", lambda argv: None if argv[0] == str(shim) else False
+        )
+        assert update_cmd_git._locate_real_git() == real
+
+        monkeypatch.setattr(update_cmd_git, "_probe_fork_bomb", lambda argv: None)
+        assert update_cmd_git._locate_real_git() is None
