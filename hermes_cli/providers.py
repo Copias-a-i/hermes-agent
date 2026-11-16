@@ -147,9 +147,16 @@ def commandcode_alias_secret(provider_id: str, read_env) -> tuple[str, str] | No
     Credential resolvers call this before any other source can return (``model.key_env``), so a
     conflicting alias pair raises ``ProviderCredentialConflictError`` instead of being masked.
     """
-    if provider_id in {"commandcode", "commandcode-anthropic"}:
-        return resolve_commandcode_api_key_env(read_env)
-    return None
+    if provider_id not in {"commandcode", "commandcode-anthropic"}:
+        return None
+    from hermes_cli.auth import has_usable_secret
+
+    def read_usable(name: str) -> str:
+        # A placeholder (``your_api_key_here``) is no credential: it neither wins nor conflicts.
+        value = read_env(name)
+        return value if has_usable_secret(value) else ""
+
+    return resolve_commandcode_api_key_env(read_usable)
 
 
 # -- Aliases: human-friendly / legacy names grouped by canonical (models.dev where possible) id;

@@ -122,3 +122,44 @@ def test_conflicting_commandcode_aliases_fail_closed_without_model_key_env(herme
 
     with pytest.raises(ProviderCredentialConflictError):
         resolve_api_key_provider_credentials(provider_id)
+
+
+class _FakePool:
+    def __init__(self, key):
+        self._entry = type("Entry", (), {"access_token": key, "runtime_api_key": ""})()
+
+    def has_credentials(self):
+        return True
+
+    def peek(self):
+        return self._entry
+
+    def entries(self):
+        return [self._entry]
+
+
+@pytest.mark.parametrize("provider_id", ["commandcode", "commandcode-anthropic"])
+def test_unset_commandcode_aliases_fall_through_to_the_credential_pool(hermes_home, monkeypatch, provider_id):
+    _commandcode_home(hermes_home, monkeypatch, provider_id, "", key_env=False)
+    (hermes_home / ".env").write_text("", encoding="utf-8")
+    import agent.credential_pool as credential_pool
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    monkeypatch.setattr(credential_pool, "load_pool", lambda _pid: _FakePool("sk-pool-saved-key"))
+
+    creds = resolve_api_key_provider_credentials(provider_id)
+    assert creds["api_key"] == "sk-pool-saved-key"
+    assert creds["source"] == f"credential_pool:{provider_id}"
+
+
+@pytest.mark.parametrize("provider_id", ["commandcode", "commandcode-anthropic"])
+def test_placeholder_commandcode_alias_neither_wins_nor_conflicts(hermes_home, monkeypatch, provider_id):
+    _commandcode_home(
+        hermes_home, monkeypatch, provider_id,
+        "COMMANDCODE_API_KEY=your_api_key_here\nCMD_API_KEY=legacy-secret\n", key_env=False,
+    )
+    from hermes_cli.auth import resolve_api_key_provider_credentials
+
+    creds = resolve_api_key_provider_credentials(provider_id)
+    assert creds["api_key"] == "legacy-secret"
+    assert creds["source"] == "CMD_API_KEY"

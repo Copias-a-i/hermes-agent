@@ -405,8 +405,8 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
     alias = commandcode_alias_secret(provider_id, get_env_value_prefer_dotenv)
     if key_env and (val := _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(key_env), key_env)):
         return val, key_env
-    if alias is not None:
-        return alias
+    if alias and (val := _usable_declared_secret(provider_id, alias[0], alias[1])):
+        return val, alias[1]
     for env_var in pconfig.api_key_env_vars:
         val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(env_var), env_var)
         if val:
