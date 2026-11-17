@@ -2514,6 +2514,8 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
                 self.name, len(menu_commands), hidden_count, max_commands)
 
+    refresh_skill_group = _register_command_menu  # /reload-skills hook: re-push BotCommands, no reconnect
+
     @staticmethod
     def _bot_commands(menu_commands) -> list:
         """``BotCommand`` rows; Telegram caps a description at 256 chars (longer locales get cut)."""
