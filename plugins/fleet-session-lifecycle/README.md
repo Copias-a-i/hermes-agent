@@ -21,4 +21,6 @@ fleet_session_lifecycle:
 
 When the adapter is absent or fails, lifecycle processing remains fail-open: the redacted records stay in `state/fleet-session-lifecycle-outbox.jsonl` for a later turn. The lifecycle plugin never passes the vault path, credentials, or raw conversation history to an adapter.
 
+Each turn is made durable twice before it settles: the inbound message when the turn is admitted (`pre_llm_call`) and the reply as soon as the core has persisted it (`post_llm_call`). A crash before the turn's `on_session_end` checkpoint therefore replays the turn with its reply on the next lease holder.
+
 Every record in that file is one complete LF-terminated JSON object. A record torn by a crash mid-write is repaired before the next enqueue, so an adapter never has to parse past a partial line — its event is replayed from the still-pending durable admission instead.

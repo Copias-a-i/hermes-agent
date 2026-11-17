@@ -81,27 +81,37 @@ def _on_pre_llm_call(**kwargs: Any) -> None:
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
-    """Add final output after it is persisted; keep the pre-turn crash snapshot.
+    """Make the finished turn's reply durable as soon as the core has persisted it.
 
-    This hook records the response but never settles the turn: it carries no completed/failed/interrupted
-    outcome (and also fires for an abnormal-exit explanation). The core fires ``on_session_end`` once per
-    turn with that turn's own ``turn_id`` and real outcome (``agent/turn_finalizer.py``), so that is where
-    each turn is checkpointed, and its snapshot is released.
+    This hook never settles the turn: it carries no completed/failed/interrupted outcome (and also fires
+    for an abnormal-exit explanation). The core fires ``on_session_end`` once per turn with that turn's
+    own ``turn_id`` and real outcome (``agent/turn_finalizer.py``), which checkpoints the turn and releases
+    its snapshot. The reply is written onto the durable admission here, so a crash between the two hooks
+    replays the turn with its reply instead of losing it.
     """
-    config = _config()
-    home_key = _home_key(get_hermes_home())
-    session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
-    if not _enabled(config):
-        _drop_pending(home_key, session_id, turn_id)
-        return
-    if not session_id or not turn_id:
-        return
-    with _pending_lock:
-        snapshot = _pending.setdefault((home_key, session_id, turn_id), {})
-        snapshot.update({
-            "user_message": kwargs.get("user_message", snapshot.get("user_message", "")),
-            "assistant_response": kwargs.get("assistant_response", ""),
-        })
+    try:
+        config = _config()
+        home = get_hermes_home()
+        home_key = _home_key(home)
+        session_id, turn_id = str(kwargs.get("session_id") or ""), str(kwargs.get("turn_id") or "")
+        if not _enabled(config):
+            _drop_pending(home_key, session_id, turn_id)
+            return
+        if not session_id or not turn_id:
+            return
+        with _pending_lock:
+            snapshot = _pending.setdefault((home_key, session_id, turn_id), {})
+            snapshot.update({
+                "user_message": kwargs.get("user_message", snapshot.get("user_message", "")),
+                "assistant_response": kwargs.get("assistant_response", ""),
+            })
+            user_message, assistant_response = snapshot["user_message"], snapshot["assistant_response"]
+        LifecycleController(home, config).record_response(
+            session_id=session_id, turn_id=turn_id,
+            user_message=user_message, assistant_response=assistant_response,
+        )
+    except Exception:
+        logger.exception("fleet-session-lifecycle: reply record failed; turn stays deliverable")
 
 
 def _on_session_end(**kwargs: Any) -> None:

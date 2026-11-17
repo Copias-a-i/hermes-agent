@@ -350,11 +350,14 @@ class LifecycleController:
             if not event_id or path.name != f"{event_id}.json":
                 continue
             adopted.append(path)
-            if (
-                self._event_session_hash(event) in cancelled_sessions
-                or event_id in processed
-                or isinstance(pending.get(event_id), dict)
-            ):
+            if self._event_session_hash(event) in cancelled_sessions or event_id in processed:
+                continue
+            existing = pending.get(event_id)
+            if isinstance(existing, dict):
+                # A lease-starved reply record can land after its admission reached state: carry the
+                # reply onto the still-unsettled row, never over a row a completion already settled.
+                if existing.get("active") and not existing.get("response") and event.get("response"):
+                    existing["response"] = event["response"]
                 continue
             event["active"] = True
             pending[event_id] = event
@@ -849,6 +852,41 @@ class LifecycleController:
                     _atomic_json(self.state_path, state)
         except Exception:
             logger.exception("fleet-session-lifecycle: turn admission failed for %s", redact_for_export(session_id))
+
+    def record_response(self, *, session_id: str, turn_id: str, user_message: Any, assistant_response: Any) -> None:
+        """Make a finished turn's reply durable on its admission before the turn settles.
+
+        The core persists the reply and fires ``post_llm_call`` well before ``on_session_end`` brings the
+        turn's outcome. Without this the reply lives only in process memory across that window, and a
+        crash there replays the admission with an empty response. The row stays active and keeps its
+        owner: this records content, never an outcome, so a live owner's turn is not replayed early.
+        """
+        response = redact_for_export(assistant_response)
+        if not session_id or not turn_id or not response:
+            return
+        event_id = hashlib.sha256(f"{session_id}\0{turn_id}".encode()).hexdigest()
+        try:
+            with self._lease_with_retry() as acquired:
+                state = self._writable_state() if acquired else None
+                if state is None:
+                    event = self._admission_event(event_id, session_id, turn_id, user_message)
+                    event["response"] = response
+                    self._persist_admission_intent(event)
+                    logger.warning("fleet-session-lifecycle: reply record lease or ledger unavailable; intent retained")
+                    return
+                if event_id in {str(item) for item in (state.get("processed_turns") or ())}:
+                    return
+                pending = state.setdefault("pending_turns", {})
+                event = pending.get(event_id)
+                if not isinstance(event, dict):
+                    event = pending[event_id] = self._admission_event(event_id, session_id, turn_id, user_message)
+                elif not event.get("active"):
+                    return  # already settled by a completion that carries its own reply
+                event["response"] = response
+                event["user"] = event.get("user") or redact_for_export(user_message)
+                _atomic_json(self.state_path, state)
+        except Exception:
+            logger.exception("fleet-session-lifecycle: reply record failed for %s", redact_for_export(session_id))
 
     def _append_full_wrapup(self, session_id: str, reason: str, attempt_id: str, partition: str) -> None:
         """Write one identifiable final checkpoint without creating an agent turn."""
