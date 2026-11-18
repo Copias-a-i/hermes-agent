@@ -51,6 +51,13 @@ test('bounded child runner terminates a timed-out process', async () => {
     .rejects.toThrow('Child exceeded 100ms')
 })
 
+// Every admission of a channel request runs the authoritative Python validator
+// in a fresh interpreter, and every mutation below is admitted again: about 60
+// interpreter launches plus 10 bounded CLI children. Hosted runners spend
+// 8-14s on that work, so this is a hang backstop sized above it, not a speed
+// contract. Each child already carries its own deadline.
+const CHANNEL_SMOKE_TIMEOUT_MS = 60_000
+
 test('channel smoke binds the complete admitted request, not a commit-build identity or display version', async () => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'channel-smoke-'))
   const token = randomBytes(8).toString('hex'), sequence = 65537
@@ -115,7 +122,7 @@ test('channel smoke binds the complete admitted request, not a commit-build iden
       expect((await run('identity')).code).not.toBe(0)
     }
   } finally { fs.rmSync(temp, { recursive: true, force: true }) }
-}, 15_000)
+}, CHANNEL_SMOKE_TIMEOUT_MS)
 
 test('workspace admission rejects reuse and symlink escapes before creating anything outside runner temp', () => {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'smoke-paths-')))
