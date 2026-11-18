@@ -2452,18 +2452,16 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
                     self._polling_conflict_recovery_generation = None
         if self._teardown_started:
             return
-        # Retries exhausted — fatal so the runner surfaces it and the user knows to act.
+        # Retries exhausted — fatal but RETRYABLE: a 409 is contention for the polling slot, not a config error (the runner rebuilds only retryable fatals).
         message = (
-            "Telegram polling could not recover after %d retries (%ds total wait). "
-            "The previous gateway session is still held open on Telegram's servers, "
-            "or another process is using the same bot token. To recover: ensure no other Hermes or OpenClaw instance is running "
-            "with this token, then restart the gateway with 'hermes gateway restart'."
+            "Telegram polling could not recover after %d retries (%ds total wait): the previous session is still held open on Telegram's "
+            "servers, or another process uses this bot token. Retrying in the background until the competing getUpdates session expires."
             % (MAX_CONFLICT_RETRIES, sum(10 + i * 10 for i in range(1, MAX_CONFLICT_RETRIES + 1))))
         logger.error("[%s] %s Original error: %s", self.name, message, _redact_telegram_error_text(error))
         # Snapshot whether WE transition to fatal: a concurrent retry task suspended past the entry
         # guard reaches this branch too. Only the first transition notifies.
         _already_fatal = self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict"
-        self._set_fatal_error("telegram_polling_conflict", message, retryable=False)
+        self._set_fatal_error("telegram_polling_conflict", message, retryable=True)
         try:
             if self._app and self._app.updater:
                 await _await_with_thread_deadline(self._app.updater.stop(), timeout=_UPDATER_STOP_TIMEOUT)
@@ -2706,6 +2704,8 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             logger.info(
                 "[%s] Telegram menu: %d commands registered, %d hidden (over %d limit). Use /commands for full list.",
                 self.name, len(menu_commands), hidden_count, max_commands)
+
+    refresh_skill_group = _register_command_menu  # /reload-skills hook: re-push BotCommands, no reconnect
 
     @staticmethod
     def _bot_commands(menu_commands) -> list:
