@@ -18,6 +18,16 @@ from gateway.restart import (
 from hermes_cli import stderr_timestamp
 
 
+@pytest.mark.parametrize("code, expected", [(0, 75), (78, 0), (75, 75), (1, 1), (-9, 137)])
+def test_supervised_gateway_exit_contract(code, expected):
+    command = [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--external-supervisor"]
+    assert stderr_timestamp._child_returncode_for_supervisor(command, code) == expected
+
+
+def test_successful_non_gateway_process_is_not_restarted():
+    assert stderr_timestamp._child_returncode_for_supervisor([sys.executable, "scratch.py"], 0) == 0
+
+
 def _script(tmp_path, name: str, source: str) -> str:
     """Write *source* to a real script file and return its path.
 
@@ -191,7 +201,7 @@ def test_main_injects_flag_into_stale_gateway_child(tmp_path, monkeypatch):
         ["--error-log", str(log_path), "--", *stale]
     )
 
-    assert rc == 0
+    assert rc == GATEWAY_SERVICE_RESTART_EXIT_CODE
     recorded = marker_path.read_text(encoding="utf-8").splitlines()
     assert recorded[-1] == "--external-supervisor"
     assert "gateway" in recorded and "run" in recorded

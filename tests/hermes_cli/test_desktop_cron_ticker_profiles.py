@@ -163,7 +163,10 @@ def test_desktop_ticker_serves_every_profile_and_yields_to_owning_gateway(monkey
     monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: root / "profiles")
     monkeypatch.setattr(
         profiles_mod, "_check_gateway_running", lambda home: home == root / "profiles" / "solo")
-    monkeypatch.setattr(profiles_mod, "_served_by_running_multiplexer", lambda name: name == "worker")
+    # The ownership gate asks the gateway module directly and treats a failed probe as "owned", so
+    # it no longer reads profiles._served_by_running_multiplexer (which swallows errors to False).
+    monkeypatch.setattr(
+        "hermes_cli.gateway.named_profile_served_by_running_multiplexer", lambda name=None: name == "worker")
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=0)
 

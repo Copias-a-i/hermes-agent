@@ -16,6 +16,11 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class _ProfileOwnershipChanged(RuntimeError):
+    """A per-store scheduler gate rejected dispatch after lock acquisition."""
+
+
 # Cap for exponential tick backoff during fd exhaustion (interval doubled per failure).
 _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60
 DEFAULT_MISFIRE_GRACE_MINUTES = 10
@@ -92,6 +97,43 @@ def _existing_profile_homes(profile_homes: list) -> list:
     return [entry for entry in profile_homes if Path(_profile_entry(entry)[1]).is_dir()]
 
 
+def _gated_initial_homes(profile_homes, profile_gate) -> list:
+    """The existing profile homes this process may recover at startup.
+
+    A failing ownership probe defers recovery for every profile: with ownership unknown, touching a
+    store could race a gateway that already owns it.
+    """
+    homes = _existing_profile_homes(profile_homes)
+    if profile_gate is None:
+        return homes
+    try:
+        return [entry for entry in homes if profile_gate(*_profile_entry(entry))]
+    except Exception:
+        logger.warning("Cron startup ownership probe failed; deferring recovery", exc_info=True)
+        return []
+
+
+def _ownership_checked_dispatch(profile_gate, can_dispatch, name, home):
+    """``can_dispatch`` for one profile's tick, bound to that iteration's ``name`` and ``home``.
+
+    It runs inside the tick lock, before delivery drain or any due-job mutation, so a gateway that
+    took the store after this cycle's gate pass still wins: the tick yields instead of dispatching.
+    """
+    def dispatch_allowed():
+        if profile_gate is not None:
+            try:
+                owned = profile_gate(name, home)
+            except Exception:
+                # Ownership unknown: yield exactly as for a lost gate, so no store write follows.
+                logger.warning("Cron ownership recheck failed for %s; yielding this tick", name, exc_info=True)
+                owned = False
+            if not owned:
+                raise _ProfileOwnershipChanged(name)
+        return can_dispatch is None or can_dispatch()
+
+    return dispatch_allowed
+
+
 def routed_profile_fire(home=None) -> bool:
     """True when a fire runs for a profile OTHER than the process's own.
 
@@ -131,6 +173,27 @@ def _profile_cron_scope(home):
             yield
     finally:
         reset_hermes_home_override(home_token)
+
+
+def _record_cycle_markers(cycle_homes: list, tick_error: str | None, profile_errors: dict) -> None:
+    """Record each ticked profile's heartbeat and error marker for a finished cycle.
+
+    In a completed cycle (``tick_error`` unset) each profile's beat reflects its own outcome, so a
+    yielding profile does not darken healthy siblings; in an aborted one no profile completed and
+    every beat is unsuccessful (#32612).
+    """
+    from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
+
+    for _, home in cycle_homes:
+        with _profile_cron_scope(home):
+            home_ok = tick_error is None and str(home) not in profile_errors
+            _guarded_store_write(record_ticker_heartbeat, "heartbeat", success=home_ok)
+            if home_ok:
+                _guarded_store_write(clear_ticker_error, "error clear")
+            elif str(home) in profile_errors:
+                _guarded_store_write(record_ticker_error, "tick error", profile_errors[str(home)])
+            elif tick_error:
+                _guarded_store_write(record_ticker_error, "tick error", tick_error)
 
 
 class CronScheduler(ABC):
@@ -543,10 +606,10 @@ class InProcessCronScheduler(CronScheduler):
         from cron.scheduler_preflight import (
             SharedRouteAdapters, _primary_profile_routes_for_current_home,
         )
-        from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
+        from cron.jobs import record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
 
-        initial_homes = _existing_profile_homes(profile_homes)
+        initial_homes = _gated_initial_homes(profile_homes, profile_gate)
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s%s",
@@ -591,6 +654,7 @@ class InProcessCronScheduler(CronScheduler):
             ok = False
             _tick_error = None
             _profile_errors: dict[str, str] = {}
+            yielded_homes: set[str] = set()
             # Worst failure this cycle (fd exhaustion wins); backoff applied once per cycle.
             # See #87644.
             _cycle_exc: BaseException | None = None
@@ -618,11 +682,16 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for _pname, home in cycle_homes:
                         try:
+                            dispatch_allowed = _ownership_checked_dispatch(
+                                profile_gate, can_dispatch, _pname, home)
                             with _profile_cron_scope(home):
                                 cron_tick(
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
-                                    sync=False, can_dispatch=can_dispatch,
+                                    sync=False, can_dispatch=dispatch_allowed,
                                 )
+                        except _ProfileOwnershipChanged:
+                            yielded_homes.add(str(home))
+                            logger.info("Cron tick yielded profile %s: gateway owns store", home)
                         except CronTickYielded as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)
@@ -644,24 +713,9 @@ class InProcessCronScheduler(CronScheduler):
                 # EMFILE: reclaim fds + exponential backoff (#87644).
                 consecutive_failures = _note_tick_failure(e, consecutive_failures)
             # Completed cycle: each profile's own outcome; aborted cycle: all beats unsuccessful.
-            for _, home in cycle_homes:
-                with _profile_cron_scope(home):
-                    _home_ok = _tick_error is None and str(home) not in _profile_errors
-                    _guarded_store_write(
-                        record_ticker_heartbeat, "heartbeat", success=_home_ok
-                    )
-                    if _home_ok:
-                        _guarded_store_write(clear_ticker_error, "error clear")
-                    elif str(home) in _profile_errors:
-                        _guarded_store_write(
-                            record_ticker_error,
-                            "tick error",
-                            _profile_errors[str(home)],
-                        )
-                    elif _tick_error:
-                        _guarded_store_write(
-                            record_ticker_error, "tick error", _tick_error
-                        )
+            cycle_homes = [(name, home) for name, home in cycle_homes if str(home) not in yielded_homes]
+            register_ticked_homes([home for _name, home in cycle_homes])
+            _record_cycle_markers(cycle_homes, _tick_error, _profile_errors)
             if ok:
                 consecutive_failures = 0
             wait_for = _backoff_wait_seconds(interval, consecutive_failures)
