@@ -395,18 +395,18 @@ def _resolve_api_key_provider_secret(provider_id: str, pconfig: ProviderConfig) 
     # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation in .env isn't shadowed by
     # a stale shell export inherited from a parent process (Codex CLI, test runners, etc.).
     from hermes_cli.config import get_env_value_prefer_dotenv
+    from hermes_cli.providers import commandcode_alias_secret
     # Desktop-saved credential pointer: the settings UI persists registry-provider keys as
     # model.key_env → $HERMES_HOME/.env (e.g. HERMES_CUSTOM_LMSTUDIO_API_KEY) while keeping
     # model.provider on the registry id, so the pointer must be honored here or the UI-saved
     # key is silently ignored and lmstudio falls through to its no-auth placeholder (#106336).
     key_env = _model_level_key_env(provider_id)
-    if key_env:
-        val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(key_env), key_env)
-        if val:
-            return val, key_env
-    if provider_id in {"commandcode", "commandcode-anthropic"}:
-        from hermes_cli.providers import resolve_commandcode_api_key_env
-        return resolve_commandcode_api_key_env(get_env_value_prefer_dotenv)
+    # CommandCode's alias pair resolves first: a conflict must raise even when model.key_env would return.
+    alias = commandcode_alias_secret(provider_id, get_env_value_prefer_dotenv)
+    if key_env and (val := _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(key_env), key_env)):
+        return val, key_env
+    if alias and (val := _usable_declared_secret(provider_id, alias[0], alias[1])):
+        return val, alias[1]
     for env_var in pconfig.api_key_env_vars:
         val = _usable_declared_secret(provider_id, get_env_value_prefer_dotenv(env_var), env_var)
         if val:
