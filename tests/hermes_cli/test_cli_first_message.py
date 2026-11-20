@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from agent.onboarding import PROFILE_BUILD_FLAG, is_seen
+from agent.startup_policy import STARTUP_POLICY_MARKER_PREFIX
 from hermes_cli.config_effective import load_user_config_effective
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, write_hermes_home
 
@@ -42,5 +43,10 @@ def test_first_cli_message_in_a_fresh_home_reaches_the_model_unchanged(tmp_path)
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert requests, f"the model was never called; stderr tail: {proc.stderr[-2000:]}"
     users = [m["content"] for m in requests[0]["messages"] if m.get("role") == "user"]
-    assert users == [PROMPT]
+    # The typed text leads, unchanged. The only thing after it is the one built-in startup
+    # policy block core adds to every conversation's first request — never an onboarding note.
+    (first,) = users
+    typed, *added = first.split("\n\n")
+    assert typed == PROMPT
+    assert len(added) == 1 and added[0].startswith(STARTUP_POLICY_MARKER_PREFIX), added
     assert not is_seen(load_user_config_effective(home / "config.yaml"), PROFILE_BUILD_FLAG)

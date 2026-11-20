@@ -790,9 +790,18 @@ def _collect_pre_llm_call_context(
 ) -> str:
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
     (never the system prompt). Oversized per-hook context is spilled to disk so a
-    runaway plugin can't inflate every subsequent turn's prompt."""
+    runaway plugin can't inflate every subsequent turn's prompt.
+
+    The built-in startup policy is claimed first, above every gate below it: plugin hooks
+    are registered per profile, a raising hook contributes nothing, and a persist-disabled
+    agent skips the call entirely — so a hook cannot reach every session, while core can."""
+    from agent.startup_policy import (
+        claim_startup_policy, join_policy_and_context, strip_policy_markers,
+    )
+
+    policy = claim_startup_policy(agent, conversation_history)
     if getattr(agent, "_persist_disabled", False):
-        return ""
+        return policy
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -835,10 +844,12 @@ def _collect_pre_llm_call_context(
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
             _ctx_parts.append(_piece)
-        return "\n\n".join(_ctx_parts)
+        # A profile-local CSR-1 hook emits its own marker block; core owns the policy, so the
+        # hook's copy is dropped and exactly one marker reaches the model.
+        return join_policy_and_context(policy, strip_policy_markers("\n\n".join(_ctx_parts)))
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
-    return ""
+    return policy
 
 
 def _merge_gateway_notes(
