@@ -1529,10 +1529,16 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[Dict[str, Any]]:
 def _codex_app_server_turn(agent: Any, s: Any) -> Optional[Dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
+    # codex receives the bare user text, not the ``api_content`` sidecar the generic loop sends, so
+    # the built-in startup policy the prologue claimed for this turn is handed over explicitly. The
+    # runtime attaches it to the wire input — and re-attaches it to the first input of any replacement
+    # thread it starts later, which is seeded with the clean transcript and so never holds the policy.
+    from agent.startup_policy import policy_block
     codex_result = agent._run_codex_app_server_turn(
         user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory,
+        startup_policy=policy_block(s._plugin_user_context),
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
@@ -1730,6 +1736,7 @@ def run_conversation(
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
     """
+    from agent.startup_policy import release_startup_policy
     from agent.turn_context import export_current_turn_boundary
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
@@ -1759,6 +1766,10 @@ def run_conversation(
             )
         finally:
             end_voice_turn_route(agent)
+            # Every exit — interrupt before the first provider call, budget exit, preflight
+            # timeout, a provider call that raised — hands back a startup-policy claim that
+            # never reached a provider. A committed claim is untouched.
+            release_startup_policy(agent)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

@@ -451,6 +451,25 @@ def _neutralize_kanban_memory_guard(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _neutralize_startup_policy(request, monkeypatch):
+    """Keep the built-in first-request startup policy out of tests that are not about it.
+
+    Core prepends the policy to the first request of every conversation, and its marker
+    carries the digests of skill files resolved from the developer's own home. Left on, every
+    test asserting the exact bytes of a first turn would depend on what is installed on the
+    host. Tests of the policy itself — including the real-``AIAgent`` wire tests — opt in
+    with ``@pytest.mark.real_startup_policy``.
+    """
+    if request.node.get_closest_marker("real_startup_policy"):
+        return
+    try:
+        from agent import startup_policy
+    except Exception:
+        return
+    monkeypatch.setattr(startup_policy, "build_policy_payload", lambda: "")
+
+
+@pytest.fixture(autouse=True)
 def _neutralize_git_safe_directory_read(request, monkeypatch):
     """Skip the ``git config --get-all safe.directory`` pre-read in ``noninteractive_git_env()``.
 
@@ -1155,6 +1174,11 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "require_symlinks: skip the test if symbolic links cannot be "
         "created in the current environment (needs admin/developer mode "
         "on Windows).",
+    )
+    config.addinivalue_line(
+        "markers",
+        "real_startup_policy: run the built-in first-request startup policy instead of the "
+        "autouse stub that blanks it",
     )
     config.addinivalue_line(
         "markers",

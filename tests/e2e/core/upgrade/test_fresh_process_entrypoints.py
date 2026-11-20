@@ -754,9 +754,17 @@ def test_entrypoint_in_a_fresh_process(case, tmp_path):
         return
 
     # One-shot turn: sent == rendered == persisted, and the DB is intact.
+    # The first wire of a fresh process carries the user's words, then the built-in startup
+    # policy (CSR-1) as its own block: exactly one, on the one user message, nowhere else in the
+    # request. A one-shot process ends after this request, so there is no later wire to check.
+    from agent.startup_policy import STARTUP_POLICY_MARKER_PREFIX, is_policy_payload
     assert len(main_requests) == 1, main_requests
     users = [m for m in main_requests[0]["messages"] if m["role"] == "user"]
-    assert users and users[-1]["content"] == canary, main_requests[0]["messages"]
+    assert len(users) == 1 and isinstance(users[0]["content"], str), main_requests[0]["messages"]
+    sent, sep, policy = users[0]["content"].partition("\n\n")
+    assert sent == canary and sep, main_requests[0]["messages"]
+    assert is_policy_payload(policy) and policy.startswith(STARTUP_POLICY_MARKER_PREFIX), policy
+    assert json.dumps(main_requests[0]).count(STARTUP_POLICY_MARKER_PREFIX) == 1, main_requests[0]
     assert reply in cp.stdout, describe(cp)
     assert db.exists(), "the one-shot turn persisted nothing"
     sessions = _db_rows(db, "SELECT id FROM sessions")

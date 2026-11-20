@@ -251,6 +251,9 @@ class CodexAppServerSession:
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
+        # True once ``thread/start`` created this session's thread, False once ``thread/resume`` handed
+        # an existing one back. A thread started from scratch holds nothing a first input must carry.
+        self.thread_started_fresh: Optional[bool] = None
         self._interrupt_event = threading.Event()
         self._active_turn_id: Optional[str] = None
         self._active_turn_lock = threading.Lock()
@@ -285,6 +288,7 @@ class CodexAppServerSession:
             # A resumed thread may carry a tier an earlier process selected (CLI ``/fast`` rebuilds the agent),
             # so its first turn sends Hermes' tier even when that is a clearing null.
             self._service_tier_sent = _TIER_UNKNOWN
+            self.thread_started_fresh = False
             logger.info("codex app-server thread resumed: id=%s cwd=%s", thread_id[:8], self._cwd)
         else:
             if self._history_seed:
@@ -297,6 +301,7 @@ class CodexAppServerSession:
                     code=-32603, message=f"codex thread/start returned no thread id (payload keys: {sorted(result.keys())})",
                 )
             self._service_tier_sent = None  # a new thread runs codex's own configured tier
+            self.thread_started_fresh = True
             logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
         self._thread_id = thread_id
         return thread_id
