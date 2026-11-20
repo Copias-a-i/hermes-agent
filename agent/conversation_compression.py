@@ -3706,7 +3706,7 @@ def _commit_compaction(
                 )
             from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, stamp_db_persisted_markers
             from hermes_cli.partial_compress import rejoin_compressed_head_and_tail
-            from agent.startup_policy import carry_policy, held_policy
+            from agent.startup_policy import carry_policy
 
             def _carry_startup_policy(final: list, *, tail_is_cloned: bool) -> None:
                 # The built-in startup policy is never compressible: head protection decays and the
@@ -3716,7 +3716,7 @@ def _commit_compaction(
                 carry_policy(
                     [*(messages_before_compression if messages_before_compression is not None else messages),
                      *(verbatim_tail or ())],
-                    final, owed=held_policy(agent),
+                    final,
                     cloned=(lambda m: id(m) in _tail_tagged_ids) if tail_is_cloned else None,
                 )
 

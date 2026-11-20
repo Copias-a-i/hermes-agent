@@ -706,10 +706,48 @@ def test_chat_completions_agents_sharing_a_session_id_each_send_the_policy_once(
         second.run_conversation("b1")
         first.run_conversation("a2")
         second.run_conversation("b2")
-    # The later turns are sent without history, so each request is a single user message: once a
-    # conversation carries the policy every request of it does, exactly once, per agent.
+    # Each agent's own first request claims the policy once. The later turns are sent without
+    # history; an empty history is not a first request and never re-creates the policy.
     assert [[_markers(text) for text in _user_texts(body)] for body in chat_wire.bodies] == [
-        [1], [1], [1], [1],
+        [1], [1], [0], [0],
+    ]
+
+
+def test_later_turns_without_history_never_reclaim_the_policy_but_a_new_instance_does(
+    sources, chat_wire,
+):
+    """First request per agent/session instance, exactly once, whether or not the caller passes
+    history: the same live agent's second and third calls with an empty history carry nothing,
+    and a separate instance on the same session id carries it on its own first call only."""
+    agent = _chat_agent(chat_wire, session_id="no-history")
+    with _no_hooks():
+        agent.run_conversation("one")
+        agent.run_conversation("two")  # history omitted
+        agent.run_conversation("three", conversation_history=[])  # history explicitly empty
+        other = _chat_agent(chat_wire, session_id="no-history")
+        other.run_conversation("other one")
+        other.run_conversation("other two", conversation_history=[])
+        agent.run_conversation("four")
+    policy = build_policy_payload()
+    assert [_user_texts(body) for body in chat_wire.bodies] == [
+        [f"one\n\n{policy}"], ["two"], ["three"],
+        [f"other one\n\n{policy}"], ["other two"], ["four"],
+    ]
+
+
+def test_a_selection_on_a_later_turn_without_history_does_not_synthesize_the_policy(
+    sources, chat_wire, monkeypatch,
+):
+    """The post-selection repair preserves a policy the transcript carries or the turn claimed;
+    on a later turn sent without history there is neither, so nothing is attached."""
+    _selecting(monkeypatch, _SELECTIONS["incoming-only"])
+    agent = _chat_agent(chat_wire, session_id="selected-no-history")
+    with _no_hooks():
+        agent.run_conversation("one")
+        agent.run_conversation("two")
+        agent.run_conversation("three", conversation_history=[])
+    assert [[_markers(text) for text in _user_texts(body)] for body in chat_wire.bodies] == [
+        [1], [0], [0],
     ]
 
 

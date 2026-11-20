@@ -146,13 +146,14 @@ def assemble_api_request(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
 
-    # The built-in startup policy is not optional context: once a conversation carries it, every
-    # request does. A selection that left it out (or returned clean clones, whose ``api_content``
+    # The built-in startup policy is not optional context: a request whose transcript carries it
+    # (or whose turn claimed it) sends it. A selection that left it out (or returned clean clones, whose ``api_content``
     # sidecar the transport strips without substituting) gets it back here, exactly once.
+    # A transcript without a carrier owes nothing — an empty history never re-creates the policy.
     from agent.startup_policy import conversation_policy, ensure_policy_on_wire
 
     api_messages = ensure_policy_on_wire(
-        api_messages, conversation_policy(agent, messages, _plugin_user_context)
+        api_messages, conversation_policy(messages, _plugin_user_context)
     )
 
     # Context selection may replace the request with a fresh clone of canonical history.
