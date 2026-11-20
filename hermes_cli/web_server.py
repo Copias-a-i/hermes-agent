@@ -75,16 +75,7 @@ from hermes_cli.web_server_lifecycle import (  # noqa: E402
     _write_dashboard_ready_file,
     _write_machine_sentinel_line,
 )
-
-
-def _gateway_owns_cron(name: str, home) -> bool:
-    """A gateway already ticks this profile's store with live adapters: its OWN process, or the
-    live default multiplexer (a served satellite has no gateway.pid of its own). Winning the
-    tick-lock race here would deliver through the standalone path (#52202, #100489, #107485)."""
-    from hermes_cli.profiles import _check_gateway_running, _served_by_running_multiplexer
-
-    return _check_gateway_running(Path(home)) or (
-        name != "default" and _served_by_running_multiplexer(name))
+from hermes_cli.web_server_cron_ownership import _gateway_owns_cron  # noqa: E402
 
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
@@ -152,9 +143,9 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
             try:
                 return _gateway_owns_cron(own_name, own_home)
             except Exception:
-                # Start the ticker rather than silently stand down.
-                _log.warning("Desktop cron: gateway-ownership probe failed; starting the ticker", exc_info=True)
-                return False
+                # Defer while ownership is uncertain; the next interval probes again.
+                _log.warning("Desktop cron: gateway-ownership probe failed; deferring ticker", exc_info=True)
+                return True
 
         if _owned():
             _log.info(
