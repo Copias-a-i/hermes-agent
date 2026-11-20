@@ -441,6 +441,9 @@ class _CodexWire:
     """Stands in for the ``codex app-server`` subprocess client and records every JSON-RPC
     request the real ``CodexAppServerSession`` sends."""
 
+    # Methods to reject, consumed in order across every wire of a test.
+    rejections: list = []
+
     def __init__(self, **_kw):
         self.requests = []
 
@@ -452,7 +455,14 @@ class _CodexWire:
 
     def request(self, method, params=None, timeout=None):
         self.requests.append((method, params))
+        if method in self.rejections:
+            self.rejections.remove(method)
+            from agent.transports.codex_app_server import CodexAppServerError
+            raise CodexAppServerError(code=-32000, message=f"{method} rejected")
         return {"thread": {"id": "thread-1"}, "turn": {"id": f"turn-{len(self.requests)}"}}
+
+    def methods(self):
+        return [method for method, _params in self.requests]
 
     def turn_texts(self):
         """The text of each ``turn/start``, in order."""
@@ -548,16 +558,28 @@ def test_two_agents_on_one_session_id_each_send_the_policy_once_on_the_wire(sour
     assert [_markers(text) for text in second_wire.turn_texts()] == [1, 0]
 
 
-def test_a_resumed_codex_conversation_sends_no_policy(sources, codex_wire):
-    """Resume in a fresh process: a new agent, the same session, the stored history."""
+def _stored_thread(monkeypatch, thread_id):
+    """Pretend the session row binds *thread_id*, as an earlier process would have stored it."""
+    from agent import codex_runtime
+
+    monkeypatch.setattr(codex_runtime, "_stored_codex_thread_id", lambda _agent: thread_id)
+
+
+def test_a_resumed_codex_conversation_on_its_resumed_thread_sends_no_policy(
+    sources, codex_wire, monkeypatch,
+):
+    """Resume in a fresh process: a new agent, the same session, the stored history, and the
+    codex thread handed back by ``thread/resume`` — it already holds the policy."""
     with _no_hooks():
         history = _codex_agent(session_id="resumed").run_conversation("first ask")["messages"]
-        _codex_agent(session_id="resumed").run_conversation(
-            "after resume", conversation_history=history,
-        )
+        _stored_thread(monkeypatch, "thread-1")
+        resumed_agent = _codex_agent(session_id="resumed")
+        resumed_agent.run_conversation("after resume", conversation_history=history)
+        resumed_agent.run_conversation("and again")
     original, resumed = codex_wire
+    assert "thread/resume" in resumed.methods() and "thread/start" not in resumed.methods()
     assert [_markers(text) for text in original.turn_texts()] == [1]
-    assert [_markers(text) for text in resumed.turn_texts()] == [0]
+    assert resumed.turn_texts() == ["after resume", "and again"]
 
 
 def test_a_marker_the_user_typed_neither_suppresses_nor_duplicates_the_policy(sources, codex_wire):
@@ -583,7 +605,10 @@ def test_a_profile_hook_marker_is_not_sent_alongside_core_on_the_codex_wire(sour
 
 
 def test_list_content_carries_the_policy_part_exactly_once(sources):
-    from agent.startup_policy import apply_policy_to_user_input
+    from agent.startup_policy import attach_policy, policy_block
+
+    def apply_policy_to_user_input(user_input, turn_context):
+        return attach_policy(user_input, policy_block(turn_context))
 
     policy = build_policy_payload()
     context = f"{policy}\n\nhook note"
@@ -683,4 +708,295 @@ def test_chat_completions_agents_sharing_a_session_id_each_send_the_policy_once(
         second.run_conversation("b2")
     assert [[_markers(text) for text in _user_texts(body)] for body in chat_wire.bodies] == [
         [1], [1], [0], [0],
+    ]
+
+
+# ── Hook output: only the policy copy is removed ───────────────────────────
+
+_STALE_COPY = f"{STARTUP_POLICY_MARKER_PREFIX} caveman:deadbeefdead frontier:none] stale copy"
+
+
+def test_hook_text_before_and_after_a_policy_copy_in_one_block_is_preserved(sources):
+    """No blank line separates the hook's own text from its copy of the policy."""
+    from agent.startup_policy import strip_policy_markers
+
+    payload = build_policy_payload()
+    assert strip_policy_markers(f"before line\n{payload}\nafter line") == "before line\nafter line"
+    assert strip_policy_markers(f"{_STALE_COPY}\nprofile: reply in Spanish") == "profile: reply in Spanish"
+    assert strip_policy_markers(f"profile: reply in Spanish\n{_STALE_COPY}") == "profile: reply in Spanish"
+    # Text the hook appended on the SAME line as the exact built-in payload survives too.
+    assert strip_policy_markers(f"{payload} PROFILE-EXTRA") == "PROFILE-EXTRA"
+    assert strip_policy_markers(f"keep A\n\n{payload}\n\nkeep B") == "keep A\n\nkeep B"
+
+
+@pytest.mark.parametrize("text", [
+    f"diagnostic: saw {STARTUP_POLICY_MARKER_PREFIX} caveman:none frontier:none] in the last reply",
+    f"> {STARTUP_POLICY_MARKER_PREFIX} caveman:deadbeefdead frontier:none] quoted for a bug report",
+    f"{STARTUP_POLICY_MARKER_PREFIX} notes] not a policy marker",
+    f"{STARTUP_POLICY_MARKER_PREFIX}0 caveman:none frontier:none] a different version",
+    f"{STARTUP_POLICY_MARKER_PREFIX} caveman:XYZ frontier:none] malformed digest",
+    f"{STARTUP_POLICY_MARKER_PREFIX} caveman:none] one field short",
+    f"{STARTUP_POLICY_MARKER_PREFIX} caveman:none frontier:none truncated before the bracket",
+    f"line one\n  {STARTUP_POLICY_MARKER_PREFIX}",
+])
+def test_quoted_and_malformed_markers_are_ordinary_hook_text(sources, text):
+    from agent.startup_policy import policy_block, strip_policy_markers
+
+    assert strip_policy_markers(text) == text
+    assert strip_policy_markers(f"note above\n{text}\n\nnote below") == f"note above\n{text}\n\nnote below"
+    # ...and it is never mistaken for the block core claimed.
+    assert policy_block(text) == ""
+
+
+def test_duplicate_policy_copies_are_all_removed_and_nothing_else(sources):
+    from agent.startup_policy import strip_policy_markers
+
+    payload = build_policy_payload()
+    text = f"top\n{payload}\n{_STALE_COPY}\nmiddle\n{payload} {payload}\n\n{payload}\n\nbottom"
+    assert strip_policy_markers(text) == "top\nmiddle\n\nbottom"
+
+
+def test_the_seam_keeps_hook_text_adjacent_to_a_stripped_copy(sources):
+    """Through the real seam: one policy (core's), and the hook's own lines all still there."""
+    quoted = f"diagnostic: {STARTUP_POLICY_MARKER_PREFIX} caveman:none frontier:none] was seen"
+    hook = f"profile preamble\n{_STALE_COPY}\nprofile: reply in Spanish\n{quoted}"
+    with patch("hermes_cli.lifecycle.invoke_hook", return_value=[{"context": hook}]):
+        first = _collect(_agent())
+        later = _collect(_agent(_user_turn_count=3), conversation_history=[{"role": "user", "content": "x"}])
+    kept = f"profile preamble\nprofile: reply in Spanish\n{quoted}"
+    assert first == f"{build_policy_payload()}\n\n{kept}"
+    assert later == kept
+
+
+def test_a_later_turn_hook_block_led_by_a_malformed_marker_is_not_sent_as_the_policy(
+    sources, codex_wire,
+):
+    """Preserved hook text that merely starts with the prefix must not be lifted onto the
+    codex wire as if core had claimed it."""
+    hook = f"{STARTUP_POLICY_MARKER_PREFIX} notes] remember the standup"
+    agent = _codex_agent()
+    with patch("hermes_cli.lifecycle.invoke_hook", return_value=[{"context": hook}]):
+        agent.run_conversation("first")
+        agent.run_conversation("second")
+    first, second = codex_wire[0].turn_texts()
+    assert first == f"first\n\n{build_policy_payload()}"
+    assert second == "second"
+
+
+# ── Codex: every thread started from scratch gets the policy once ──────────
+
+
+def _retire_thread(agent):
+    """What a wedged client, a prompt change or a provider switch does between turns."""
+    from agent import codex_runtime
+
+    codex_runtime._close_codex_session(agent)
+
+
+def test_a_replacement_codex_thread_carries_the_policy_on_its_first_input_only(sources, codex_wire):
+    agent = _codex_agent(session_id="same-session")
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        agent.run_conversation("second ask")
+        _retire_thread(agent)
+        agent.run_conversation("third ask")
+        result = agent.run_conversation("fourth ask")
+
+    original, replacement = codex_wire
+    assert original.turn_texts() == [f"first ask\n\n{build_policy_payload()}", "second ask"]
+    assert replacement.turn_texts() == [f"third ask\n\n{build_policy_payload()}", "fourth ask"]
+    assert "thread/start" in replacement.methods()
+    # Still wire-only: the transcript (and so the next thread's history seed) stays clean.
+    assert not any(STARTUP_POLICY_MARKER_PREFIX in str(m.get("content")) for m in result["messages"])
+    seed = dict(replacement.requests)["thread/start"].get("developerInstructions", "")
+    assert STARTUP_POLICY_MARKER_PREFIX not in seed
+
+
+def test_a_prompt_change_that_retires_the_thread_carries_the_policy_again(sources, codex_wire):
+    agent = _codex_agent()
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        agent.ephemeral_system_prompt = "Channel override: answer in haiku."
+        agent.run_conversation("second ask")
+        agent.run_conversation("third ask")
+    original, replacement = codex_wire
+    assert [_markers(text) for text in original.turn_texts()] == [1]
+    assert [_markers(text) for text in replacement.turn_texts()] == [1, 0]
+
+
+def test_a_session_change_alone_does_not_resend_but_its_replacement_thread_does(sources, codex_wire):
+    """The claim follows the THREAD: a new session id on the live thread adds nothing; a thread
+    started from scratch under that other session id carries the policy once."""
+    agent = _codex_agent(session_id="session-a")
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        agent.session_id = "session-b"
+        agent.run_conversation("second ask")
+        _retire_thread(agent)
+        agent.run_conversation("third ask")
+        agent.run_conversation("fourth ask")
+    original, replacement = codex_wire
+    assert [_markers(text) for text in original.turn_texts()] == [1, 0]
+    assert [_markers(text) for text in replacement.turn_texts()] == [1, 0]
+
+
+def test_a_resumed_conversation_whose_thread_cannot_be_resumed_carries_the_policy_once(
+    sources, codex_wire, monkeypatch,
+):
+    """A fresh process resumes the conversation, but codex cannot hand the stored thread back:
+    the thread it starts instead is seeded with the clean transcript and is owed the policy."""
+    with _no_hooks():
+        history = _codex_agent(session_id="resumed").run_conversation("first ask")["messages"]
+        _stored_thread(monkeypatch, "thread-gone")
+        agent = _codex_agent(session_id="resumed")
+        agent.run_conversation("after resume", conversation_history=history)
+        agent.run_conversation("and again")
+    _original, replacement = codex_wire
+    assert replacement.methods()[:2] == ["thread/resume", "thread/start"]
+    assert replacement.turn_texts() == [f"after resume\n\n{build_policy_payload()}", "and again"]
+
+
+def test_a_resumed_conversation_without_a_stored_thread_carries_the_policy_once(sources, codex_wire):
+    with _no_hooks():
+        history = _codex_agent(session_id="resumed").run_conversation("first ask")["messages"]
+        agent = _codex_agent(session_id="resumed")
+        agent.run_conversation("after resume", conversation_history=history)
+        agent.run_conversation("and again")
+    assert [_markers(text) for text in codex_wire[1].turn_texts()] == [1, 0]
+
+
+def test_a_rejected_first_input_leaves_the_replacement_thread_owed_the_policy(
+    sources, codex_wire, monkeypatch,
+):
+    """The thread only holds the policy once a ``turn/start`` carrying it was accepted."""
+    agent = _codex_agent()
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        _retire_thread(agent)
+        monkeypatch.setattr(_CodexWire, "rejections", ["turn/start"])
+        agent.run_conversation("second ask")
+        agent.run_conversation("third ask")
+        agent.run_conversation("fourth ask")
+    texts = [text for wire in codex_wire[1:] for text in wire.turn_texts()]
+    assert [_markers(text) for text in texts] == [1, 1, 0]
+
+
+def test_one_agents_replacement_thread_neither_silences_nor_triggers_another_agent(
+    sources, codex_wire,
+):
+    first, second = _codex_agent(session_id="shared-id"), _codex_agent(session_id="shared-id")
+    with _no_hooks():
+        first.run_conversation("a1")
+        second.run_conversation("b1")
+        _retire_thread(first)
+        first.run_conversation("a2")
+        second.run_conversation("b2")
+        first.run_conversation("a3")
+        _retire_thread(second)
+        second.run_conversation("b3")
+        second.run_conversation("b4")
+    a_thread, b_thread, a_replacement, b_replacement = codex_wire
+    assert [_markers(text) for text in a_thread.turn_texts()] == [1]
+    assert [_markers(text) for text in b_thread.turn_texts()] == [1, 0]
+    assert [_markers(text) for text in a_replacement.turn_texts()] == [1, 0]
+    assert [_markers(text) for text in b_replacement.turn_texts()] == [1, 0]
+
+
+def test_a_replacement_thread_gets_the_policy_part_on_list_content_without_touching_history(
+    sources, codex_wire,
+):
+    agent = _codex_agent()
+    parts = [{"type": "text", "text": "look at this"}]
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        _retire_thread(agent)
+        result = agent.run_conversation(parts)
+    assert codex_wire[1].turn_texts() == [f"look at this\n\n{build_policy_payload()}"]
+    assert parts == [{"type": "text", "text": "look at this"}]
+    assert not any(STARTUP_POLICY_MARKER_PREFIX in str(m.get("content")) for m in result["messages"])
+
+
+# ── MoA: the policy outlives a first turn that stamps no full sidecar ──────
+
+_MOA = {"reference_models": [{"provider": "custom", "model": "ref-model"}], "aggregator": {}}
+
+
+def _moa_advice(text="MOA-ADVICE"):
+    return patch("agent.moa_loop.aggregate_moa_context", return_value=text)
+
+
+def _hook_note(note="hook note"):
+    return patch("hermes_cli.lifecycle.invoke_hook", return_value=[{"context": note}])
+
+
+def test_a_moa_first_turn_keeps_the_policy_in_replay_and_never_duplicates_it(sources, chat_wire):
+    """Turn 1 is a MoA turn: its per-call advice is not replayable, the static policy is. Later
+    turns — plain or MoA — replay the policy with the first row and add no second copy."""
+    agent = _chat_agent(chat_wire)
+    policy = build_policy_payload()
+    with _hook_note(), _moa_advice():
+        history = agent.run_conversation("first ask", moa_config=_MOA)["messages"]
+        history = agent.run_conversation("second ask", conversation_history=history)["messages"]
+        agent.run_conversation("third ask", conversation_history=history, moa_config=_MOA)
+
+    first, second, third = (_user_texts(body) for body in chat_wire.bodies)
+    assert first == [f"first ask\n\n{policy}\n\nhook note\n\nMOA-ADVICE"]
+    assert second == [f"first ask\n\n{policy}", "second ask\n\nhook note"]
+    assert third[0] == second[0] and third[1] == second[1]
+    assert third[2] == "third ask\n\nhook note\n\nMOA-ADVICE"
+    assert [sum(_markers(text) for text in texts) for texts in (first, second, third)] == [1, 1, 1]
+
+
+def test_a_moa_first_turn_persists_the_policy_and_replays_it_in_a_fresh_agent(
+    sources, chat_wire, tmp_path,
+):
+    """The durable row keeps the user's words; the sent policy rides the persisted sidecar, so a
+    new process replaying the stored session sends the same first row — once."""
+    from hermes_state import SessionDB
+
+    policy = build_policy_payload()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        with _no_hooks(), _moa_advice():
+            _chat_agent(chat_wire, session_db=db, session_id="moa-replay").run_conversation(
+                "first ask", moa_config=_MOA,
+            )
+        stored = db.get_messages_as_conversation("moa-replay")
+        (row,) = [m for m in stored if m.get("role") == "user"]
+        assert row["content"] == "first ask"
+        assert row["api_content"] == f"first ask\n\n{policy}"
+
+        with _no_hooks(), _moa_advice():
+            _chat_agent(chat_wire, session_db=db, session_id="moa-replay").run_conversation(
+                "after restart", conversation_history=stored,
+            )
+    finally:
+        db.close()
+    # A session DB also enables the auxiliary titling request; the turn itself is the one that
+    # replays history.
+    replays = [texts for texts in map(_user_texts, chat_wire.bodies) if len(texts) > 1]
+    assert replays == [[f"first ask\n\n{policy}", "after restart"]]
+
+
+def test_a_later_moa_turn_stamps_nothing_and_adds_no_policy(sources, chat_wire):
+    agent = _chat_agent(chat_wire)
+    with _no_hooks(), _moa_advice():
+        history = agent.run_conversation("first ask")["messages"]
+        result = agent.run_conversation("second ask", conversation_history=history, moa_config=_MOA)
+    second_row = [m for m in result["messages"] if m.get("role") == "user"][1]
+    assert "api_content" not in second_row
+    assert _user_texts(chat_wire.bodies[-1]) == [
+        f"first ask\n\n{build_policy_payload()}", "second ask\n\nMOA-ADVICE",
+    ]
+
+
+def test_moa_agents_sharing_a_session_id_each_keep_their_own_policy(sources, chat_wire):
+    first, second = (_chat_agent(chat_wire, session_id="shared-moa") for _ in range(2))
+    with _no_hooks(), _moa_advice():
+        a = first.run_conversation("a1", moa_config=_MOA)["messages"]
+        b = second.run_conversation("b1", moa_config=_MOA)["messages"]
+        first.run_conversation("a2", conversation_history=a)
+        second.run_conversation("b2", conversation_history=b)
+    assert [[_markers(text) for text in _user_texts(body)] for body in chat_wire.bodies] == [
+        [1], [1], [1, 0], [1, 0],
     ]

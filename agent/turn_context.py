@@ -1190,18 +1190,28 @@ def build_turn_context(
     # no-op once titled; it ensures the session row itself.
     _maybe_title_session_at_turn_start(agent, messages, title_user_message)
 
-    # Sidecar skipped for codex_app_server/MoA; list content carries its context as a part in every mode.
+    # Sidecar skipped for codex_app_server; MoA stamps only the static startup policy. List content
+    # carries its context as a part in every mode.
     if 0 <= current_turn_user_idx < len(messages) and messages[current_turn_user_idx].get("role") == "user":
         if isinstance(messages[current_turn_user_idx].get("content"), list):
             _append_multimodal_context(
                 agent, messages[current_turn_user_idx], ext_prefetch_cache, plugin_user_context,
                 preflight_compressed=compaction.compressed,
             )
-        elif not moa_active and getattr(agent, "api_mode", None) != "codex_app_server":
-            _stamp_api_content_sidecar(
-                agent, messages, current_turn_user_idx, ext_prefetch_cache,
-                plugin_user_context, preflight_compressed=compaction.compressed,
-            )
+        elif getattr(agent, "api_mode", None) != "codex_app_server":
+            # A MoA turn appends per-call aggregated context, so its full composition is not
+            # byte-stable — but the claimed startup policy is static. It alone is stamped (and
+            # persisted), leading the injected context, so replay keeps it and the rest of the
+            # turn's context is composed after it per call (build_api_messages).
+            from agent.startup_policy import policy_block
+            _moa_policy = policy_block(plugin_user_context) if moa_active else ""
+            if not moa_active or _moa_policy:
+                _stamp_api_content_sidecar(
+                    agent, messages, current_turn_user_idx,
+                    "" if moa_active else ext_prefetch_cache,
+                    _moa_policy if moa_active else plugin_user_context,
+                    preflight_compressed=compaction.compressed,
+                )
 
     _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 
@@ -1288,7 +1298,17 @@ def build_api_messages(
             if isinstance(_api_content, str) and _api_content:
                 # Reuse the prologue's stamp so sidecar and wire cannot drift
                 # and every pass this turn sends identical bytes.
+                _live_content = api_msg.get("content")
                 api_msg["content"] = _api_content
+                if moa_config:
+                    # A MoA turn's stamp holds only the static startup policy; the rest of the
+                    # turn's context still rides this call, after the stamped (replayed) bytes.
+                    from agent.startup_policy import split_policy_context
+                    _policy, _rest = split_policy_context(plugin_user_context)
+                    if _policy and isinstance(_live_content, str) and _api_content == _live_content + "\n\n" + _policy:
+                        _composed = compose_user_api_content(_api_content, ext_prefetch_cache, _rest)
+                        if _composed is not None:
+                            api_msg["content"] = _composed
             else:
                 # Callers that bypass the prologue stamping: compose live.
                 _composed = compose_user_api_content(

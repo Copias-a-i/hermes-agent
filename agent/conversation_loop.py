@@ -1530,13 +1530,15 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[Dict[str, Any]]:
     """The codex app-server's result for this turn, or None when its failure activated a fallback and the
     generic loop retries the same user turn."""
     # codex receives the bare user text, not the ``api_content`` sidecar the generic loop sends, so
-    # the built-in startup policy the prologue claimed for this turn is carried on the wire here.
-    from agent.startup_policy import apply_policy_to_user_input
+    # the built-in startup policy the prologue claimed for this turn is handed over explicitly. The
+    # runtime attaches it to the wire input — and re-attaches it to the first input of any replacement
+    # thread it starts later, which is seeded with the clean transcript and so never holds the policy.
+    from agent.startup_policy import policy_block
     codex_result = agent._run_codex_app_server_turn(
-        user_message=apply_policy_to_user_input(s.user_message, s._plugin_user_context),
-        original_user_message=s.original_user_message,
+        user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
         should_review_memory=s._should_review_memory,
+        startup_policy=policy_block(s._plugin_user_context),
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):

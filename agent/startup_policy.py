@@ -10,7 +10,7 @@ its own agent, running this same prologue under its own profile home.
 
 The generic loop carries the claimed block inside the turn's composed user content. The
 codex app-server runtime is handed the bare user message instead, so its dispatch attaches
-the block explicitly (``apply_policy_to_user_input``).
+the block explicitly, and again on the first input of any replacement thread it starts.
 
 The policy is a compact paraphrase bound to the SHA256 of its canonical source skills.
 Source bodies are hashed, never read into the prompt. Missing or unreadable sources fail
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -219,18 +220,72 @@ def build_policy_payload() -> str:
     return ""
 
 
-def strip_policy_markers(text: str) -> str:
-    """Drop every marker-bearing block from *text* (hook output).
+_DIGEST_FIELD = rf"(?:[0-9a-f]{{{_DIGEST_PREFIX_LEN}}}|none)"
+_SOURCE_STATE = r"(?:ok|modified|unavailable)"
+# A well-formed marker, exactly as ``_marker`` writes it. Anything else that merely starts with
+# the prefix (``[CSR-1 notes]``, ``[CSR-10 ...]``, a truncated marker) is ordinary text.
+_MARKER_PATTERN = (
+    rf"{re.escape(STARTUP_POLICY_MARKER_PREFIX)} caveman:{_DIGEST_FIELD} frontier:{_DIGEST_FIELD}\]"
+)
+# The payload ``build_policy_payload`` can produce: marker, one of the two clause sets, and the
+# optional degraded-source note. Bound to the clause constants, so it follows any future edit.
+_PAYLOAD_PATTERN = (
+    _MARKER_PATTERN
+    + " (?:"
+    + "|".join(
+        re.escape(" ".join(clauses))
+        for clauses in ((_CAVEMAN_CLAUSE, _ROUTING_CLAUSE, _FRONTIER_CLAUSE), (_COMPACT_CLAUSE,))
+    )
+    + ")"
+    + rf"(?: \(policy sources caveman={_SOURCE_STATE} frontier={_SOURCE_STATE}; using built-in text\.\))?"
+)
+_LEADING_PAYLOAD_RE = re.compile(rf"[ \t]*{_PAYLOAD_PATTERN}")
+_LEADING_MARKER_RE = re.compile(rf"[ \t]*{_MARKER_PATTERN}")
+_EXACT_PAYLOAD_RE = re.compile(_PAYLOAD_PATTERN)
 
-    A profile-local hook may emit its own CSR-1 block — during the transitional rollout every
+
+def _strip_policy_from_line(line: str) -> Optional[str]:
+    """*line* without the policy copy it leads with; ``None`` when nothing else is on it.
+
+    Only a line that BEGINS with a well-formed marker is a policy copy. The exact built-in
+    payload is cut out precisely, so text a hook wrote after it on the same line survives. A
+    marker followed by other wording is a hook's own (older) paraphrase: that marker-led line
+    is the copy. A marker quoted mid-line is ordinary text and is never touched.
+    """
+    if not _LEADING_MARKER_RE.match(line):
+        return line
+    rest = line
+    while True:
+        exact = _LEADING_PAYLOAD_RE.match(rest)
+        if exact is None:
+            break
+        rest = rest[exact.end():]
+    if _LEADING_MARKER_RE.match(rest):
+        return None
+    return rest.strip() or None
+
+
+def strip_policy_markers(text: str) -> str:
+    """*text* (hook output) without the CSR-1 policy copies it carries, and nothing else removed.
+
+    A profile-local hook may emit its own CSR-1 copy — during the transitional rollout every
     profile has one registered. Core owns the policy, so the hook's copy is removed and
-    exactly one marker reaches the model. This de-duplicates output only; it never decides
-    whether core injects, which is read from the claim registry.
+    exactly one marker reaches the model. Removal is line-scoped and marker-led (see
+    ``_strip_policy_from_line``): hook text before or after the copy in the same block, text
+    that quotes the marker, and malformed markers are all preserved byte-for-byte. This
+    de-duplicates output only; it never decides whether core injects, which is read from the
+    claim registry.
     """
     if not text or STARTUP_POLICY_MARKER_PREFIX not in text:
         return text
-    kept = [block for block in text.split("\n\n") if STARTUP_POLICY_MARKER_PREFIX not in block]
-    return "\n\n".join(part for part in kept if part.strip())
+    blocks = []
+    for block in text.split("\n\n"):
+        if STARTUP_POLICY_MARKER_PREFIX in block:
+            lines = (_strip_policy_from_line(line) for line in block.split("\n"))
+            block = "\n".join(line for line in lines if line is not None)
+        if block.strip():
+            blocks.append(block)
+    return "\n\n".join(blocks)
 
 
 def _claim_key(agent: Any) -> tuple[str, str]:
@@ -312,24 +367,31 @@ def join_policy_and_context(policy: str, context: str) -> str:
     return "\n\n".join(parts)
 
 
+def split_policy_context(context: str) -> tuple[str, str]:
+    """``(policy, rest)`` of one turn's user-channel context.
+
+    ``join_policy_and_context`` puts the claimed policy first, as its own block. Only a block
+    that IS a built-in payload counts — a hook or gateway note that merely begins with the
+    marker prefix is context, never the policy.
+    """
+    first, _, rest = (context or "").partition("\n\n")
+    if _EXACT_PAYLOAD_RE.fullmatch(first):
+        return first, rest
+    return "", context or ""
+
+
 def policy_block(context: str) -> str:
-    """The core policy block inside one turn's user-channel context, or ``""``.
+    """The core policy block inside one turn's user-channel context, or ``""``."""
+    return split_policy_context(context)[0]
 
-    ``join_policy_and_context`` puts it first and hook copies are already stripped, so a
-    leading marker block is the one core claimed for this turn.
+
+def attach_policy(user_input: Any, policy: str) -> Any:
+    """*user_input* with *policy* attached the way the sidecar appends it.
+
+    A string gains the block after a blank line. List content already carries the turn's
+    context as a text part when the prologue composed it; the block is only added if absent,
+    and always on a copy so the durable list is never touched.
     """
-    first = (context or "").split("\n\n", 1)[0]
-    return first if first.startswith(STARTUP_POLICY_MARKER_PREFIX) else ""
-
-
-def apply_policy_to_user_input(user_input: Any, context: str) -> Any:
-    """*user_input* with this turn's policy block attached, for a runtime that is handed the
-    bare user message instead of the composed ``api_content`` (the codex app-server).
-
-    A string gains the block the way the sidecar appends it. List content already carries the
-    turn's context as a text part when the prologue composed it; it is only added if absent.
-    """
-    policy = policy_block(context)
     if not policy:
         return user_input
     if isinstance(user_input, str):

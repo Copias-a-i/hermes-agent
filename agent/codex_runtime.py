@@ -475,6 +475,7 @@ def _close_codex_session(agent) -> None:
     with suppress(Exception):
         agent._codex_session.close()
     agent._codex_session = None
+    agent._codex_policy_session = None
 
 
 def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any]:
@@ -532,6 +533,26 @@ def _start_codex_thread(agent) -> str:
         _store_codex_thread_id(agent, None)
         agent._emit_diagnostic_status(_CODEX_THREAD_RESUME_NOTICE)
         return agent._codex_session.ensure_started()
+
+
+def _codex_thread_startup_policy(agent, claimed: str) -> str:
+    """The built-in startup policy this turn's input must carry on the codex thread, or ``""``.
+
+    ``claimed`` is what the prologue claimed for the conversation's own first request. A thread
+    started from scratch later in the conversation (retired client, failed resume, prompt or
+    provider change) is seeded with the clean transcript, which never holds the policy, so its
+    first input carries the policy again — once per thread. A resumed thread already holds it.
+    Decided from core-owned state only (the session object), never from transcript text.
+    """
+    if claimed:
+        return claimed
+    session = getattr(agent, "_codex_session", None)
+    if getattr(session, "thread_started_fresh", None) is not True:
+        return ""
+    if getattr(agent, "_codex_policy_session", None) is session:
+        return ""
+    from agent.startup_policy import build_policy_payload
+    return build_policy_payload()
 
 
 def _codex_model_provider(agent) -> str | None:
@@ -719,9 +740,12 @@ def _finish_codex_turn(agent, turn, messages: List[Dict[str, Any]], *, original_
 
 
 def run_codex_app_server_turn(agent, *, user_message: str, original_user_message: Any, messages: List[Dict[str, Any]],
-                              effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
+                              effective_task_id: str, should_review_memory: bool = False,
+                              startup_policy: str = "") -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
-    Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again.
+    ``startup_policy`` is the built-in policy block the prologue claimed for this turn (wire-only: codex is
+    handed the bare user text, and the policy never enters ``messages``)."""
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
@@ -732,8 +756,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     try:
         _start_codex_thread(agent)
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
-        turn = agent._codex_session.run_turn(
-            user_input=user_message,
+        from agent.startup_policy import attach_policy
+        session = agent._codex_session
+        turn = session.run_turn(
+            user_input=attach_policy(user_message, _codex_thread_startup_policy(agent, startup_policy)),
             model=wire_model, reasoning_effort=_codex_turn_effort(agent, wire_model),
             service_tier=_codex_turn_service_tier(agent))
     except Exception as exc:
@@ -743,6 +769,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
             final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
         )
+    # The thread holds the policy once its ``turn/start`` was accepted; an input that never left
+    # (interrupt before submit, rejected ``turn/start``) leaves the thread still owed it.
+    if getattr(turn, "submitted_user_text", None) is not None and (
+            getattr(turn, "turn_id", None) or turn.error is None):
+        agent._codex_policy_session = session
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
     # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
     # silence alone no longer retires — it only logs a warning (#112928).
