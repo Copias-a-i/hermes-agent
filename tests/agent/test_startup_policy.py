@@ -1271,3 +1271,217 @@ def test_ensure_policy_on_wire_is_deterministic_and_leaves_its_input_alone(sourc
     # Text a user typed that merely quotes the marker is not the policy.
     quoted = [{"role": "user", "content": f"{STARTUP_POLICY_MARKER_PREFIX} caveman:none frontier:none] hi"}]
     assert ensure_policy_on_wire(quoted, policy)[0]["content"].endswith(f"\n\n{policy}")
+
+
+# ── The claim is provisional until a provider accepts the first request ────
+
+
+def _counts(bodies):
+    return [[_markers(text) for text in _user_texts(body)] for body in bodies]
+
+
+def _interrupt_in_prologue(agent):
+    """A ``pre_llm_call`` seam that interrupts *agent* once: after the prologue claimed the
+    policy, before the loop's first iteration can issue a provider request."""
+    pending = [True]
+
+    def invoke(name, **_kw):
+        if name == "pre_llm_call" and pending:
+            pending.clear()
+            agent._interrupt_requested = True
+        return []
+
+    return patch("hermes_cli.lifecycle.invoke_hook", side_effect=invoke)
+
+
+def _state(agent):
+    """The claim states an agent holds, as plain words."""
+    return sorted(
+        "provisional" if isinstance(state, startup_policy._Provisional) else state
+        for state in getattr(agent, startup_policy._CLAIM_ATTR, {}).values()
+    )
+
+
+def test_an_interrupt_before_the_first_provider_call_does_not_burn_the_claim(sources, chat_wire):
+    """The reported P1: the prologue claimed, the loop broke on the interrupt before any
+    request, and the next empty-history call sent no policy. The claim is released instead."""
+    agent = _chat_agent(chat_wire, session_id="interrupted-first")
+    with _interrupt_in_prologue(agent):
+        aborted = agent.run_conversation("first ask")
+        assert aborted["interrupted"] is True
+        assert chat_wire.bodies == [] and _state(agent) == ["owed"]
+        agent.clear_interrupt()
+        agent.run_conversation("second ask")  # empty history
+        assert _state(agent) == ["spent"]
+        agent.run_conversation("third ask", conversation_history=[])
+    policy = build_policy_payload()
+    assert [_user_texts(body) for body in chat_wire.bodies] == [
+        [f"second ask\n\n{policy}"], ["third ask"],
+    ]
+
+
+def test_a_released_claim_replayed_with_the_aborted_row_sends_exactly_one_policy(
+    sources, chat_wire,
+):
+    """The aborted turn already stamped its row, and a caller may replay it. The released claim
+    is held for that block without adding a second copy — and since the alternation repair
+    merges the aborted row with the new one and drops its sidecar, the claim itself is what
+    keeps the request owing the policy. The row is re-stamped, so later turns replay it."""
+    agent = _chat_agent(chat_wire, session_id="interrupted-replayed")
+    policy = build_policy_payload()
+    with _interrupt_in_prologue(agent):
+        history = agent.run_conversation("first ask")["messages"]
+        assert startup_policy.carried_policy(history) == policy and chat_wire.bodies == []
+        agent.clear_interrupt()
+        history = agent.run_conversation("second ask", conversation_history=history)["messages"]
+        assert _state(agent) == ["spent"]
+        agent.run_conversation("third ask", conversation_history=history)
+        agent.run_conversation("fourth ask")  # empty history: the claim was spent on turn two
+    second, third, fourth = (_user_texts(body) for body in chat_wire.bodies)
+    assert second == [f"first ask\n\nsecond ask\n\n{policy}"]
+    assert third == [second[0], "third ask"]
+    assert fourth == ["fourth ask"]
+
+
+def test_an_interrupted_moa_first_turn_releases_the_claim(sources, chat_wire):
+    agent = _chat_agent(chat_wire, session_id="interrupted-moa")
+    with _interrupt_in_prologue(agent), _moa_advice():
+        agent.run_conversation("first ask", moa_config=_MOA)
+        assert chat_wire.bodies == [] and _state(agent) == ["owed"]
+        agent.clear_interrupt()
+        agent.run_conversation("second ask", moa_config=_MOA)
+        agent.run_conversation("third ask", moa_config=_MOA)
+    assert _counts(chat_wire.bodies) == [[1], [0]]
+
+
+def test_a_provider_call_that_raises_before_any_response_releases_the_claim(
+    sources, chat_wire, monkeypatch,
+):
+    """No provider accepted the request, so the policy was not delivered: the next call owes it."""
+    agent = _chat_agent(chat_wire, session_id="provider-raised")
+    agent._api_max_retries = 1
+    real_call = agent._interruptible_streaming_api_call
+    monkeypatch.setattr(
+        agent, "_interruptible_streaming_api_call",
+        lambda *_a, **_kw: (_ for _ in ()).throw(ValueError("provider client could not start")),
+    )
+    with _no_hooks():
+        failed = agent.run_conversation("first ask")
+        assert failed.get("failed") or failed.get("error") or not failed.get("completed")
+        assert chat_wire.bodies == [] and _state(agent) == ["owed"]
+        monkeypatch.setattr(agent, "_interruptible_streaming_api_call", real_call)
+        agent.run_conversation("second ask")
+        agent.run_conversation("third ask")
+    assert _counts(chat_wire.bodies) == [[1], [0]]
+    assert _state(agent) == ["spent"]
+
+
+def test_a_started_provider_request_commits_the_claim_exactly_once(sources, chat_wire, monkeypatch):
+    commits = []
+    real_commit = startup_policy.commit_startup_policy
+    monkeypatch.setattr(
+        startup_policy, "commit_startup_policy", lambda agent: commits.append(real_commit(agent)),
+    )
+    agent = _chat_agent(chat_wire, session_id="committed")
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        assert _state(agent) == ["spent"]
+        assert startup_policy.release_startup_policy(agent) is False  # nothing left to hand back
+        agent.run_conversation("second ask")
+        agent.run_conversation("third ask", conversation_history=[])
+    assert _counts(chat_wire.bodies) == [[1], [0], [0]]
+    assert commits == [True, False, False]
+
+
+def test_a_provisional_claim_is_exclusive_and_only_its_own_turn_can_settle_it(sources):
+    """Claim / abort race on one agent: while turn A holds the claim, turn B gets nothing and
+    can neither release nor commit A's claim; A's release hands the policy to the next call."""
+    agent = _agent()
+    claimed, released, settled = threading.Event(), threading.Event(), {}
+
+    def turn_a():
+        with _no_hooks():
+            settled["a"] = _collect(agent)
+        claimed.set()
+        released.wait(5)
+        settled["a_release"] = startup_policy.release_startup_policy(agent)
+
+    thread = threading.Thread(target=turn_a)
+    thread.start()
+    assert claimed.wait(5)
+    with _no_hooks():
+        assert _collect(agent) == ""  # B: A holds it
+    assert startup_policy.commit_startup_policy(agent) is False
+    assert startup_policy.release_startup_policy(agent) is False
+    assert _state(agent) == ["provisional"]
+    released.set()
+    thread.join(5)
+
+    assert _markers(settled["a"]) == 1 and settled["a_release"] is True
+    assert _state(agent) == ["owed"]
+    agent._user_turn_count = 3  # an owed claim is not re-derived from turn counters
+    with _no_hooks():
+        assert _markers(_collect(agent)) == 1
+        assert startup_policy.commit_startup_policy(agent) is True
+        assert startup_policy.commit_startup_policy(agent) is False
+        assert _collect(agent) == ""
+    assert _state(agent) == ["spent"]
+
+
+def test_racing_claims_and_aborts_never_put_two_policies_in_flight(sources):
+    """Eight turns race per round. Each round has exactly one winner; the rounds that abort
+    hand the claim on, the round that commits ends it, and nothing is claimed afterwards."""
+    agent = _agent()
+
+    def race(settle):
+        results, barrier, hold = [], threading.Barrier(8), threading.Barrier(8)
+
+        def run():
+            barrier.wait()
+            with _no_hooks():
+                context = _collect(agent)
+            hold.wait()  # every turn has claimed before any settles
+            results.append((_markers(context), settle(agent)))
+
+        threads = [threading.Thread(target=run) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return sorted(results, reverse=True)
+
+    losers = [(0, False)] * 7
+    for _round in range(3):
+        assert race(startup_policy.release_startup_policy) == [(1, True), *losers]
+        assert _state(agent) == ["owed"]
+    assert race(startup_policy.commit_startup_policy) == [(1, True), *losers]
+    assert race(startup_policy.release_startup_policy) == [(0, False), *losers]
+    assert _state(agent) == ["spent"]
+
+
+def test_a_codex_first_turn_that_never_leaves_releases_the_claim(sources, codex_wire, monkeypatch):
+    """``thread/start`` raised: nothing reached codex. The next call's first accepted input
+    carries the policy once."""
+    monkeypatch.setattr(_CodexWire, "rejections", ["thread/start"])
+    agent = _codex_agent()
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        assert _state(agent) == ["owed"]
+        agent.run_conversation("second ask")
+        assert _state(agent) == ["spent"]
+        agent.run_conversation("third ask")
+    texts = [text for wire in codex_wire for text in wire.turn_texts()]
+    assert texts == [f"second ask\n\n{build_policy_payload()}", "third ask"]
+
+
+def test_a_codex_first_input_that_is_rejected_releases_the_claim(sources, codex_wire, monkeypatch):
+    monkeypatch.setattr(_CodexWire, "rejections", ["turn/start"])
+    agent = _codex_agent()
+    with _no_hooks():
+        agent.run_conversation("first ask")
+        assert _state(agent) == ["owed"]
+        agent.run_conversation("second ask")
+        agent.run_conversation("third ask")
+    texts = [text for wire in codex_wire for text in wire.turn_texts()]
+    assert [_markers(text) for text in texts] == [1, 1, 0]
+    assert _state(agent) == ["spent"]

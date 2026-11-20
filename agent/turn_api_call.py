@@ -145,6 +145,10 @@ def perform_api_call(
                 bool(agent._pending_redirect) if _redirect_lock is not None
                 else agent._has_pending_redirect()
             )
+    # The provider accepted this turn's request: the startup policy it carried is delivered.
+    # Anything that raised above leaves the claim provisional, and turn exit releases it.
+    from agent.startup_policy import commit_startup_policy
+    commit_startup_policy(agent)
     if _redirect_crossed_response:
         # Response and redirect can cross threads: discard the now-stale
         # response and rebuild from the correction rather than lose it.

@@ -3706,20 +3706,8 @@ def _commit_compaction(
                 )
             from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, stamp_db_persisted_markers
             from hermes_cli.partial_compress import rejoin_compressed_head_and_tail
-            from agent.startup_policy import carry_policy
-
-            def _carry_startup_policy(final: list, *, tail_is_cloned: bool) -> None:
-                # The built-in startup policy is never compressible: head protection decays and the
-                # summarizer reads clean ``content``, so a later compaction would drop its only copy.
-                # Stamped on the list actually committed, after the anti-growth verdict. An in-place
-                # commit clones tail rows from their durable originals, so a fresh row is preferred.
-                carry_policy(
-                    [*(messages_before_compression if messages_before_compression is not None else messages),
-                     *(verbatim_tail or ())],
-                    final,
-                    cloned=(lambda m: id(m) in _tail_tagged_ids) if tail_is_cloned else None,
-                )
-
+            from agent.startup_policy import carry_policy_into_commit
+            _held = messages_before_compression if messages_before_compression is not None else messages
             if in_place:
                 # In-place compaction: same session_id; soft-archive old turns (active=0, still
                 # searchable) + insert `compressed` atomically; no pre-flush (tail already in).
@@ -3744,7 +3732,7 @@ def _commit_compaction(
                 # tool rows): counted once, the oldest carried original stays compacted=1 beside its live
                 # copy and is recalled twice. Only rows still active: a live list keeps the ids after an
                 # earlier compaction archived them.
-                from agent.conversation_compression_archive import ABSORBED_ROW_IDS, _positive_id
+                from agent.conversation_compression_archive import ABSORBED_ROW_IDS, _positive_id, coverage_for_commit
                 tail_count += len({
                     r for m in _tail_held if isinstance(m, dict)
                     for r in map(_positive_id, m.get(ABSORBED_ROW_IDS) or ())
@@ -3756,12 +3744,8 @@ def _commit_compaction(
                     # would build, and count their originals as carried duplicates like compress()'s tail.
                     persisted = rejoin_compressed_head_and_tail(compressed, verbatim_tail)
                     tail_count += len(verbatim_tail)
-                _carry_startup_policy(persisted, tail_is_cloned=True)
-                from agent.conversation_compression_archive import coverage_for_commit
-                covered_ids, unresolved_held = coverage_for_commit(
-                    agent._session_db, agent.session_id,
-                    messages_before_compression if messages_before_compression is not None else messages,
-                    verbatim_tail)
+                carry_policy_into_commit(_held, verbatim_tail, persisted, cloned_ids=_tail_tagged_ids)
+                covered_ids, unresolved_held = coverage_for_commit(agent._session_db, agent.session_id, _held, verbatim_tail)
                 agent._session_db.archive_and_compact(
                     agent.session_id, persisted, model_config_patch={PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None},
                     watermark=_held_watermark(agent, lease.watermark, messages, verbatim_tail),
@@ -3803,7 +3787,7 @@ def _commit_compaction(
                     # Publish the kept exchanges with the head, as the in-place branch stores them: the
                     # gateway no longer rewrites a published child, so a head-only handoff loses the tail.
                     compressed = rejoin_compressed_head_and_tail(compressed, verbatim_tail)
-                _carry_startup_policy(compressed, tail_is_cloned=False)
+                carry_policy_into_commit(_held, verbatim_tail, compressed)
                 _publish_rotated_compaction(
                     agent, messages, compressed, new_system_prompt=new_system_prompt, lease=lease,
                     old_session_id=old_session_id, compressed_user_turn_outcome=compressed_user_turn_outcome,

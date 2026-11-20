@@ -149,11 +149,12 @@ def assemble_api_request(
     # The built-in startup policy is not optional context: a request whose transcript carries it
     # (or whose turn claimed it) sends it. A selection that left it out (or returned clean clones, whose ``api_content``
     # sidecar the transport strips without substituting) gets it back here, exactly once.
-    # A transcript without a carrier owes nothing — an empty history never re-creates the policy.
-    from agent.startup_policy import conversation_policy, ensure_policy_on_wire
+    # A transcript without a carrier owes nothing — an empty history never re-creates the policy —
+    # unless this turn still holds the provisional claim, which is the debt itself.
+    from agent.startup_policy import settle_request_policy
 
-    api_messages = ensure_policy_on_wire(
-        api_messages, conversation_policy(messages, _plugin_user_context)
+    api_messages = settle_request_policy(
+        agent, messages, api_messages, _plugin_user_context, static=not moa_config,
     )
 
     # Context selection may replace the request with a fresh clone of canonical history.

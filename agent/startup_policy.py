@@ -12,10 +12,14 @@ The generic loop carries the claimed block inside the turn's composed user conte
 codex app-server runtime is handed the bare user message instead, so its dispatch attaches
 the block explicitly, and again on the first input of any replacement thread it starts.
 
-The invariant is: the first request of an agent instance's conversation claims the policy,
-exactly once, whether or not its caller passes history on later turns. A later turn sent
-without history is not a first request and carries none — nothing re-claims or synthesizes
-the policy because a transcript is empty.
+The invariant is: the first request of an agent instance's conversation that actually
+reaches a provider carries the policy, exactly once, whether or not its caller passes history
+on later turns. The prologue's claim is therefore provisional and exclusive: it is committed
+only when the turn's first provider request is accepted (``commit_startup_policy``), and a
+turn that ends before that — interrupt, budget exit, preflight timeout, a provider call that
+raised — hands the exact claim back (``release_startup_policy``), so the next call still owes
+the policy. Once committed, a later turn sent without history is not a first request and
+carries none — nothing re-claims or synthesizes the policy because a transcript is empty.
 
 Once claimed, the policy stays on the row that carried it: it is replayed with that row and
 is never optional context. Its carrier is the ``api_content`` sidecar of one row — the durable
@@ -30,8 +34,8 @@ The policy is a compact paraphrase bound to the SHA256 of its canonical source s
 Source bodies are hashed, never read into the prompt. Missing or unreadable sources fail
 soft to the embedded text and report a non-secret ``caveman=/frontier=`` status.
 
-Idempotence is decided from core-owned state only — the claims an agent instance carries,
-keyed by ``(profile home, session id)``. Nothing is process-global, so one agent can never
+Idempotence is decided from core-owned state only — the claim states an agent instance carries,
+keyed by ``(profile home, session id)``: provisional (one turn holds it), spent, or owed again. Nothing is process-global, so one agent can never
 suppress another that happens to share its session id. Transcript text is never consulted: a
 user, web page or tool result that contains the marker must not be able to suppress or forge
 the policy. A marker a profile-local hook (the transitional CSR-1 Jarvis hook) emitted is
@@ -74,11 +78,27 @@ _CANONICAL_DIGESTS = {
 }
 _DIGEST_PREFIX_LEN = 12  # what the marker shows; the comparison above is on the full digest
 
-# Guards the per-agent claim sets below. It holds no claim state of its own.
+# Guards the per-agent claim states below. It holds no claim state of its own.
 _CLAIM_LOCK = threading.Lock()
-# Attribute on the agent instance holding the ``(profile home, session id)`` pairs it has
-# already sent the policy for.
+# Attribute on the agent instance mapping each ``(profile home, session id)`` to its claim
+# state: a ``_Provisional`` (the turn in flight holds it), ``_SPENT`` or ``_OWED``.
 _CLAIM_ATTR = "_startup_policy_claims"
+# The policy left on a provider request (or the conversation predates this agent): never again.
+_SPENT = "spent"
+# A turn claimed the policy and ended before any provider request: the next call owes it.
+_OWED = "owed"
+
+
+class _Provisional:
+    """One turn's exclusive, not-yet-committed claim. ``owner`` is the thread running that
+    turn — prologue, provider call and turn exit all run on it — so only that turn can settle
+    this exact claim, and a concurrent turn on the same agent can neither take nor settle it."""
+
+    __slots__ = ("owner", "policy")
+
+    def __init__(self, policy: str) -> None:
+        self.owner = threading.get_ident()
+        self.policy = policy  # the exact block this turn owes its first provider request
 
 _DIGEST_LOCK = threading.Lock()
 # path -> (stat signature, digest). Hashed once per process and re-hashed only when the
@@ -315,26 +335,67 @@ def _claim_key(agent: Any) -> tuple[str, str]:
     return home, str(getattr(agent, "session_id", "") or "")
 
 
-def claim_first_request(agent: Any) -> bool:
-    """Atomically claim the first request of *agent*'s current conversation; ``True`` only
-    for the first caller.
+def _claim_states(agent: Any) -> Optional[dict]:
+    """*agent*'s claim states (created on first use); ``None`` when it refuses attributes.
+    Caller holds ``_CLAIM_LOCK``."""
+    states = getattr(agent, _CLAIM_ATTR, None)
+    if not isinstance(states, dict):
+        states = {}
+        try:
+            setattr(agent, _CLAIM_ATTR, states)
+        except (AttributeError, TypeError):
+            return None
+    return states
 
-    The claim lives on the agent instance: two agents — even on one session id — each win
-    their own, while two threads racing on one agent mean exactly one injection.
+
+def _settle(agent: Any, outcome: str) -> bool:
+    """Move the provisional claim the calling turn holds on *agent* to *outcome*.
+
+    Found by owner, not by key: a compaction may rotate the session id between the claim and
+    the provider call. ``False`` when this turn holds none (it did not win the claim, or it
+    already settled), so settling is idempotent and never touches another turn's claim.
     """
-    key = _claim_key(agent)
+    owner = threading.get_ident()
     with _CLAIM_LOCK:
-        claims = getattr(agent, _CLAIM_ATTR, None)
-        if not isinstance(claims, set):
-            claims = set()
-            try:
-                setattr(agent, _CLAIM_ATTR, claims)
-            except (AttributeError, TypeError):  # refuses attributes: cannot repeat a claim either
-                return True
-        if key in claims:
+        states = getattr(agent, _CLAIM_ATTR, None)
+        if not isinstance(states, dict):
             return False
-        claims.add(key)
-        return True
+        for key, state in states.items():
+            if isinstance(state, _Provisional) and state.owner == owner:
+                states[key] = outcome
+                return True
+    return False
+
+
+def held_startup_policy(agent: Any) -> str:
+    """The policy block the calling turn still owes a provider — it holds *agent*'s provisional
+    claim — or ``""``. This, not the transcript, is what makes the turn's request owe the policy:
+    a history rewrite between the prologue and the request cannot drop the debt."""
+    owner = threading.get_ident()
+    with _CLAIM_LOCK:
+        states = getattr(agent, _CLAIM_ATTR, None)
+        for state in (states.values() if isinstance(states, dict) else ()):
+            if isinstance(state, _Provisional) and state.owner == owner:
+                return state.policy
+    return ""
+
+
+def commit_startup_policy(agent: Any) -> bool:
+    """A provider accepted this turn's request: the claim it held is spent, for good.
+
+    Called where a provider request returns (the generic loop's call, an accepted codex
+    ``turn/start``). ``True`` only for the one call that commits; every later call is a no-op.
+    """
+    return _settle(agent, _SPENT)
+
+
+def release_startup_policy(agent: Any) -> bool:
+    """This turn is over: a claim it still holds never reached a provider, so it is owed again.
+
+    Called on every turn exit. A no-op after ``commit_startup_policy``; otherwise the exact
+    claim this turn took is handed back and the agent's next call claims the policy afresh.
+    """
+    return _settle(agent, _OWED)
 
 
 def reset_startup_policy_state() -> None:
@@ -362,16 +423,36 @@ def _is_conversation_first_request(agent: Any, conversation_history: Optional[li
 def claim_startup_policy(agent: Any, conversation_history: Optional[list]) -> str:
     """The policy text to prepend to this turn's user-channel context, or ``""``.
 
-    Non-empty exactly once per conversation, for the caller that won the claim. The claim is
-    taken here, ahead of the hooks, because this is the last point every surface still passes
-    through.
+    Taken here, ahead of the hooks, because this is the last point every surface still passes
+    through — but only provisionally: the turn that wins holds the claim exclusively until its
+    first provider request is accepted (``commit_startup_policy``) or it ends without one
+    (``release_startup_policy``). While it is held, and once it is spent, every other call gets
+    ``""``, so two turns racing on one agent can never both put the policy on the wire.
+
+    Whether a claim is owed is read from the claim state alone. An agent with no state for
+    this conversation decides once, from the core-owned first-request signals; a claim that
+    was released is owed whatever the caller passes as history. History is then consulted only
+    to avoid a second copy: when it replays the row the aborted turn stamped, the claim is held
+    for that carrier's block without adding another, and ``settle_request_policy`` sends it
+    from the claim even if the carrier does not survive to the request.
     """
-    if not _is_conversation_first_request(agent, conversation_history):
-        return ""
     payload = build_policy_payload()
-    if not payload or not claim_first_request(agent):
+    if not payload:
         return ""
-    return payload
+    first_request = _is_conversation_first_request(agent, conversation_history)
+    key = _claim_key(agent)
+    with _CLAIM_LOCK:
+        states = _claim_states(agent)
+        if states is None:  # refuses attributes: nothing to hold, and nothing to repeat
+            return payload if first_request else ""
+        state = states.get(key)
+        if state is None and not first_request:
+            states[key] = state = _SPENT
+        if state is _SPENT or isinstance(state, _Provisional):
+            return ""
+        replayed = carried_policy(conversation_history) if state is _OWED else ""
+        states[key] = _Provisional(replayed or payload)
+    return "" if replayed else payload
 
 
 def join_policy_and_context(policy: str, context: str) -> str:
@@ -511,6 +592,26 @@ def carry_policy(before: Optional[Iterable[Any]], after: list, *, cloned: Any = 
     return False
 
 
+def carry_policy_into_commit(
+    held: Optional[Iterable[Any]], verbatim_tail: Optional[Iterable[Any]], final: list,
+    *, cloned_ids: Optional[Iterable[int]] = None,
+) -> bool:
+    """``carry_policy`` for a compaction commit: keep the policy on *final*, the list committed.
+
+    The built-in startup policy is never compressible: head protection decays and the summarizer
+    reads clean ``content``, so a later compaction would drop its only copy. *held* is the history
+    the compressor was handed and *verbatim_tail* the exchanges it kept aside; *final* is stamped
+    after the anti-growth verdict, immediately before it is stored. An in-place commit clones its
+    tail rows from their durable originals — *cloned_ids* names them by ``id()`` — so a row
+    written fresh is preferred; a rotation writes every row and passes none.
+    """
+    cloned = None
+    if cloned_ids is not None:
+        ids = set(cloned_ids)
+        cloned = lambda row: id(row) in ids  # noqa: E731
+    return carry_policy([*(held or ()), *(verbatim_tail or ())], final, cloned=cloned)
+
+
 def _wire_has_policy(message: Any, policy: str) -> bool:
     if not isinstance(message, dict) or message.get("role") != "user":
         return False
@@ -550,4 +651,31 @@ def ensure_policy_on_wire(api_messages: list, policy: str) -> list:
     while lead < len(wire) and isinstance(wire[lead], dict) and wire[lead].get("role") == "system":
         lead += 1
     wire.insert(lead, {"role": "user", "content": policy})
+    return wire
+
+
+
+def settle_request_policy(
+    agent: Any, messages: list, api_messages: list, turn_context: str = "", *, static: bool = True,
+) -> list:
+    """*api_messages* carrying the policy this request owes, exactly once; the assembly's one call.
+
+    The debt is ``conversation_policy`` — a carrier in the transcript, or this turn's claimed
+    block — or, failing both, the provisional claim the turn still holds: a released claim
+    re-taken over a replayed carrier adds no block of its own, and the alternation repair that
+    merges the aborted row with the new one drops that carrier's sidecar. The claim keeps the
+    request owing the policy, and the first user row is re-stamped with what was sent so later
+    turns replay it. ``static`` is false for a MoA request, whose wire bytes carry per-call
+    context: its row is stamped with the policy alone, as the MoA prologue stamps it.
+    """
+    held = held_startup_policy(agent)
+    wire = ensure_policy_on_wire(api_messages, conversation_policy(messages, turn_context) or held)
+    if not held or carried_policy(messages):
+        return wire
+    row = next((m for m in messages if isinstance(m, dict) and m.get("role") == "user"
+                and isinstance(m.get("content"), str) and m["content"]), None)
+    sent = next((m["content"] for m in wire if _wire_has_policy(m, held)
+                 and isinstance(m.get("content"), str)), None)
+    if row is not None and sent is not None and sent.startswith(row["content"]):
+        row["api_content"] = sent if static else attach_policy(row["content"], held)
     return wire

@@ -776,6 +776,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "submitted_user_text", None) is not None and (
             getattr(turn, "turn_id", None) or turn.error is None):
         agent._codex_policy_session = session
+        from agent.startup_policy import commit_startup_policy
+        commit_startup_policy(agent)
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
     # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
     # silence alone no longer retires — it only logs a warning (#112928).
