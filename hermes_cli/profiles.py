@@ -25,14 +25,11 @@ from hermes_constants import (
 )
 
 logger = logging.getLogger(__name__)
-
 _PROFILE_ID_RE = PROFILE_ID_RE  # legacy alias; hermes_constants.PROFILE_ID_RE is canonical
-
 # Directories bootstrapped inside every new profile. ``home`` is the back-compat/Docker
 # HOME for tool subprocesses (host subprocesses keep the real HOME so CLI credentials
 # stay visible; containers persist HOME state here). See hermes_constants.get_subprocess_home().
 _PROFILE_DIRS = ["memories", "sessions", "skills", "skins", "logs", "plans", "workspace", "cron", "home"]
-
 # Files copied during --clone (if they exist in the source).
 _CLONE_CONFIG_FILES = ["config.yaml", ".env", "SOUL.md"]
 # Subdirectory files copied during --clone: memory files are part of the agent's curated
@@ -83,7 +80,7 @@ _CLONE_ALL_DEFAULT_EXCLUDE_ROOT: frozenset[str] =  frozenset({
 # that inherits jobs.json runs every job twice (two gateways, same job ids, double spend,
 # duplicate deliveries) the moment its gateway starts. The empty dir is recreated below.
 _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
-    "state.db", "state.db-wal", "state.db-shm", "sessions", "backups", "state-snapshots", "checkpoints",
+    "state.db", "state.db-wal", "state.db-shm", "state", "sessions", "backups", "state-snapshots", "checkpoints",
     "cron",
 })
 

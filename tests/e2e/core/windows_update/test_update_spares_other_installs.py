@@ -20,6 +20,7 @@ from tests.e2e.core.windows_update._machine import (
     Journey,
     fail_with,
     new_machine,
+    require_install_space,
 )
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
@@ -45,6 +46,8 @@ def journey(tmp_path_factory):
         j = Journey(host)
         j.results["neighbour"] = neighbour
         try:
+            # Two concurrent clean installs in one file: preflight for both before either starts.
+            require_install_space(host.profile if host.profile.exists() else host.root, live_machines=2)
             with ThreadPoolExecutor(2) as pool:
                 installs = list(pool.map(lambda m: m.install(), (host, neighbour)))
             j.step("installs_ok", lambda: [j.require(m.profile_name, run.returncode == 0,
@@ -66,8 +69,14 @@ def journey(tmp_path_factory):
                     neighbour.kill_owned()
             yield j
         finally:
-            neighbour.teardown()
-            host.teardown()
+            errors: list[BaseException] = []
+            for machine in (neighbour, host):
+                try:
+                    machine.teardown()
+                except BaseException as exc:  # reclaim must still run for the sibling
+                    errors.append(exc)
+            if errors:
+                raise errors[-1]
 
 
 def test_neighbour_update_leaves_this_installs_gateway_running(journey: Journey) -> None:

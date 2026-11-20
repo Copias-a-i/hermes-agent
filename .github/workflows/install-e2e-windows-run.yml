@@ -194,6 +194,28 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
+      # The PR fork has no release tags. Materialize the requested OLD tag
+      # from the exact canonical repository before the driver bare-clones
+      # this checkout into serve.git.
+      - name: Materialize selected release tag
+        shell: pwsh
+        env:
+          INSTALL_REF: ${{ inputs.install-ref }}
+        run: |
+          $installRef = $env:INSTALL_REF
+          if ($installRef -match '^(?:refs/tags/)?v20\d\d\..+$') {
+            $tag = $installRef -replace '^refs/tags/', ''
+            $expectedOrigin = 'https://github.com/Copias-a-i/hermes-agent'
+            $canonicalUpstream = 'https://github.com/NousResearch/hermes-agent.git'
+            if ((git remote get-url origin) -ne $expectedOrigin) {
+              throw 'unexpected checkout origin; refusing canonical tag fetch'
+            }
+            git fetch --no-tags --force "$canonicalUpstream" "refs/tags/${tag}:refs/tags/${tag}"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git rev-parse --verify --quiet "refs/tags/${tag}^{commit}"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
       # Old installers refresh PATH after winget installs ripgrep, dropping the
       # process-only uv path. Supply the tool before running those shipped scripts.
       - name: Set up driver tools only

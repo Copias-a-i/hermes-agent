@@ -266,6 +266,17 @@ class TestBundledBackendAutoLoad:
         assert loaded.manifest.source == "bundled"
         assert loaded.manifest.kind == "backend"
         assert loaded.enabled is True, f"error: {loaded.error}"
+    def test_bundled_fleet_lifecycle_registers_start_and_finalize_hooks(self, tmp_path, monkeypatch):
+        """The bundled lifecycle plugin is reachable in a fresh profile without opt-in."""
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        loaded = mgr._plugins["fleet-session-lifecycle"]
+        assert loaded.manifest.source == "bundled"
+        assert loaded.manifest.kind == "backend"
+        assert loaded.enabled is True, f"error: {loaded.error}"
+        assert mgr._hooks["pre_llm_call"]
+        assert mgr._hooks["on_session_finalize"]
 
 
 # ── PluginContext.register_image_gen_provider ───────────────────────────────

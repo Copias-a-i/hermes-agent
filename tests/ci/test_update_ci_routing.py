@@ -51,6 +51,343 @@ _spec.loader.exec_module(cc)
 # marker so a green Windows job has run them on that layout (review F81-R). Not "any": macOS
 # bash 3.2 is not a host the replay has been run on.
 _NATIVE_WINDOWS_PLATFORMS = pytest.mark.platforms("linux", "windows")
+
+
+def test_no_workflow_requests_an_unprovisioned_private_runner_label() -> None:
+    """Required lanes run on stock hosted runners; private ``*-32-core`` labels never schedule.
+
+    Worker counts and budgets are owned by ``scripts/ci/runner_capacity.py`` and its own
+    contracts; this only keeps the unprovisioned labels from coming back.
+    """
+    unavailable = {"ubuntu-latest-32-core", "windows-latest-32-core", "windows-latest-32-arm-core"}
+    workflows = sorted((_REPO / ".github" / "workflows").glob("*.yml"))
+    assert workflows, "no workflows found"
+    for workflow in workflows:
+        rendered = json.dumps(_yaml(f".github/workflows/{workflow.name}"))
+        assert all(label not in rendered for label in unavailable), workflow.name
+
+
+def test_release_tag_consumers_use_complete_tagged_checkouts_and_fail_closed_when_empty() -> None:
+    """Tag-derived E2E inputs must be available before either consumer reads them."""
+    consumers = (
+        (".github/workflows/tests.yml", "e2e-upgrade"),
+        (".github/workflows/install-e2e.yml", "pick-releases"),
+    )
+    for workflow_path, job_name in consumers:
+        steps = _yaml(workflow_path)["jobs"][job_name]["steps"]
+        checkout_index = next(i for i, step in enumerate(steps) if "actions/checkout@" in step.get("uses", ""))
+        checkout = steps[checkout_index]
+        assert checkout["with"]["fetch-depth"] == 0
+        assert checkout["with"]["fetch-tags"] is True
+        verify = next(step for step in steps[checkout_index + 1:] if step.get("name") == "Require release tags")
+        command = verify["run"]
+        assert "git fetch --force --tags origin" in command
+        # Copias-a-i/hermes-agent is a tagless fork. The fallback must be pinned to
+        # the canonical upstream after proving the checkout's origin is precisely
+        # the expected fork, rather than trusting a mutable remote alias.
+        assert "EXPECTED_ORIGIN='https://github.com/Copias-a-i/hermes-agent'" in command
+        assert "CANONICAL_UPSTREAM='https://github.com/NousResearch/hermes-agent.git'" in command
+        assert 'git remote get-url origin' in command
+        assert 'git fetch --force --tags "$CANONICAL_UPSTREAM"' in command
+        assert "git describe --tags --match 'v20[0-9][0-9].*' --abbrev=0 HEAD~1" in command
+        assert "::error::release tags are unavailable" in command
+        assert "exit 1" in command
+
+
+_MATERIALIZE_TAG_STEP = "Materialize selected release tag"
+_FORK_ORIGIN = "https://github.com/Copias-a-i/hermes-agent"
+_CANONICAL_UPSTREAM = "https://github.com/NousResearch/hermes-agent.git"
+_MATERIALIZE_TAG_WORKFLOWS = (
+    (".github/workflows/install-e2e-run.yml", "bash"),
+    (".github/workflows/install-e2e-macos-run.yml", "bash"),
+    (".github/workflows/install-e2e-windows-run.yml", "pwsh"),
+)
+_BASH_TAG_WORKFLOWS = tuple(path for path, shell in _MATERIALIZE_TAG_WORKFLOWS if shell == "bash")
+_RELEASE_TAG = "v2026.1.1"
+
+
+def _materialize_tag_step(workflow_path: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The (job steps, tag step) of the one job that checks out and then stages an OLD install."""
+    carriers = [
+        steps
+        for job in _yaml(workflow_path)["jobs"].values()
+        if isinstance(steps := job.get("steps"), list)
+        and any(step.get("name") == _MATERIALIZE_TAG_STEP for step in steps)
+    ]
+    assert len(carriers) == 1, f"{workflow_path} must stage the selected tag in exactly one job"
+    (steps,) = carriers
+    matches = [step for step in steps if step.get("name") == _MATERIALIZE_TAG_STEP]
+    assert len(matches) == 1
+    return steps, matches[0]
+
+
+@pytest.mark.parametrize("workflow_path,shell", _MATERIALIZE_TAG_WORKFLOWS)
+def test_install_e2e_run_workflows_materialize_the_selected_tag_after_a_full_checkout(workflow_path, shell) -> None:
+    """Every checkout that stages an OLD install must carry its selected tag object.
+
+    ``Copias-a-i/hermes-agent`` intentionally has no release tags. The pick job can
+    discover canonical tags, but each independently checked-out leg must fetch the
+    selected tag before the driver bare-clones this checkout into the serve repository.
+    """
+    steps, step = _materialize_tag_step(workflow_path)
+    checkout = next(i for i, s in enumerate(steps) if "actions/checkout@" in s.get("uses", ""))
+    assert steps[checkout]["with"]["fetch-depth"] == 0
+    assert checkout < steps.index(step), "the tag must exist before anything consumes the checkout"
+    assert step["shell"] == shell
+    # The ref reaches the script through the environment, never through expression syntax.
+    assert step["env"] == {"INSTALL_REF": "${{ inputs.install-ref }}"}
+    assert "${{" not in step["run"]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    done = subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+    return done.stdout.strip()
+
+
+def _stage_tag_fixture(tmp_path: Path, *, origin: str) -> tuple[Path, dict[str, str], str]:
+    """A fork-like checkout, plus a local bare repository standing in for canonical upstream.
+
+    ``url.<local>.insteadOf`` reroutes the step's pinned canonical URL to that repository, so
+    the step's real ``git fetch`` runs without a network. Returns (checkout, env, tag commit).
+    """
+    upstream = tmp_path / "upstream.git"
+    checkout = tmp_path / "checkout"
+    identity = {
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    env = {
+        **os.environ,
+        **identity,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": f"url.{upstream}.insteadOf",
+        "GIT_CONFIG_VALUE_0": _CANONICAL_UPSTREAM,
+    }
+    for path in (upstream, checkout):
+        path.mkdir()
+    for repo, flags in ((upstream, ("--bare",)), (checkout, ())):
+        subprocess.run(["git", "init", "-q", "-b", "main", *flags], cwd=repo, check=True, env=env)
+    # The tag exists only upstream, like the real fork; the checkout carries unrelated history.
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=seed, check=True, env=env)
+    (seed / "f").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "f"], cwd=seed, check=True, env=env)
+    subprocess.run(["git", "commit", "-q", "-m", "release"], cwd=seed, check=True, env=env)
+    subprocess.run(["git", "tag", _RELEASE_TAG], cwd=seed, check=True, env=env)
+    subprocess.run(["git", "push", "-q", str(upstream), "main", _RELEASE_TAG], cwd=seed, check=True, env=env)
+    tag_commit = subprocess.run(
+        ["git", "rev-parse", f"{_RELEASE_TAG}^{{commit}}"], cwd=seed, check=True, capture_output=True, text=True, env=env,
+    ).stdout.strip()
+    subprocess.run(["git", "remote", "add", "origin", origin], cwd=checkout, check=True, env=env)
+    return checkout, env, tag_commit
+
+
+def _run_materialize_tag(workflow_path: str, checkout: Path, env: dict[str, str], install_ref: str):
+    """Execute the workflow's real bash step in ``checkout`` (the PowerShell leg runs on Windows)."""
+    script = _materialize_tag_step(workflow_path)[1]["run"]
+    return subprocess.run(
+        ["bash", "-c", script], cwd=checkout, env={**env, "INSTALL_REF": install_ref},
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+def _has_tag(checkout: Path, env: dict[str, str]) -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{_RELEASE_TAG}^{{commit}}"],
+        cwd=checkout, env=env, capture_output=True,
+    ).returncode == 0
+
+
+@pytest.mark.parametrize("workflow_path", _BASH_TAG_WORKFLOWS)
+@pytest.mark.parametrize("install_ref", [f"refs/tags/{_RELEASE_TAG}", _RELEASE_TAG])
+def test_materialize_selected_tag_fetches_it_from_the_pinned_upstream(tmp_path, workflow_path, install_ref) -> None:
+    checkout, env, tag_commit = _stage_tag_fixture(tmp_path, origin=_FORK_ORIGIN)
+    assert not _has_tag(checkout, env)
+    done = _run_materialize_tag(workflow_path, checkout, env, install_ref)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _git(checkout, "rev-parse", f"refs/tags/{_RELEASE_TAG}^{{commit}}") == tag_commit
+
+
+@pytest.mark.parametrize("workflow_path", _BASH_TAG_WORKFLOWS)
+def test_materialize_selected_tag_refuses_an_unexpected_checkout_origin(tmp_path, workflow_path) -> None:
+    """A mutable remote alias must not redirect where release tags are trusted from."""
+    checkout, env, _ = _stage_tag_fixture(tmp_path, origin="https://github.com/someone-else/hermes-agent")
+    done = _run_materialize_tag(workflow_path, checkout, env, _RELEASE_TAG)
+    assert done.returncode != 0
+    assert "unexpected checkout origin" in done.stdout + done.stderr
+    assert not _has_tag(checkout, env)
+
+
+@pytest.mark.parametrize("workflow_path", _BASH_TAG_WORKFLOWS)
+def test_materialize_selected_tag_fails_when_upstream_lacks_the_tag(tmp_path, workflow_path) -> None:
+    checkout, env, _ = _stage_tag_fixture(tmp_path, origin=_FORK_ORIGIN)
+    done = _run_materialize_tag(workflow_path, checkout, env, "v2026.9.9")
+    assert done.returncode != 0
+    assert not _has_tag(checkout, env)
+
+
+@pytest.mark.parametrize("workflow_path", _BASH_TAG_WORKFLOWS)
+@pytest.mark.parametrize("install_ref", ["main", "refs/heads/main", "0123456789abcdef0123456789abcdef01234567"])
+def test_materialize_selected_tag_leaves_non_release_refs_alone(tmp_path, workflow_path, install_ref) -> None:
+    checkout, env, _ = _stage_tag_fixture(tmp_path, origin="https://github.com/someone-else/hermes-agent")
+    done = _run_materialize_tag(workflow_path, checkout, env, install_ref)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert not _has_tag(checkout, env)
+
+
+# -- the clean Windows install lane's capacity and budget ----------------------------------
+
+_WINDOWS_E2E = ".github/workflows/windows-install-update-e2e.yml"
+_WINDOWS_JOURNEYS = "tests/e2e/core/windows_update"
+# windows-latest is the stock hosted runner: 4 vCPUs, and a disk that holds a handful of
+# toolchains. One clean install.ps1 journey needs about half of those vCPUs to finish inside
+# the harness's own INSTALL_TIMEOUT; six concurrent ones starved every install past that bound
+# and then filled the disk with their diagnostics.
+_STOCK_WINDOWS_VCPUS = 4
+_VCPUS_PER_CLEAN_INSTALL = 2
+# Checkout at fetch-depth 0, setup-pm and the artifact upload, outside the pytest waves.
+_WINDOWS_E2E_OVERHEAD_MINUTES = 20
+# Empirically observed free space on a loaded stock windows-latest after setup-pm is only a
+# low double-digit number of GiB. Unreclaimed installs from earlier journey files filled it.
+_STOCK_WINDOWS_FREE_DISK_BYTES = 14 * 1024 ** 3
+
+
+# Proves the install-slot primitive with its own short-lived worker processes; it installs nothing.
+_NOT_A_JOURNEY = {"test_install_slots.py"}
+
+
+def _windows_journey_files() -> list[str]:
+    """Every clean-install journey file the lane's single pytest invocation has to get through."""
+    found = sorted(
+        p.name for p in (_REPO / _WINDOWS_JOURNEYS).glob("test_*.py") if p.name not in _NOT_A_JOURNEY
+    )
+    assert len(found) >= 10, f"{_WINDOWS_JOURNEYS} journeys moved or shrank: {found}"
+    return found
+
+
+def _windows_machine_module():
+    return importlib.import_module(_WINDOWS_JOURNEYS.replace("/", ".") + "._machine")
+
+
+def _install_capacity():
+    """The executable capacity policy the install workflow consumes through its capacity step."""
+    from scripts.ci.runner_capacity import capacity
+
+    return capacity("windows-install-update")
+
+
+def test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_the_budget():
+    """Capacity and budget are one contract: starving the installs or cancelling the job
+    mid-suite both read as product failures on a PR.
+
+    Derived from the suite on disk, the harness's own bound and the capacity policy, not
+    remembered: adding a journey file or raising the worker count without raising the job
+    budget fails here rather than as a wave of uniform install timeouts on a Windows runner.
+    """
+    machine = _windows_machine_module()
+    policy = _install_capacity()
+    job = _yaml(_WINDOWS_E2E)["jobs"]["install-update"]
+    env = next(s for s in job["steps"] if s.get("name") == "Run Windows install + update E2E")["env"]
+
+    workers = policy.workers
+    assert workers >= 1
+    assert workers * _VCPUS_PER_CLEAN_INSTALL <= _STOCK_WINDOWS_VCPUS, \
+        f"{workers} concurrent clean installs oversubscribe a {_STOCK_WINDOWS_VCPUS}-vCPU runner"
+
+    # Peak concurrent clean installs must fit the stock free disk *with reclaim between files*.
+    # Without reclaim, ten journey files leave ten multi-GB profiles and ENOSPC mid-suite.
+    assert machine.install_space_required(policy.install_slots) <= _STOCK_WINDOWS_FREE_DISK_BYTES, \
+        f"{policy.install_slots} live installs need more disk than stock windows-latest can spare"
+
+    # test_crash_cells.py runs its whole journey inside one file and needs the full hour; a
+    # retry of a file killed by that bound would double the capacity problem it reports.
+    assert str(env["HERMES_TEST_FILE_RETRIES"]) == "0"
+
+    waves = -(-len(_windows_journey_files()) // workers)
+    budget = job["timeout-minutes"]
+    assert budget >= waves * machine.INSTALL_TIMEOUT / 60 + _WINDOWS_E2E_OVERHEAD_MINUTES, \
+        f"{budget} min cannot cover {waves} install waves at {machine.INSTALL_TIMEOUT}s plus setup"
+    assert budget > policy.file_timeout / 60, "the job would be cancelled before the per-file bound reports red"
+
+
+def test_windows_install_lane_disk_budget_constants_fit_stock_runner():
+    """Peak live installs must fit stock free disk once prior journeys reclaim."""
+    machine = _windows_machine_module()
+    assert machine.CLEAN_INSTALL_DISK_BYTES >= 2 * 1024 ** 3
+    assert machine.FREE_SPACE_CUSHION_BYTES >= 1024 ** 3
+    assert machine.install_space_required(1) == (
+        machine.CLEAN_INSTALL_DISK_BYTES + machine.FREE_SPACE_CUSHION_BYTES
+    )
+    assert machine.install_space_required(_install_capacity().install_slots) <= _STOCK_WINDOWS_FREE_DISK_BYTES
+
+
+def _staged_machine(machine_mod, tmp_path):
+    root = tmp_path / "wm-root"
+    profile = tmp_path / "Users" / "hermes-e2e-unit"
+    (root / "serve.git").mkdir(parents=True)
+    installs = profile / "AppData" / "Local" / "hermes" / "installs" / "x"
+    installs.mkdir(parents=True)
+    (installs / "big.bin").write_bytes(b"x" * 1024)
+    (profile / "AppData" / "Local" / "hermes" / "logs").mkdir(parents=True)
+    (profile / "AppData" / "Local" / "hermes" / "logs" / "agent.log").write_text("ok\n", encoding="utf-8")
+    m = machine_mod.Machine(
+        root=root, profile_name=profile.name, base_url="http://127.0.0.1:9",
+        profiles_root=profile.parent,
+    )
+    return m, root, profile
+
+
+def test_install_refuses_when_free_space_is_below_budget(tmp_path, monkeypatch):
+    """install.ps1 must not start when the volume cannot host another clean journey."""
+    machine_mod = _windows_machine_module()
+    m, _root, _profile = _staged_machine(machine_mod, tmp_path)
+
+    class _Usage:
+        free = 100
+
+    monkeypatch.setattr(machine_mod.shutil, "disk_usage", lambda _p: _Usage())
+    with pytest.raises(AssertionError, match="not enough free disk"):
+        m.install()
+
+
+def test_require_install_space_fails_closed_when_disk_is_tight(tmp_path, monkeypatch):
+    machine_mod = _windows_machine_module()
+
+    class _Usage:
+        free = 100
+
+    monkeypatch.setattr(machine_mod.shutil, "disk_usage", lambda _p: _Usage())
+    with pytest.raises(AssertionError, match="not enough free disk"):
+        machine_mod.require_install_space(tmp_path, live_machines=1)
+
+
+@pytest.mark.parametrize("mutation", [
+    "more-workers", "more-journeys", "smaller-budget", "file-retries",
+])
+def test_capacity_guard_rejects_an_oversubscribed_or_underbudgeted_install_lane(monkeypatch, mutation):
+    here = sys.modules[__name__]
+    if mutation == "more-journeys":
+        monkeypatch.setattr(here, "_windows_journey_files",
+                            lambda: [f"test_journey_{i}.py" for i in range(20)])
+    elif mutation == "more-workers":
+        from dataclasses import replace
+
+        real = _install_capacity()
+        monkeypatch.setattr(here, "_install_capacity", lambda: replace(real, workers=6, install_slots=6))
+    else:
+        job = _mutated_yaml(monkeypatch, _WINDOWS_E2E)["jobs"]["install-update"]
+        step = next(s for s in job["steps"] if s.get("name") == "Run Windows install + update E2E")
+        if mutation == "smaller-budget":
+            job["timeout-minutes"] = 75
+        else:
+            step["env"]["HERMES_TEST_FILE_RETRIES"] = "1"
+    with pytest.raises(AssertionError):
+        test_clean_windows_install_journeys_fit_the_runner_and_the_whole_suite_fits_the_budget()
+
+
 # Not Windows on arm64: Git for Windows ships an x86-64 MSYS bash.exe there, run under emulation,
 # and with the os-tests lane's 16 workers it dies with 0xC000026F (STATUS_WX86_INTERNAL_ERROR) or
 # 0xC0000005 before running a line, on replays of unchanged workflows: one copy of this file red

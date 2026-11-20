@@ -72,6 +72,12 @@ INSTALL_TIMEOUT = 1500.0
 UPDATE_TIMEOUT = 1200.0
 CMD_TIMEOUT = 300.0
 GATEWAY_READY_TIMEOUT = 240.0
+# One clean install.ps1 journey on stock windows-latest: pinned Git + managed Python + uv
+# venv + filtered checkout + tool caches. Measured by late-suite ENOSPC after ~8-10
+# unreclaimed installs; keep the budget above one live install and below a stock free disk.
+CLEAN_INSTALL_DISK_BYTES = 3 * 1024 ** 3
+# Headroom for runner diagnostics, the next install's temp extract, and concurrent peers.
+FREE_SPACE_CUSHION_BYTES = 2 * 1024 ** 3
 CANONICAL_URLS = (
     "https://github.com/NousResearch/hermes-agent.git",
     "https://github.com/NousResearch/hermes-agent",
@@ -80,6 +86,33 @@ CANONICAL_URLS = (
 NEXT_MARKER = ".hermes-e2e-next"
 # Captured before any machine strips PATH: harness plumbing (serve.git, rev-parse) only.
 REAL_GIT = shutil.which("git")
+
+
+def free_bytes_for(path: Path) -> int:
+    """Free bytes on the volume that holds ``path`` (creating parents is the caller's job)."""
+    probe = path if path.exists() else path.parent
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    return int(shutil.disk_usage(probe).free)
+
+
+def install_space_required(live_machines: int = 1) -> int:
+    """Bytes that must be free before starting ``live_machines`` concurrent clean installs."""
+    if live_machines < 1:
+        raise ValueError("live_machines must be >= 1")
+    return CLEAN_INSTALL_DISK_BYTES * live_machines + FREE_SPACE_CUSHION_BYTES
+
+
+def require_install_space(path: Path, *, live_machines: int = 1) -> None:
+    """Fail closed before ``install.ps1`` when the volume cannot host another clean journey."""
+    need = install_space_required(live_machines)
+    free = free_bytes_for(path)
+    if free < need:
+        raise AssertionError(
+            f"not enough free disk for {live_machines} clean install journey(s): "
+            f"need {need // (1024 ** 2)} MiB, have {free // (1024 ** 2)} MiB on {path}"
+        )
+
 
 # Every module here also carries platforms("windows") + integration + live_system_guard_bypass
 # literally in its own ``pytestmark`` (scripts/ci/list_os_marked_tests.py reads the file text).
@@ -374,6 +407,9 @@ class Machine:
         with acquire_install_slot() as slot:
             if slot is not None:
                 self.timings.append((slot.diagnostic, 0.0))
+            # Refuse to start another toolchain when the volume is already tight: the
+            # previous residual ENOSPC was "installing git" with a full disk, not a product gate.
+            require_install_space(self.profile if self.profile.exists() else self.root)
             return self._run_logged(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script), "-NonInteractive"],
                 "install", timeout=INSTALL_TIMEOUT, cwd=cwd)

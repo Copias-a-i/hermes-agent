@@ -322,9 +322,55 @@ def kill_owned(home: WinHome, *, since: float) -> None:
     kill_tree(owned_processes(home, since=since))
 
 
-def taskkill_tree(pid: int) -> subprocess.CompletedProcess:
-    """The Desktop's backend quit path on Windows (electron/backend-child.ts): taskkill /T /F."""
-    return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=60)
+@dataclass(frozen=True)
+class TaskkillResult:
+    """A Windows tree-kill result whose success is tied to the original PID identity.
+
+    ``taskkill /T /F`` can return 255 after it has already terminated a child and
+    observed the root disappear during its own tree walk. The process outcome,
+    not that racy diagnostic exit code, is the shutdown authority.
+    """
+
+    completed: subprocess.CompletedProcess
+    target_exited: bool
+
+    @property
+    def returncode(self) -> int:
+        return self.completed.returncode
+
+    @property
+    def stdout(self) -> bytes:
+        return self.completed.stdout
+
+    @property
+    def stderr(self) -> bytes:
+        return self.completed.stderr
+
+
+def taskkill_tree(pid: int, *, timeout: float = 30.0, interval: float = 0.1) -> TaskkillResult:
+    """Run the Desktop's ``taskkill /T /F`` and prove that its original target died.
+
+    PID identity is captured before the command. A nonzero ``taskkill`` result is
+    accepted only when that exact process is gone (or its PID was recycled), and
+    callers still independently prove no profile-owned child survived.
+    """
+    import psutil
+
+    try:
+        original_started = psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess as exc:
+        raise AssertionError(f"taskkill target PID {pid} was not alive before shutdown") from exc
+
+    completed = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=60)
+
+    def original_target_exited() -> bool:
+        try:
+            return psutil.Process(pid).create_time() != original_started
+        except psutil.NoSuchProcess:
+            return True
+
+    wait_until(original_target_exited, timeout, f"taskkill did not terminate original PID {pid}", interval)
+    return TaskkillResult(completed=completed, target_exited=True)
 
 
 def nonce(prefix: str) -> str:

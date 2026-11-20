@@ -1,0 +1,9 @@
+name: fleet-session-lifecycle
+version: 1.0.0
+description: "Crash-safe profile-local checkpointing after every Hermes turn."
+kind: backend
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end
+  - on_session_finalize
