@@ -12,6 +12,14 @@ The generic loop carries the claimed block inside the turn's composed user conte
 codex app-server runtime is handed the bare user message instead, so its dispatch attaches
 the block explicitly, and again on the first input of any replacement thread it starts.
 
+Once claimed, the policy is a mandatory part of every later request of that conversation and
+is never optional context. Its carrier is the ``api_content`` sidecar of one row — the durable
+``content`` stays the user's words, and later turns' rows never gain a copy. Two core steps
+keep it there: ``carry_policy`` re-stamps the sidecar on a surviving row whenever a compaction
+is about to commit a transcript that no longer holds the carrier, and ``ensure_policy_on_wire``
+runs after ``ContextEngine.select_context`` and re-attaches the block when a selection left it
+out of the request.
+
 The policy is a compact paraphrase bound to the SHA256 of its canonical source skills.
 Source bodies are hashed, never read into the prompt. Missing or unreadable sources fail
 soft to the embedded text and report a non-secret ``caveman=/frontier=`` status.
@@ -62,6 +70,10 @@ _DIGEST_PREFIX_LEN = 12  # what the marker shows; the comparison above is on the
 
 # Guards the per-agent claim sets below. It holds no claim state of its own.
 _CLAIM_LOCK = threading.Lock()
+# Attribute on the agent instance holding ``(profile home, session id) -> payload`` for the
+# conversations it has seen carry the policy. In-process backstop for a carrier whose sidecar
+# was dropped by a rewrite that is not a compaction commit.
+_HELD_ATTR = "_startup_policy_held"
 # Attribute on the agent instance holding the ``(profile home, session id)`` pairs it has
 # already sent the policy for.
 _CLAIM_ATTR = "_startup_policy_claims"
@@ -403,3 +415,158 @@ def attach_policy(user_input: Any, policy: str) -> Any:
                 return user_input
         return [*user_input, {"type": "text", "text": policy}]
     return user_input
+
+
+def is_policy_payload(text: Any) -> bool:
+    """Whether *text* is exactly one built-in policy payload (either clause set, any digests)."""
+    return isinstance(text, str) and _EXACT_PAYLOAD_RE.fullmatch(text) is not None
+
+
+def _policy_blocks(text: Any) -> list[str]:
+    """The blank-line-delimited blocks of *text* that are exactly a built-in payload."""
+    if not isinstance(text, str) or STARTUP_POLICY_MARKER_PREFIX not in text:
+        return []
+    return [block for block in text.split("\n\n") if _EXACT_PAYLOAD_RE.fullmatch(block)]
+
+
+def _row_policy(message: Any) -> str:
+    """The policy core attached to *message*, or ``""``.
+
+    Read from core-owned structure, not from what the row says: the ``api_content`` sidecar
+    holds a payload block the row's own ``content`` does not, so text a user typed (which
+    appears in both) can neither forge nor hide a carrier. List content takes no sidecar; its
+    turn context — the policy included — is the text part core appended.
+    """
+    if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+        return ""
+    content = message.get("content")
+    stamped = _policy_blocks(message.get("api_content"))
+    if len(stamped) > len(_policy_blocks(content)):
+        return stamped[-1]
+    if isinstance(content, list) and message.get("role") == "user":
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                blocks = _policy_blocks(part.get("text"))
+                if blocks:
+                    return blocks[0]
+    return ""
+
+
+def carried_policy(messages: Optional[Iterable[Any]]) -> str:
+    """The policy the transcript *messages* carries, or ``""`` when no row is a carrier."""
+    for message in messages or ():
+        policy = _row_policy(message)
+        if policy:
+            return policy
+    return ""
+
+
+def _held(agent: Any) -> dict:
+    held = getattr(agent, _HELD_ATTR, None)
+    if not isinstance(held, dict):
+        held = {}
+        try:
+            setattr(agent, _HELD_ATTR, held)
+        except (AttributeError, TypeError):
+            pass
+    return held
+
+
+def held_policy(agent: Any) -> str:
+    """The policy *agent* has seen its current conversation carry, or ``""``."""
+    with _CLAIM_LOCK:
+        return _held(agent).get(_claim_key(agent), "")
+
+
+def conversation_policy(agent: Any, messages: Optional[Iterable[Any]], turn_context: str = "") -> str:
+    """The policy every request of *agent*'s current conversation must carry, or ``""``.
+
+    Owed when the transcript holds a carrier (also after a resume in a fresh process), when the
+    prologue claimed it for this turn (``turn_context``), or when this agent has already seen
+    the conversation carry it. A conversation that never claimed it — one that predates the
+    policy — owes nothing, so its replayed prefix is not altered.
+    """
+    policy = carried_policy(messages) or policy_block(turn_context)
+    key = _claim_key(agent)
+    with _CLAIM_LOCK:
+        held = _held(agent)
+        if policy:
+            held[key] = policy
+        return policy or held.get(key, "")
+
+
+def carry_policy(before: Optional[Iterable[Any]], after: list, *, owed: str = "",
+                 cloned: Any = None) -> bool:
+    """Keep the policy on a transcript that is about to replace *before*; ``True`` when stamped.
+
+    *after* is what a compaction is about to commit. When *before* carried the policy (or the
+    conversation is known to owe it, ``owed``) and no row of *after* does, the block is stamped
+    on the ``api_content`` sidecar of a surviving row — the durable ``content`` is not touched.
+    Preference: the first user row written from its dict, then the summary row, then a user
+    row the store clones from its durable original (``cloned(row)`` true: live for this
+    process, though the clone does not persist the stamp). The policy is never summarized and
+    never competes for budget; it is re-stamped at every boundary that would otherwise drop it.
+    """
+    policy = carried_policy(before) or owed
+    if not policy or carried_policy(after):
+        return False
+    rows = [m for m in after if isinstance(m, dict) and isinstance(m.get("content"), str) and m["content"]]
+    is_cloned = cloned or (lambda _row: False)
+    for wanted in (
+        lambda m: m.get("role") == "user" and not is_cloned(m),
+        lambda m: m.get("role") == "assistant" and m.get("_compressed_summary") and not is_cloned(m),
+        lambda m: m.get("role") == "user",
+    ):
+        target = next((m for m in rows if wanted(m)), None)
+        if target is not None:
+            sent = target.get("api_content")
+            base = sent if isinstance(sent, str) and sent else target["content"]
+            target["api_content"] = attach_policy(base, policy)
+            return True
+    for message in after:  # only multimodal user rows survive: the part channel they already use
+        if isinstance(message, dict) and message.get("role") == "user" and isinstance(message.get("content"), list):
+            message["content"] = attach_policy(message["content"], policy)
+            return True
+    return False
+
+
+def _wire_has_policy(message: Any, policy: str) -> bool:
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return policy in content
+    if isinstance(content, list):
+        return any(
+            isinstance(text, str) and policy in text
+            for text in (part.get("text") if isinstance(part, dict) else part for part in content)
+        )
+    return False
+
+
+def ensure_policy_on_wire(api_messages: list, policy: str) -> list:
+    """*api_messages* carrying *policy*: the request as selected, plus the block if it is missing.
+
+    The last word on one request, run after ``ContextEngine.select_context``. Whether the
+    conversation owes the policy was already decided from core state (``conversation_policy``);
+    this only checks that the exact bytes are leaving in a user message. A selection that kept
+    the carrier is returned untouched (byte-stable prefix). One that dropped it, or handed back
+    a clean clone whose sidecar the transport strips, gets the block appended to its first user
+    message, on a copy; a selection with no user message at all gets it as one, ahead of the
+    conversation. Deterministic for a given selection, so repeated requests send the same bytes.
+    """
+    if not policy or not isinstance(api_messages, list):
+        return api_messages
+    if any(_wire_has_policy(message, policy) for message in api_messages):
+        return api_messages
+    wire = list(api_messages)
+    for index, message in enumerate(wire):
+        if isinstance(message, dict) and message.get("role") == "user" and isinstance(
+                message.get("content"), (str, list)):
+            wire[index] = {**message, "content": attach_policy(message["content"], policy)}
+            return wire
+    lead = 0
+    while lead < len(wire) and isinstance(wire[lead], dict) and wire[lead].get("role") == "system":
+        lead += 1
+    wire.insert(lead, {"role": "user", "content": policy})
+    return wire

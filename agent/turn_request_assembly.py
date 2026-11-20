@@ -146,6 +146,15 @@ def assemble_api_request(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
 
+    # The built-in startup policy is not optional context: once a conversation carries it, every
+    # request does. A selection that left it out (or returned clean clones, whose ``api_content``
+    # sidecar the transport strips without substituting) gets it back here, exactly once.
+    from agent.startup_policy import conversation_policy, ensure_policy_on_wire
+
+    api_messages = ensure_policy_on_wire(
+        api_messages, conversation_policy(agent, messages, _plugin_user_context)
+    )
+
     # Context selection may replace the request with a fresh clone of canonical history.
     # Re-apply durable rejection suppression after that final replacement hook.
     from agent.anthropic_thinking_replay import apply_rejected_thinking_suppression

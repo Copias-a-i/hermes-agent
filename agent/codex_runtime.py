@@ -538,19 +538,21 @@ def _start_codex_thread(agent) -> str:
 def _codex_thread_startup_policy(agent, claimed: str) -> str:
     """The built-in startup policy this turn's input must carry on the codex thread, or ``""``.
 
-    ``claimed`` is what the prologue claimed for the conversation's own first request. A thread
-    started from scratch later in the conversation (retired client, failed resume, prompt or
-    provider change) is seeded with the clean transcript, which never holds the policy, so its
-    first input carries the policy again — once per thread. A resumed thread already holds it.
-    Decided from core-owned state only (the session object), never from transcript text.
+    Bound to the authoritative outcome of ``ensure_started`` and to nothing else: only a thread
+    that ``thread/start`` created (the conversation's first thread, or a replacement after a
+    retired client, a refused resume, a missing stored id, a prompt or provider change) is owed
+    the policy, on its first accepted input, once. A thread ``thread/resume`` handed back already
+    holds it — also when the local transcript is empty or unavailable and the prologue therefore
+    claimed the policy for what looked like a first request (``claimed``). Transcript length and
+    transcript text are never consulted.
     """
-    if claimed:
-        return claimed
     session = getattr(agent, "_codex_session", None)
     if getattr(session, "thread_started_fresh", None) is not True:
         return ""
     if getattr(agent, "_codex_policy_session", None) is session:
         return ""
+    if claimed:
+        return claimed
     from agent.startup_policy import build_policy_payload
     return build_policy_payload()
 

@@ -706,8 +706,10 @@ def test_chat_completions_agents_sharing_a_session_id_each_send_the_policy_once(
         second.run_conversation("b1")
         first.run_conversation("a2")
         second.run_conversation("b2")
+    # The later turns are sent without history, so each request is a single user message: once a
+    # conversation carries the policy every request of it does, exactly once, per agent.
     assert [[_markers(text) for text in _user_texts(body)] for body in chat_wire.bodies] == [
-        [1], [1], [0], [0],
+        [1], [1], [1], [1],
     ]
 
 
@@ -1000,3 +1002,234 @@ def test_moa_agents_sharing_a_session_id_each_keep_their_own_policy(sources, cha
     assert [[_markers(text) for text in _user_texts(body)] for body in chat_wire.bodies] == [
         [1], [1], [1, 0], [1, 0],
     ]
+
+
+# ── Codex: the outcome of ``ensure_started`` decides, not the transcript ───
+
+
+def test_a_successful_resume_with_an_empty_local_history_does_not_resend_the_policy(
+    sources, codex_wire, monkeypatch,
+):
+    """A fresh process resumes the stored codex thread but is handed no local history, so the
+    prologue takes the turn for the conversation's first request and claims the policy. The
+    thread ``thread/resume`` handed back already holds it: nothing is sent again."""
+    with _no_hooks():
+        _codex_agent(session_id="resumed").run_conversation("first ask")
+        _stored_thread(monkeypatch, "thread-1")
+        resumed_agent = _codex_agent(session_id="resumed")
+        resumed_agent.run_conversation("after resume")  # no conversation_history
+        resumed_agent.run_conversation("and again")
+    original, resumed = codex_wire
+    assert "thread/resume" in resumed.methods() and "thread/start" not in resumed.methods()
+    assert [_markers(text) for text in original.turn_texts()] == [1]
+    assert resumed.turn_texts() == ["after resume", "and again"]
+
+
+def test_a_failed_resume_with_an_empty_local_history_carries_the_policy_exactly_once(
+    sources, codex_wire, monkeypatch,
+):
+    """Same empty-history start, but codex refuses the stored thread: the replacement that
+    ``thread/start`` creates is owed the policy — the claimed block, once, not a second copy."""
+    with _no_hooks():
+        _codex_agent(session_id="resumed").run_conversation("first ask")
+        _stored_thread(monkeypatch, "thread-gone")
+        monkeypatch.setattr(_CodexWire, "rejections", ["thread/resume"])
+        agent = _codex_agent(session_id="resumed")
+        agent.run_conversation("after resume")  # no conversation_history
+        agent.run_conversation("and again")
+    _original, replacement = codex_wire
+    assert replacement.methods()[:2] == ["thread/resume", "thread/start"]
+    assert replacement.turn_texts() == [f"after resume\n\n{build_policy_payload()}", "and again"]
+
+
+def test_a_replacement_after_a_successful_resume_is_owed_the_policy(sources, codex_wire, monkeypatch):
+    """Resume sends nothing; the thread started from scratch after it is retired sends it once."""
+    with _no_hooks():
+        history = _codex_agent(session_id="resumed").run_conversation("first ask")["messages"]
+        _stored_thread(monkeypatch, "thread-1")
+        agent = _codex_agent(session_id="resumed")
+        agent.run_conversation("after resume", conversation_history=history)
+        _retire_thread(agent)
+        agent._codex_session_prompt = "prompt changed"  # a prompt change never resumes the stored id
+        agent.run_conversation("on the new thread")
+        agent.run_conversation("and again")
+    _original, resumed, replacement = codex_wire
+    assert resumed.turn_texts() == ["after resume"]
+    assert "thread/start" in replacement.methods() and "thread/resume" not in replacement.methods()
+    assert [_markers(text) for text in replacement.turn_texts()] == [1, 0]
+
+
+# ── Compression: the policy is never compressible ──────────────────────────
+
+
+def _request_markers(body):
+    return sum(_markers(text) for text in _user_texts(body))
+
+
+def _compact(agent, messages, monkeypatch, label):
+    """One real compaction (real compressor, real commit) with only the summary LLM call stubbed."""
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_compression import compress_context
+
+    monkeypatch.setattr(ContextCompressor, "_generate_summary", lambda self, *_a, **_kw: f"summary {label}")
+    compressor = agent.context_compressor
+    compressor.protect_last_n, compressor.tail_token_budget = 2, 1
+    compressed, _prompt = compress_context(
+        agent, messages, agent._cached_system_prompt or "", approx_tokens=200_000, force=True,
+    )
+    return compressed
+
+
+@pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "rotated"])
+def test_repeated_compression_keeps_exactly_one_policy_on_every_request(
+    sources, chat_wire, tmp_path, monkeypatch, in_place,
+):
+    """Head protection decays after the first compaction and the summarizer reads clean
+    ``content``, so the second compaction summarizes the row whose sidecar held the policy.
+    Every later request — in this process and after a restart from the store — still sends it
+    once, and the durable rows stay the user's words."""
+    from hermes_state import SessionDB
+
+    policy = build_policy_payload()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        agent = _chat_agent(chat_wire, session_db=db, session_id="compacted")
+        agent.compression_in_place = in_place
+        history = None
+        with _no_hooks():
+            for round_no in (1, 2, 3):
+                for turn in range(4):
+                    history = agent.run_conversation(
+                        f"ask {round_no}.{turn} " + "filler " * 40, conversation_history=history,
+                    )["messages"]
+                before = len(history)
+                history = _compact(agent, history, monkeypatch, round_no)
+                assert len(history) < before, "the compaction did not shrink the transcript"
+                assert agent.context_compressor.compression_count == round_no
+                assert startup_policy.carried_policy(history) == policy
+            # The first ask — the original carrier — is long gone from the live transcript.
+            assert not any("ask 1.0" in str(m.get("content")) for m in history)
+            history = agent.run_conversation("after three compactions", conversation_history=history)["messages"]
+            agent.run_conversation("and again", conversation_history=history)
+
+            stored = db.get_messages_as_conversation(agent.session_id)
+            _chat_agent(chat_wire, session_db=db, session_id=agent.session_id).run_conversation(
+                "after restart", conversation_history=stored,
+            )
+    finally:
+        db.close()
+
+    # A session DB also enables the auxiliary titling request; it is not a conversation request.
+    turns = [body for body in chat_wire.bodies if "response_format" not in body]
+    assert len(turns) == 15
+    assert [_request_markers(body) for body in turns] == [1] * 15
+    assert all(policy in "\n".join(_user_texts(body)) for body in turns)
+    # Never summarized, never stored as the user's words.
+    assert not any(STARTUP_POLICY_MARKER_PREFIX in str(m.get("content")) for m in stored)
+    assert startup_policy.carried_policy(stored) == policy
+
+
+def test_compaction_of_a_conversation_that_never_carried_the_policy_adds_none(
+    sources, chat_wire, monkeypatch,
+):
+    """A conversation that predates the policy owes nothing: compaction does not invent it."""
+    agent = _chat_agent(chat_wire, session_id="legacy")
+    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"old {i} " + "filler " * 40}
+               for i in range(8)]
+    with _no_hooks():
+        history = _compact(agent, history, monkeypatch, 1)
+        assert startup_policy.carried_policy(history) == ""
+        agent.run_conversation("later ask", conversation_history=history)
+    assert _request_markers(chat_wire.bodies[-1]) == 0
+
+
+# ── Context selection: the policy is not optional context ──────────────────
+
+
+def _selecting(monkeypatch, select):
+    """Make the agent's context engine implement ``select_context`` with *select*."""
+    from agent.context_compressor import ContextCompressor
+
+    def select_context(self, api_messages, conversation_messages=None, incoming_message=None,
+                       budget_tokens=0):
+        return select(api_messages, conversation_messages, incoming_message)
+
+    monkeypatch.setattr(ContextCompressor, "select_context", select_context)
+
+
+_SELECTIONS = {
+    # The clean history clones: ``content`` without the policy, the sidecar the transport strips.
+    "history-clones": lambda api, history, incoming: list(history),
+    # Only the incoming message clone — on a later turn the carrier row is not selected at all.
+    "incoming-only": lambda api, history, incoming: [incoming],
+    # The request minus its first user row (the carrier).
+    "drops-the-carrier": lambda api, history, incoming: [
+        m for i, m in enumerate(api)
+        if i != next(j for j, row in enumerate(api) if row.get("role") == "user")
+    ] or [incoming],
+    # No user message at all.
+    "no-user-message": lambda api, history, incoming: [{"role": "assistant", "content": "selected note"}],
+    # The request as assembled: must stay byte-identical, with no second copy.
+    "unchanged": lambda api, history, incoming: list(api),
+}
+
+
+@pytest.mark.parametrize("name", sorted(_SELECTIONS))
+def test_a_context_selection_cannot_omit_or_duplicate_the_policy(sources, chat_wire, monkeypatch, name):
+    _selecting(monkeypatch, _SELECTIONS[name])
+    policy = build_policy_payload()
+    agent = _chat_agent(chat_wire)
+    history = None
+    with _no_hooks():
+        for message in ("first ask", "second ask", "third ask"):
+            history = agent.run_conversation(message, conversation_history=history)["messages"]
+
+    assert len(chat_wire.bodies) == 3
+    for body in chat_wire.bodies:
+        assert _request_markers(body) == 1, _user_texts(body)
+        assert policy in "\n".join(_user_texts(body))
+    # The durable transcript is not touched by the wire-side repair.
+    assert [m["content"] for m in history if m.get("role") == "user"] == [
+        "first ask", "second ask", "third ask",
+    ]
+    if name == "unchanged":
+        assert _user_texts(chat_wire.bodies[2]) == [f"first ask\n\n{policy}", "second ask", "third ask"]
+
+
+def test_a_selection_on_a_conversation_without_the_policy_is_left_alone(sources, chat_wire, monkeypatch):
+    """Nothing is owed by a conversation that never claimed the policy (it arrives with history)."""
+    _selecting(monkeypatch, _SELECTIONS["history-clones"])
+    legacy = [{"role": "user", "content": "old ask"}, {"role": "assistant", "content": "old reply"}]
+    with _no_hooks():
+        _chat_agent(chat_wire, session_id="legacy-selected").run_conversation(
+            "later ask", conversation_history=legacy,
+        )
+    assert _user_texts(chat_wire.bodies[-1]) == ["old ask", "later ask"]
+
+
+def test_ensure_policy_on_wire_is_deterministic_and_leaves_its_input_alone(sources):
+    from agent.startup_policy import ensure_policy_on_wire
+
+    policy = build_policy_payload()
+    carried = [{"role": "system", "content": "sys"}, {"role": "user", "content": f"hi\n\n{policy}"}]
+    assert ensure_policy_on_wire(carried, policy) is carried
+    assert ensure_policy_on_wire(carried, "") is carried
+
+    dropped = [{"role": "system", "content": "sys"}, {"role": "user", "content": "hi"},
+               {"role": "user", "content": "later"}]
+    snapshot = json.loads(json.dumps(dropped))
+    first, second = ensure_policy_on_wire(dropped, policy), ensure_policy_on_wire(dropped, policy)
+    assert first == second and dropped == snapshot
+    assert [m["content"] for m in first] == ["sys", f"hi\n\n{policy}", "later"]
+
+    parts = [{"role": "user", "content": [{"type": "text", "text": "look"}]}]
+    assert ensure_policy_on_wire(parts, policy)[0]["content"] == [
+        {"type": "text", "text": "look"}, {"type": "text", "text": policy},
+    ]
+    userless = [{"role": "system", "content": "sys"}, {"role": "assistant", "content": "note"}]
+    assert ensure_policy_on_wire(userless, policy) == [
+        userless[0], {"role": "user", "content": policy}, userless[1],
+    ]
+    # Text a user typed that merely quotes the marker is not the policy.
+    quoted = [{"role": "user", "content": f"{STARTUP_POLICY_MARKER_PREFIX} caveman:none frontier:none] hi"}]
+    assert ensure_policy_on_wire(quoted, policy)[0]["content"].endswith(f"\n\n{policy}")
